@@ -12,21 +12,24 @@ logger = setup_logger(__name__)
 # n_states_default: M5 uses 4 states to capture micro-noise; M15/H1 use 3.
 TF_CONFIG = {
     "H1": {
-        "raw_path": Path("data/raw/XAU_1h_data.csv"),
+        "raw_path":     Path("data/raw/XAU_1h_data.csv"),
+        "dxy_raw_path": Path("data/raw/DXY_1h_data.csv"),
         "processed_path": Path("data/processed/gold_h1_processed.parquet"),
         "obs_cov_default": 1.0,
         "trans_cov_default": 0.01,
         "n_states_default": 3,
     },
     "M15": {
-        "raw_path": Path("data/raw/XAU_15m_data.csv"),
+        "raw_path":     Path("data/raw/XAU_15m_data.csv"),
+        "dxy_raw_path": Path("data/raw/DXY_15m_data.csv"),
         "processed_path": Path("data/processed/gold_m15_processed.parquet"),
         "obs_cov_default": 4.0,
         "trans_cov_default": 0.01,
         "n_states_default": 3,
     },
     "M5": {
-        "raw_path": Path("data/raw/XAU_5m_data.csv"),
+        "raw_path":     Path("data/raw/XAU_5m_data.csv"),
+        "dxy_raw_path": Path("data/raw/DXY_5m_data.csv"),
         "processed_path": Path("data/processed/gold_m5_processed.parquet"),
         "obs_cov_default": 0.05,   # low value = responsive Kalman for scalping
         "trans_cov_default": 0.01,
@@ -52,6 +55,26 @@ def load_raw_data(path: Path = RAW_PATH) -> pd.DataFrame:
     df.sort_index(inplace=True)
     logger.info("Loaded %d rows from %s", len(df), path)
     return df
+
+
+def load_dxy_data(path: Path) -> pd.DataFrame | None:
+    """Load a DXY CSV and return a single-column DataFrame with ``dxy_log_return``.
+
+    Returns ``None`` if the file does not exist — callers treat this as
+    "DXY feature not available for this training run".
+
+    Expected format: same semicolon-delimited MT5 export as XAUUSD, with a
+    ``Close`` column.  File names follow the pattern ``DXY_{tf}_data.csv``
+    (e.g. ``data/raw/DXY_1h_data.csv``).
+    """
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, sep=";", parse_dates=["Date"], date_format="%Y.%m.%d %H:%M")
+    df.set_index("Date", inplace=True)
+    df.sort_index(inplace=True)
+    df["dxy_log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+    logger.info("Loaded DXY data: %d rows from %s", len(df), path)
+    return df[["dxy_log_return"]]
 
 
 def filter_data(df: pd.DataFrame, years: int = 10) -> pd.DataFrame:
@@ -141,6 +164,21 @@ def process_pipeline(
     df["rsi"] = compute_rsi(df["Close"])
     df["rsi_slope"] = df["rsi"].diff()
     df["atr_normalized"] = compute_atr(df)
+
+    # ── Optional DXY cross-asset feature ────────────────────────────────────
+    dxy_path = cfg.get("dxy_raw_path")
+    if dxy_path:
+        dxy_df = load_dxy_data(dxy_path)
+        if dxy_df is not None:
+            df = df.join(dxy_df, how="left")
+            n_dxy = df["dxy_log_return"].notna().sum()
+            logger.info("DXY merged: %d non-null dxy_log_return values.", n_dxy)
+        else:
+            logger.info(
+                "DXY file not found at %s — pipeline running without cross-asset feature. "
+                "Export DXY from MT5 History Center to enable it.",
+                dxy_path,
+            )
 
     df.dropna(inplace=True)
     logger.info(

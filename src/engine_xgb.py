@@ -9,10 +9,28 @@ from src.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-ONNX_PATH = Path("models/xgb_model.onnx")
-XGB_PKL_PATH = Path("models/xgb_model.pkl")
+ONNX_PATH        = Path("models/xgb_model.onnx")
+XGB_PKL_PATH     = Path("models/xgb_model.pkl")
+ENSEMBLE_PKL_PATH = Path("models/xgb_ensemble.pkl")
 
-FEATURE_COLS = ["hmm_state", "rsi_slope", "atr_normalized", "prev_log_return"]
+# Base features always present; dxy_log_return is added when DXY data is available.
+FEATURE_COLS     = ["hmm_state", "rsi_slope", "atr_normalized", "prev_log_return"]
+DXY_FEATURE      = "dxy_log_return"
+
+# Volatility bucket labels (ATR tertiles: low / med / high)
+VOL_BUCKETS = ["low", "med", "high"]
+
+
+def get_feature_cols(df: pd.DataFrame) -> list[str]:
+    """Return the feature column list for this DataFrame.
+
+    Includes ``dxy_log_return`` only when the column is present and has enough
+    non-null values to be useful (>50% coverage).
+    """
+    cols = list(FEATURE_COLS)
+    if DXY_FEATURE in df.columns and df[DXY_FEATURE].notna().mean() > 0.5:
+        cols.append(DXY_FEATURE)
+    return cols
 
 
 def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray):
@@ -21,13 +39,14 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray):
     df["prev_log_return"] = df["log_return"].shift(1)
     y = (df["log_return"].shift(-1) > 0).astype(int).rename("target")
 
-    X = df[FEATURE_COLS]
+    feature_cols = get_feature_cols(df)
+    X = df[feature_cols]
     valid = X.notna().all(axis=1) & y.notna()
     X = X[valid]
     y = y[valid]
     df_aligned = df.loc[X.index]
 
-    logger.info("Features prepared: %d samples, %d features", len(X), len(FEATURE_COLS))
+    logger.info("Features prepared: %d samples, %d features: %s", len(X), len(feature_cols), feature_cols)
     return X, y, df_aligned
 
 
@@ -67,7 +86,7 @@ def train_xgb(
 
     train_acc = accuracy_score(y_train, model.predict(X_train))
     test_acc = accuracy_score(y_test, model.predict(X_test))
-    importance = dict(zip(FEATURE_COLS, model.feature_importances_))
+    importance = dict(zip(list(X.columns), model.feature_importances_))
 
     logger.info("XGB Train Acc: %.4f | Test Acc: %.4f", train_acc, test_acc)
     logger.info("Feature importance: %s", importance)
@@ -188,3 +207,177 @@ def export_onnx(model: xgb.XGBClassifier, n_features: int = 4, path: Path = ONNX
     )
     print(f"\n  ONNX export OK — n_classes={n_classes}. "
           f"Set NStates={n_classes} in the MT5 EA inputs.\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Three-model volatility-regime ensemble
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_vol_thresholds(atr_normalized: pd.Series) -> tuple[float, float]:
+    """Compute ATR 33rd and 66th percentile thresholds from the supplied series.
+
+    Call this on **IS data only** to avoid look-ahead bias.  The returned
+    thresholds are stored with the ensemble and reused at inference time.
+    """
+    p33 = float(np.nanpercentile(atr_normalized.values, 33))
+    p66 = float(np.nanpercentile(atr_normalized.values, 66))
+    return p33, p66
+
+
+def assign_vol_bucket(atr_values: np.ndarray, p33: float, p66: float) -> np.ndarray:
+    """Assign each bar to a volatility bucket string: ``'low'``, ``'med'``, or ``'high'``."""
+    return np.where(atr_values <= p33, "low",
+           np.where(atr_values <= p66, "med", "high"))
+
+
+def train_xgb_ensemble(
+    X: pd.DataFrame,
+    y: pd.Series,
+    train_ratio: float = 0.8,
+    **xgb_kwargs,
+) -> tuple[dict, tuple[float, float], dict]:
+    """Train three XGBoost classifiers on Low / Med / High ATR volatility subsets.
+
+    Data is split temporally into IS (first ``train_ratio`` fraction) and OOS.
+    ATR percentile thresholds are computed on IS data only to prevent
+    look-ahead bias.  Each bucket model is trained on its IS-subset bars.
+
+    Args:
+        X:           Feature DataFrame (output of ``prepare_features``).
+        y:           Target Series.
+        train_ratio: Fraction of data used for IS training (default 0.8).
+        **xgb_kwargs: Forwarded to ``train_xgb`` for each bucket model.
+
+    Returns:
+        models:      ``{"low": model, "med": model, "high": model}``
+        thresholds:  ``(p33, p66)`` ATR tertile boundaries from IS data.
+        metrics:     Aggregate metrics dict including ``split_idx``,
+                     ``vol_thresholds``, and ``feature_cols``.
+    """
+    split_idx = int(len(X) * train_ratio)
+    X_is = X.iloc[:split_idx]
+    y_is = y.iloc[:split_idx]
+
+    # Thresholds from IS only — no look-ahead into OOS bars
+    p33, p66 = compute_vol_thresholds(X_is["atr_normalized"])
+    buckets_is = assign_vol_bucket(X_is["atr_normalized"].values, p33, p66)
+
+    models = {}
+    bucket_sizes = {}
+    for bucket in VOL_BUCKETS:
+        mask = (buckets_is == bucket)
+        X_b = X_is[mask]
+        y_b = y_is[mask]
+        bucket_sizes[bucket] = int(mask.sum())
+
+        if len(X_b) < 100:
+            # Too few samples in this bucket — fall back to all IS data
+            logger.warning(
+                "Vol bucket '%s' has only %d IS samples — falling back to full IS data.",
+                bucket, len(X_b),
+            )
+            X_b, y_b = X_is, y_is
+
+        model, _ = train_xgb(X_b, y_b, **xgb_kwargs)
+        models[bucket] = model
+        logger.info("Trained vol-bucket '%s': %d samples.", bucket, len(X_b))
+
+    # Feature importance from the med bucket (most representative)
+    fi = {}
+    if "med" in models:
+        try:
+            fi = dict(zip(list(X.columns), models["med"].feature_importances_))
+        except Exception:
+            pass
+
+    metrics = {
+        "split_idx":        split_idx,
+        "vol_thresholds":   (p33, p66),
+        "feature_cols":     list(X.columns),
+        "bucket_sizes":     bucket_sizes,
+        "feature_importance": fi,
+        "train_accuracy":   0.0,   # not meaningful for ensemble (per-bucket varies)
+        "test_accuracy":    0.0,
+    }
+    logger.info(
+        "Ensemble trained: buckets=%s  thresholds=(%.5f, %.5f)  features=%s",
+        bucket_sizes, p33, p66, list(X.columns),
+    )
+    return models, (p33, p66), metrics
+
+
+def get_predictions_ensemble(
+    models: dict,
+    thresholds: tuple[float, float],
+    X: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Route each bar to its vol-bucket model and return unified predictions.
+
+    Args:
+        models:     ``{"low": model, "med": model, "high": model}``
+        thresholds: ``(p33, p66)`` from training.
+        X:          Feature DataFrame — must contain ``atr_normalized``.
+
+    Returns:
+        predictions:  int array of class labels.
+        probabilities: float array of class-1 probabilities.
+    """
+    p33, p66 = thresholds
+    buckets = assign_vol_bucket(X["atr_normalized"].values, p33, p66)
+
+    predictions   = np.zeros(len(X), dtype=int)
+    probabilities = np.zeros(len(X), dtype=float)
+
+    for bucket in VOL_BUCKETS:
+        mask = (buckets == bucket)
+        if not mask.any():
+            continue
+        model = models[bucket]
+        X_b   = X[mask]
+        predictions[mask]   = model.predict(X_b)
+        probabilities[mask] = model.predict_proba(X_b)[:, 1]
+
+    return predictions, probabilities
+
+
+def save_xgb_ensemble(
+    models: dict,
+    thresholds: tuple[float, float],
+    metrics: dict,
+    path: Path = ENSEMBLE_PKL_PATH,
+) -> None:
+    """Persist the ensemble (3 models + thresholds + metadata) to a single pkl."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({"models": models, "thresholds": thresholds, "metrics": metrics}, path)
+    logger.info("Ensemble saved to %s", path)
+
+
+def load_xgb_ensemble(
+    path: Path = ENSEMBLE_PKL_PATH,
+) -> tuple[dict, tuple[float, float], dict]:
+    """Load the ensemble pkl and return ``(models, thresholds, metrics)``."""
+    data = joblib.load(path)
+    return data["models"], data["thresholds"], data["metrics"]
+
+
+def export_onnx_ensemble(
+    models: dict,
+    n_features: int,
+    base_dir: Path = Path("models"),
+) -> dict[str, Path]:
+    """Export all three vol-bucket models to individual ONNX files.
+
+    Output filenames:
+        ``models/xgb_model_vol_low.onnx``
+        ``models/xgb_model_vol_med.onnx``
+        ``models/xgb_model_vol_high.onnx``
+
+    Returns a dict mapping bucket name → ONNX path.
+    """
+    base_dir = Path(base_dir)
+    paths = {}
+    for bucket, model in models.items():
+        path = base_dir / f"xgb_model_vol_{bucket}.onnx"
+        export_onnx(model, n_features=n_features, path=path)
+        paths[bucket] = path
+    return paths

@@ -21,7 +21,7 @@ import optuna
 
 from src.processor import process_pipeline
 from src.engine_hmm import fit_hmm
-from src.engine_xgb import prepare_features, train_xgb, get_predictions
+from src.engine_xgb import prepare_features, train_xgb_ensemble, get_predictions_ensemble
 from src.backtester import vectorized_backtest
 from src.risk_manager import SMALL_ACCOUNT_THRESHOLD
 from src.logger import setup_logger
@@ -89,7 +89,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             )
             _hmm, states, _ = fit_hmm(df, n_states=n_states)
             X, y, df_aligned     = prepare_features(df, states)
-            model_xgb, metrics   = train_xgb(
+            models, thresholds, metrics = train_xgb_ensemble(
                 X, y,
                 max_depth=max_depth,
                 learning_rate=learning_rate,
@@ -100,7 +100,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 gamma=gamma,
                 reg_alpha=reg_alpha,
             )
-            _, probabilities = get_predictions(model_xgb, X)
+            _, probabilities = get_predictions_ensemble(models, thresholds, X)
 
             states_aligned = states[df.index.isin(df_aligned.index)]
             split_idx      = metrics.get("split_idx")

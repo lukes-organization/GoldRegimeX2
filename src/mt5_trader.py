@@ -29,7 +29,10 @@ from src.processor import (
     compute_atr,
 )
 from src.engine_hmm import load_model as load_hmm, predict_states
-from src.engine_xgb import load_xgb
+from src.engine_xgb import (
+    load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
+)
+from src.mt5_sync import DXY_SYMBOL_ALIASES, _find_dxy_symbol
 from src.risk_manager import AdaptiveRiskManager, CENT_MULTIPLIER
 
 logger = setup_logger(__name__)
@@ -193,6 +196,22 @@ def check_margin(symbol: str, lot: float, order_type: int, price: float) -> bool
 # Signal derivation
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fetch_dxy_log_return(tf_mt5: int, mt5) -> float | None:
+    """Fetch the most recently completed DXY bar log return for live inference.
+
+    Returns ``None`` if no DXY symbol is found on the broker or data is
+    unavailable — callers should substitute ``0.0`` in that case.
+    """
+    dxy_sym = _find_dxy_symbol(mt5)
+    if dxy_sym is None:
+        return None
+    rates = mt5.copy_rates_from_pos(dxy_sym, tf_mt5, 1, 3)  # 3 completed bars
+    if rates is None or len(rates) < 2:
+        return None
+    closes = [r["close"] for r in rates]
+    return float(np.log(closes[-1] / closes[-2]))
+
+
 def compute_deviation(model_hmm, current_state: int, tf: str = "H1") -> int:
     """Select order deviation based on regime stability and timeframe.
 
@@ -312,34 +331,50 @@ def compute_live_features(
     model_hmm,
     obs_cov: float,
     trans_cov: float,
+    feature_cols: list | None = None,
+    mt5=None,
 ):
-    """Build the current-bar feature vector for XGBoost inference.
+    """Build the current-bar feature vector for XGBoost ensemble inference.
 
     Returns:
-        features (np.ndarray shape (1,4)):  [hmm_state, rsi_slope, atr_normalized, prev_log_return]
-        hmm_state (int):                    current HMM regime index
-        atr_price (float):                  ATR in price terms for SL calculation
+        features_df  (pd.DataFrame shape (1, n_features)): named feature row.
+        hmm_state    (int):   current HMM regime index.
+        atr_price    (float): ATR in price terms for SL calculation.
 
-    NOTE: We build the 4-element feature vector manually (bypassing
-    prepare_features()) to avoid the last-row NaN drop that strips the signal
-    bar from training feature matrices.  Column order must match FEATURE_COLS.
+    ``feature_cols`` is loaded from the ensemble metadata so the live vector
+    always matches what the models were trained on.  If ``dxy_log_return`` is
+    required and unavailable from the broker, it is filled with 0.0.
     """
+    if feature_cols is None:
+        feature_cols = FEATURE_COLS
+
     df = _build_live_df(symbol, tf_mt5, N_BARS_WARMUP, obs_cov, trans_cov)
     states = predict_states(model_hmm, df)
 
     current_state   = int(states[-1])
     rsi_slope       = float(df["rsi_slope"].iloc[-1])
     atr_normalized  = float(df["atr_normalized"].iloc[-1])
-    prev_log_return = float(df["log_return"].iloc[-2])   # bar N-1
+    prev_log_return = float(df["log_return"].iloc[-2])
 
-    # FEATURE_COLS = ["hmm_state", "rsi_slope", "atr_normalized", "prev_log_return"]
-    features = np.array(
-        [[float(current_state), rsi_slope, atr_normalized, prev_log_return]],
-        dtype=np.float32,
-    )
+    feature_dict = {
+        "hmm_state":       float(current_state),
+        "rsi_slope":       rsi_slope,
+        "atr_normalized":  atr_normalized,
+        "prev_log_return": prev_log_return,
+    }
 
-    atr_price = atr_normalized * float(df["Close"].iloc[-1])
-    return features, current_state, atr_price
+    if "dxy_log_return" in feature_cols:
+        if mt5 is not None:
+            dxy_ret = _fetch_dxy_log_return(tf_mt5, mt5)
+        else:
+            dxy_ret = None
+        feature_dict["dxy_log_return"] = dxy_ret if dxy_ret is not None else 0.0
+        if dxy_ret is None:
+            logger.warning("DXY return unavailable — using 0.0 as fallback for dxy_log_return.")
+
+    features_df = pd.DataFrame([feature_dict])[feature_cols]
+    atr_price   = atr_normalized * float(df["Close"].iloc[-1])
+    return features_df, current_state, atr_price
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -471,9 +506,10 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
     except FileNotFoundError:
         raise FileNotFoundError("HMM model not found. Run --mode train first.")
     try:
-        model_xgb, _ = load_xgb()
+        models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble()
+        feature_cols = xgb_meta.get("feature_cols", list(FEATURE_COLS))
     except FileNotFoundError:
-        raise FileNotFoundError("XGB model not found. Run --mode train first.")
+        raise FileNotFoundError("XGB ensemble model not found. Run --mode train first.")
 
     # Resolve Kalman params from Optuna study or TF defaults
     try:
@@ -553,8 +589,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
             arm.daily_trades = daily_trades   # restore session count
 
             # ── 4. Compute live features ──────────────────────────────────
-            features, hmm_state, atr_price = compute_live_features(
+            features_df, hmm_state, atr_price = compute_live_features(
                 DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
+                feature_cols=feature_cols, mt5=mt5,
             )
 
             # ── 5. Session limit check ────────────────────────────────────
@@ -576,7 +613,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
             bar_str   = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")
             state_lbl = {0: "Bull", 1: "Bear", 2: "Chop"}.get(hmm_state, str(hmm_state))
             max_trades_today = arm.get_trade_limits(hmm_state)["max_daily_trades"]
-            prob = float(model_xgb.predict_proba(features)[:, 1][0])
+            _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
+            prob = float(_probs[0])
             logger.info(
                 "Bar %s | state=%s | prob=%.3f | trades=%d/%d",
                 bar_str, hmm_state, prob,

@@ -19,6 +19,8 @@ from src.engine_hmm import fit_hmm, save_model as save_hmm, load_model as load_h
 from src.engine_xgb import (
     prepare_features, train_xgb, get_predictions,
     export_onnx, save_xgb, load_xgb, ONNX_PATH, FEATURE_COLS,
+    train_xgb_ensemble, get_predictions_ensemble,
+    save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
 )
 from src.optimizer import run_optimization, get_best_params
 from src.backtester import vectorized_backtest
@@ -79,7 +81,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         df, n_states=params.get("n_states", TF_CONFIG[tf].get("n_states_default", 3))
     )
     X, y, df_aligned = prepare_features(df, states)
-    model_xgb, metrics = train_xgb(
+    models_ensemble, thresholds, metrics = train_xgb_ensemble(
         X, y,
         max_depth=params.get("max_depth", 4),
         learning_rate=params.get("learning_rate", 0.1),
@@ -90,7 +92,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         gamma=params.get("gamma", 1.0),
         reg_alpha=params.get("reg_alpha", 0.1),
     )
-    _, probabilities = get_predictions(model_xgb, X)
+    _, probabilities = get_predictions_ensemble(models_ensemble, thresholds, X)
     states_aligned = states[df.index.isin(df_aligned.index)]
     split_idx = metrics.get("split_idx")
     result = vectorized_backtest(
@@ -99,8 +101,9 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         account_size=balance,
         broker=broker,
         tf=tf,
+        prob_threshold=params.get("prob_threshold"),
     )
-    return result, model_hmm, state_map, model_xgb, metrics, df_aligned, states_aligned, X, probabilities
+    return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
 
 
 def cmd_process(args):
@@ -161,9 +164,9 @@ def cmd_train(args):
         logger.warning("No Optuna study found for tf=%s broker=%s — using defaults", tf, broker)
         params = {}
 
-    result, model_hmm, state_map, model_xgb, metrics, *_ = _train_for_tf(tf, balance, broker, params)
+    result, model_hmm, state_map, models_ensemble, thresholds, metrics, *_ = _train_for_tf(tf, balance, broker, params)
     save_hmm(model_hmm)
-    save_xgb(model_xgb, metrics)
+    save_xgb_ensemble(models_ensemble, thresholds, metrics)
 
     arm = AdaptiveRiskManager(balance)
     limits = arm.get_trade_limits()
@@ -254,13 +257,18 @@ def cmd_compare(args):
 
 def cmd_export(args):
     try:
-        model_xgb, _ = load_xgb()
+        models_ensemble, _, xgb_metrics = load_xgb_ensemble()
     except FileNotFoundError:
-        logger.error("No trained XGB model found. Run --mode train first.")
+        logger.error("No trained ensemble model found. Run --mode train first.")
         sys.exit(1)
-    export_onnx(model_xgb)
-    print(f"\nONNX model exported to {ONNX_PATH}")
-    print("Copy this file to your MT5 MQL5/Files/ directory.")
+    feature_cols = xgb_metrics.get("feature_cols", FEATURE_COLS)
+    n_features   = len(feature_cols)
+    paths = export_onnx_ensemble(models_ensemble, n_features=n_features)
+    print(f"\nONNX ensemble exported ({n_features} features: {feature_cols}):")
+    for bucket, path in paths.items():
+        print(f"  [{bucket:>4}]  {path}")
+    print("\nCopy these files to your MT5 MQL5/Files/ directory.")
+    print("The EA selects the model based on the current ATR volatility bucket.")
 
 
 def cmd_sync_validate(args):
