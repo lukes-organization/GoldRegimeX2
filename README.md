@@ -120,7 +120,7 @@ The system requires historical OHLCV CSV files exported from MetaTrader5. In MT5
 
 **Format**: semicolon-delimited, columns: `Date;Open;High;Low;Close;Volume`
 
-> The system works with H1 alone. M15 and M5 are optional additional timeframes. More data = better optimization. Aim for at least 2 years of history; the included H1 dataset covers 2004–2025.
+> The system works with H1, M15 and M5 timeframes. More data = better optimization. Aim for at least 2 years of history; the included H1 dataset covers 2004–2025.
 
 ---
 
