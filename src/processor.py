@@ -10,10 +10,13 @@ logger = setup_logger(__name__)
 # in raw observations). M15 is ~4× noisier than H1; M5 uses a low obs_cov
 # (0.05) to keep the filter very responsive for fast scalping regime detection.
 # n_states_default: M5 uses 4 states to capture micro-noise; M15/H1 use 3.
+# Single DXY file — DXY is a daily index; one complete file is shared across all TFs.
+# Export from MT5 History Center (XAUUSD → H1, then switch to DXY/USDX) and save here.
+DXY_RAW_PATH = Path("data/raw/DXY_data.csv")
+
 TF_CONFIG = {
     "H1": {
         "raw_path":     Path("data/raw/XAU_1h_data.csv"),
-        "dxy_raw_path": Path("data/raw/DXY_1h_data.csv"),
         "processed_path": Path("data/processed/gold_h1_processed.parquet"),
         "obs_cov_default": 1.0,
         "trans_cov_default": 0.01,
@@ -21,7 +24,6 @@ TF_CONFIG = {
     },
     "M15": {
         "raw_path":     Path("data/raw/XAU_15m_data.csv"),
-        "dxy_raw_path": Path("data/raw/DXY_15m_data.csv"),
         "processed_path": Path("data/processed/gold_m15_processed.parquet"),
         "obs_cov_default": 4.0,
         "trans_cov_default": 0.01,
@@ -29,7 +31,6 @@ TF_CONFIG = {
     },
     "M5": {
         "raw_path":     Path("data/raw/XAU_5m_data.csv"),
-        "dxy_raw_path": Path("data/raw/DXY_5m_data.csv"),
         "processed_path": Path("data/processed/gold_m5_processed.parquet"),
         "obs_cov_default": 0.05,   # low value = responsive Kalman for scalping
         "trans_cov_default": 0.01,
@@ -166,7 +167,8 @@ def process_pipeline(
     df["atr_normalized"] = compute_atr(df)
 
     # ── Optional DXY cross-asset feature ────────────────────────────────────
-    dxy_path = cfg.get("dxy_raw_path")
+    # DXY is a daily index shared across all TFs — one file covers H1/M15/M5.
+    dxy_path = DXY_RAW_PATH
     if dxy_path:
         dxy_df = load_dxy_data(dxy_path)
         if dxy_df is not None:

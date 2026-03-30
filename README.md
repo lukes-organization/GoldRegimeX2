@@ -122,6 +122,16 @@ The system requires historical OHLCV CSV files exported from MetaTrader5. In MT5
 
 > The system works with H1, M15 and M5 timeframes. More data = better optimization. Aim for at least 2 years of history; the included H1 dataset covers 2004–2025.
 
+### DXY (US Dollar Index) — optional cross-asset feature
+
+DXY is a daily index — **one file covers all timeframes**. To enable the cross-asset `dxy_log_return` feature:
+
+1. In MT5 History Center, select **DXY** (or USDX / DOLLAR, depending on your broker)
+2. Export as CSV (semicolon-delimited, same format as above)
+3. Save to: `data/raw/DXY_data.csv`
+
+If the file is absent the pipeline runs without the DXY feature — all three timeframes degrade gracefully to the standard 4-feature model. No code change is needed; the presence of the file is the only switch.
+
 ---
 
 ## Configuration
