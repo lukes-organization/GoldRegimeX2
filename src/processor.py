@@ -70,7 +70,8 @@ def load_dxy_data(path: Path) -> pd.DataFrame | None:
     """
     if not path.exists():
         return None
-    df = pd.read_csv(path, sep=";", parse_dates=["Date"], date_format="%Y.%m.%d %H:%M")
+    # DXY_data.csv is saved as YYYY-MM-DD (daily). Use infer to be format-agnostic.
+    df = pd.read_csv(path, sep=";", parse_dates=["Date"])
     df.set_index("Date", inplace=True)
     df.sort_index(inplace=True)
     df["dxy_log_return"] = np.log(df["Close"] / df["Close"].shift(1))
@@ -172,7 +173,9 @@ def process_pipeline(
     if dxy_path:
         dxy_df = load_dxy_data(dxy_path)
         if dxy_df is not None:
-            df = df.join(dxy_df, how="left")
+            # DXY is daily — normalize each intraday bar's timestamp to midnight
+            # so it matches the DXY date index before mapping.
+            df["dxy_log_return"] = df.index.normalize().map(dxy_df["dxy_log_return"])
             n_dxy = df["dxy_log_return"].notna().sum()
             logger.info("DXY merged: %d non-null dxy_log_return values.", n_dxy)
         else:
