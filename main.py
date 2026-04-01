@@ -368,9 +368,13 @@ def cmd_report(args):
     X, y, df_aligned = prepare_features(df, states)
 
     try:
-        model_xgb, metrics = load_xgb()
-    except FileNotFoundError:
-        model_xgb, metrics = train_xgb(
+        models_xgb, thresholds_xgb, metrics = load_xgb_ensemble()
+        # If the saved ensemble was trained with different features (e.g. before DXY
+        # was added), retrain in-memory so the report stays consistent with the data.
+        if metrics.get("feature_cols") != list(X.columns):
+            raise ValueError("Feature mismatch — retraining for report.")
+    except (FileNotFoundError, ValueError):
+        models_xgb, thresholds_xgb, metrics = train_xgb_ensemble(
             X, y,
             max_depth=params.get("max_depth", 4),
             learning_rate=params.get("learning_rate", 0.1),
@@ -382,10 +386,7 @@ def cmd_report(args):
             reg_alpha=params.get("reg_alpha", 0.1),
         )
 
-    if "feature_importance" not in metrics:
-        metrics["feature_importance"] = dict(zip(FEATURE_COLS, model_xgb.feature_importances_))
-
-    _, probabilities = get_predictions(model_xgb, X)
+    _, probabilities = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
     states_aligned = states[df.index.isin(df_aligned.index)]
 
     # split_idx in saved metrics may come from a different TF's training run

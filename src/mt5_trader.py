@@ -22,6 +22,8 @@ from src.notifier import send_telegram_msg
 from src.logger import setup_logger
 from src.processor import (
     TF_CONFIG,
+    DXY_RAW_PATH,
+    load_dxy_data,
     compute_log_returns,
     kalman_smooth,
     compute_volatility,
@@ -68,6 +70,25 @@ TF_TP_CONFIG = {
 }
 
 # Lazy MT5 timeframe map
+
+# ── DXY fallback cache ────────────────────────────────────────────────────────
+# When the broker doesn't carry DXY as a live symbol, we carry forward the
+# last known daily log return from DXY_data.csv (much closer to reality than 0.0).
+_DXY_FALLBACK_CACHE: float | None = None
+
+def _get_dxy_fallback() -> float:
+    """Return the last known DXY log return from DXY_data.csv (cached after first load)."""
+    global _DXY_FALLBACK_CACHE
+    if _DXY_FALLBACK_CACHE is None:
+        try:
+            dxy_df = load_dxy_data(DXY_RAW_PATH)
+            if dxy_df is not None:
+                _DXY_FALLBACK_CACHE = float(dxy_df["dxy_log_return"].dropna().iloc[-1])
+            else:
+                _DXY_FALLBACK_CACHE = 0.0
+        except Exception:
+            _DXY_FALLBACK_CACHE = 0.0
+    return _DXY_FALLBACK_CACHE
 _MT5_TF_MAP: dict | None = None
 
 
@@ -368,9 +389,13 @@ def compute_live_features(
             dxy_ret = _fetch_dxy_log_return(tf_mt5, mt5)
         else:
             dxy_ret = None
-        feature_dict["dxy_log_return"] = dxy_ret if dxy_ret is not None else 0.0
         if dxy_ret is None:
-            logger.warning("DXY return unavailable — using 0.0 as fallback for dxy_log_return.")
+            dxy_ret = _get_dxy_fallback()
+            logger.warning(
+                "DXY return unavailable — using last known value %.6f as fallback for dxy_log_return.",
+                dxy_ret,
+            )
+        feature_dict["dxy_log_return"] = dxy_ret
 
     features_df = pd.DataFrame([feature_dict])[feature_cols]
     atr_price   = atr_normalized * float(df["Close"].iloc[-1])
