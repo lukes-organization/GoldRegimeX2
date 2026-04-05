@@ -13,6 +13,26 @@ REPORT_DIR = Path("reports")
 REGIME_COLORS = {0: "#2ecc71", 1: "#e74c3c", 2: "#f39c12", 3: "#9b59b6"}
 REGIME_LABELS = {0: "Bull", 1: "Bear", 2: "Chop", 3: "Chop_High"}
 
+# Max bars to render in time-series charts.  M5 has 626K bars over 10 years —
+# rendering all of them causes weekend gaps to appear as straight horizontal
+# lines and makes regime fills look noisy/white.  Downsampling to ~15K bars
+# gives ~1 point per hour on M5, equivalent to H1 resolution visually.
+_MAX_DISPLAY_BARS = 15_000
+
+
+def _downsample(df: pd.DataFrame, states: np.ndarray, max_bars: int = _MAX_DISPLAY_BARS):
+    """Reduce df and states to at most max_bars rows for display.
+
+    Uses a fixed stride so the time axis stays evenly spaced and weekend gaps
+    are no longer wide enough to produce obvious straight-line artefacts.
+    Downsampling is purely cosmetic — models are unaffected.
+    """
+    n = len(df)
+    if n <= max_bars:
+        return df, states
+    step = max(1, n // max_bars)
+    return df.iloc[::step], states[::step]
+
 
 def _tf_dir(tf: str = "H1") -> Path:
     """Return the TF-specific report subdirectory, creating it if needed."""
@@ -25,27 +45,36 @@ def plot_regime_overlay(df, hmm_states, state_names, tf="H1", save_path=None):
     """Price chart with HMM regime shading."""
     save_path = save_path or _tf_dir(tf) / "1_regime_overlay.png"
 
+    # Downsample for display — avoids straight-line weekend-gap artefacts and
+    # noisy regime fills that appear white at high bar density (e.g. M5 10yr).
+    df_plot, states_plot = _downsample(df, hmm_states)
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 10), height_ratios=[3, 1],
                                     sharex=True, gridspec_kw={"hspace": 0.05})
 
-    dates = df.index
-    close = df["Close"].values
+    dates = df_plot.index
+    close = df_plot["Close"].values
 
     for state_id, label in state_names.items():
-        mask = hmm_states == state_id
+        mask = states_plot == state_id
         color = REGIME_COLORS.get(state_id, "#95a5a6")
         ax1.fill_between(dates, close.min() * 0.98, close.max() * 1.02,
-                         where=mask, alpha=0.15, color=color, label=label)
+                         where=mask, alpha=0.25, color=color, label=label)
 
-    ax1.plot(dates, close, color="#2c3e50", linewidth=0.5, alpha=0.9)
-    ax1.set_ylabel("XAUUSD Price (H1)", fontsize=11)
-    ax1.set_title("Gold Regime X \u2014 HMM Regime Detection Over Price", fontsize=14, fontweight="bold")
+    ax1.plot(dates, close, color="#2c3e50", linewidth=0.6, alpha=0.9)
+    n_total = len(df)
+    n_shown = len(df_plot)
+    sample_note = (f"  (display: every {n_total // n_shown}th bar — {n_shown:,} of {n_total:,} M5 bars)"
+                   if n_shown < n_total else "")
+    ax1.set_ylabel("XAUUSD Price", fontsize=11)
+    ax1.set_title(f"Gold Regime X — HMM Regime Detection Over Price  [{tf}]{sample_note}",
+                  fontsize=13, fontweight="bold")
     ax1.legend(loc="upper left", fontsize=10)
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim(dates[0], dates[-1])
 
-    ax2.scatter(dates, hmm_states, c=[REGIME_COLORS.get(s, "#95a5a6") for s in hmm_states],
-                s=1, alpha=0.6)
+    ax2.scatter(dates, states_plot, c=[REGIME_COLORS.get(s, "#95a5a6") for s in states_plot],
+                s=2, alpha=0.7)
     ax2.set_ylabel("HMM State", fontsize=11)
     ax2.set_yticks(list(state_names.keys()))
     ax2.set_yticklabels(list(state_names.values()))
@@ -80,22 +109,32 @@ def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", sa
     running_max = np.maximum.accumulate(cumulative_strat)
     drawdown = running_max - cumulative_strat
 
-    dates = df.index
+    # Downsample display arrays — same reason as regime overlay
+    n_total = len(df)
+    step = max(1, n_total // _MAX_DISPLAY_BARS)
+    dates      = df.index[::step]
+    cum_strat  = cumulative_strat[::step]
+    cum_bh     = cumulative_bh[::step]
+    dd_plot    = drawdown[::step]
+    probs_plot = probabilities[::step]
+    sig_plot   = signals[::step]
 
     fig, axes = plt.subplots(3, 1, figsize=(18, 12), height_ratios=[3, 1, 1],
                               sharex=True, gridspec_kw={"hspace": 0.08})
 
     # Equity curves
     ax1 = axes[0]
-    ax1.plot(dates, cumulative_strat, color="#2980b9", linewidth=1.2, label="Strategy (log return)")
-    ax1.plot(dates, cumulative_bh, color="#95a5a6", linewidth=0.8, alpha=0.7, label="Buy & Hold")
-    entry_mask = signals == 1
-    ax1.scatter(dates[entry_mask], cumulative_strat[entry_mask],
-                c="#2ecc71", s=3, alpha=0.4, label=f"Long entries ({np.sum(entry_mask)})", zorder=3)
+    ax1.plot(dates, cum_strat, color="#2980b9", linewidth=1.2, label="Strategy (log return)")
+    ax1.plot(dates, cum_bh, color="#95a5a6", linewidth=0.8, alpha=0.7, label="Buy & Hold")
+    entry_mask = sig_plot == 1
+    n_entries = int(np.sum(signals == 1))   # use full signals for true count
+    ax1.scatter(dates[entry_mask], cum_strat[entry_mask],
+                c="#2ecc71", s=5, alpha=0.6, label=f"Long entries ({n_entries})", zorder=3)
 
     # Train/test split line
-    if split_idx is not None and 0 < split_idx < len(dates):
-        split_date = dates[split_idx]
+    all_dates = df.index
+    if split_idx is not None and 0 < split_idx < len(all_dates):
+        split_date = all_dates[split_idx]
         for ax in axes:
             ax.axvline(x=split_date, color="#e74c3c", linewidth=1.5, linestyle="--", alpha=0.7)
         ax1.axvspan(split_date, dates[-1], alpha=0.04, color="#e74c3c")
@@ -112,17 +151,17 @@ def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", sa
 
     # Drawdown
     ax2 = axes[1]
-    ax2.fill_between(dates, 0, -drawdown * 100, color="#e74c3c", alpha=0.5)
+    ax2.fill_between(dates, 0, -dd_plot * 100, color="#e74c3c", alpha=0.5)
     ax2.set_ylabel("Drawdown (%)", fontsize=11)
     ax2.grid(True, alpha=0.3)
-    max_dd_idx = np.argmax(drawdown)
-    ax2.annotate(f"Max DD: {drawdown[max_dd_idx]*100:.1f}%",
-                 xy=(dates[max_dd_idx], -drawdown[max_dd_idx] * 100),
+    max_dd_idx = int(np.argmax(dd_plot))
+    ax2.annotate(f"Max DD: {dd_plot[max_dd_idx]*100:.1f}%",
+                 xy=(dates[max_dd_idx], -dd_plot[max_dd_idx] * 100),
                  fontsize=9, color="#c0392b", fontweight="bold")
 
     # XGB probability
     ax3 = axes[2]
-    ax3.scatter(dates, probabilities, c=probabilities, cmap="RdYlGn", s=1, alpha=0.3, vmin=0.3, vmax=0.7)
+    ax3.scatter(dates, probs_plot, c=probs_plot, cmap="RdYlGn", s=2, alpha=0.4, vmin=0.3, vmax=0.7)
     ax3.axhline(y=0.65, color="#2ecc71", linewidth=1, linestyle="--", alpha=0.8, label="Long threshold (0.65)")
     ax3.axhline(y=0.35, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.8, label="Short threshold (0.35)")
     ax3.axhline(y=0.5, color="#7f8c8d", linewidth=0.5, linestyle=":", alpha=0.5)
