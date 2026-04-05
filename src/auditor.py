@@ -20,8 +20,18 @@ from src.risk_manager import CENT_MULTIPLIER
 logger = setup_logger(__name__)
 
 
-def get_daily_report(broker: str = "headway_cent", days: int = 1) -> str:
+def get_daily_report(
+    broker: str = "headway_cent",
+    days: int = 1,
+    session_limit: int = None,
+) -> str:
     """Fetch and format a performance summary for the last *days* days.
+
+    Args:
+        broker:        Broker name — used to normalise cent-account P&L.
+        days:          Look-back window in days (default 1 = last 24 hours).
+        session_limit: If provided, the trade count line shows "X/N used today"
+                       so the user can see remaining capacity at a glance.
 
     Returns an HTML-formatted string suitable for Telegram (parse_mode='HTML').
     Never raises — returns an error string if MT5 is unavailable.
@@ -74,13 +84,18 @@ def get_daily_report(broker: str = "headway_cent", days: int = 1) -> str:
     period   = "24h" if days == 1 else f"{days}d"
     stamp    = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
+    # Trade count line — show session capacity if limit is known
+    if session_limit:
+        trades_str = f"<b>{total_trades}/{session_limit} used today</b>  (Wins: {wins} | Losses: {losses})"
+    else:
+        trades_str = f"<b>{total_trades}</b>  (Wins: {wins} | Losses: {losses})"
+
     report = (
         f"<b>Gold Regime X — Daily Report ({period})</b>\n"
         f"{'—'*28}\n"
         f"Total PnL:     <code>{icon_pnl}{total_pnl:.2f} USD</code>\n"
         f"{floating_line}"
-        f"Total Trades:  <b>{total_trades}</b>  "
-        f"(Wins: {wins} | Losses: {losses})\n"
+        f"Trades:        {trades_str}\n"
         f"Win Rate:      <b>{win_rate:.1f}%</b>\n"
         f"Best Trade:    <code>+{best_trade:.2f} USD</code>\n"
         f"Worst Trade:   <code>{worst_trade:.2f} USD</code>\n"

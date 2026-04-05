@@ -5,18 +5,17 @@ the authorised user and dispatches them as subprocesses so the listener
 thread is never blocked.
 
 Keyboard layout:
-    ┌──────────────────────┬─────────────────────┐
-    │  🚀 START TRADING    │  🛑 STOP TRADING     │
-    ├──────────────────────┼─────────────────────┤
-    │  📉 START OPTIMIZE   │  📊 BOT STATUS       │
-    │     (M5)             │                     │
-    └──────────────────────┴─────────────────────┘
+    ┌──────────────────────────────┬─────────────────────┐
+    │  🚀 START TRADING            │  🛑 STOP TRADING     │
+    ├──────────────────────────────┼─────────────────────┤
+    │  📉 OPTIMIZE M5 (0.50-0.55) │  📊 BOT STATUS       │
+    └──────────────────────────────┴─────────────────────┘
 
 Required env vars (see .env.example):
     TELEGRAM_BOT_TOKEN   — BotFather token
     TELEGRAM_CHAT_ID     — Your chat ID (used for outbound heartbeat messages)
     ALLOWED_USER_ID      — Your numeric Telegram user ID (security gate)
-    LIVE_TF              — Default TF for START TRADING (default: H1)
+    LIVE_TF              — Default TF for START TRADING (default: M5)
     LIVE_BROKER          — Default broker  (default: headway_cent)
     LIVE_BALANCE         — Default balance (default: 15)
 
@@ -36,11 +35,13 @@ from src.notifier import get_credentials, send_telegram_msg
 
 logger = setup_logger(__name__)
 
-# ── Telegram keyboard sent with every reply ────────────────────────────────────
+# ── Persistent reply keyboard ──────────────────────────────────────────────────
+# resize_keyboard=True  → compact size on mobile
+# one_time_keyboard=False → stays visible after every tap
 _KEYBOARD = {
     "keyboard": [
-        ["🚀 START TRADING",       "🛑 STOP TRADING"],
-        ["📉 START OPTIMIZE (M5)", "📊 BOT STATUS"],
+        ["🚀 START TRADING",             "🛑 STOP TRADING"],
+        ["📉 OPTIMIZE M5 (0.50-0.55)",   "📊 BOT STATUS"],
     ],
     "resize_keyboard":   True,
     "one_time_keyboard": False,
@@ -94,12 +95,25 @@ def _proc_alive(key: str) -> bool:
 
 def _handle(token: str, chat_id, user_id: str, text: str) -> None:
     """Authorise and dispatch a single inbound command."""
+    # /start and /help are shown to anyone — they only reveal the keyboard
+    if text in ("/start", "/help"):
+        _reply(
+            token, chat_id,
+            "<b>Gold Regime X — Command Center</b>\n\n"
+            "Use the buttons below to manage the trading system remotely.\n\n"
+            "<b>🚀 START TRADING</b> — Launch the live M5 loop\n"
+            "<b>🛑 STOP TRADING</b>  — Terminate the live loop\n"
+            "<b>📉 OPTIMIZE M5</b>   — Resume/start M5 optimisation (0.50–0.55 range)\n"
+            "<b>📊 BOT STATUS</b>    — Live P&amp;L, daily trade count, process health",
+        )
+        return
+
     allowed = os.getenv("ALLOWED_USER_ID", "")
     if user_id != allowed:
         _api(token, "sendMessage", chat_id=chat_id, text="Unauthorized.")
         return
 
-    tf      = os.getenv("LIVE_TF",      "H1")
+    tf      = os.getenv("LIVE_TF",      "M5")
     broker  = os.getenv("LIVE_BROKER",  "headway_cent")
     balance = os.getenv("LIVE_BALANCE", "15")
 
@@ -122,26 +136,44 @@ def _handle(token: str, chat_id, user_id: str, text: str) -> None:
         else:
             _reply(token, chat_id, "No active trading process found.")
 
-    elif text == "📉 START OPTIMIZE (M5)":
+    elif text == "📉 OPTIMIZE M5 (0.50-0.55)":
         if _proc_alive("optimizer"):
-            _reply(token, chat_id, "Optimization is already running.")
+            _reply(token, chat_id, "Optimisation is already running.")
             return
         _procs["optimizer"] = subprocess.Popen([
             "python", "main.py",
             "--mode", "optimize", "--tf", "M5",
             "--broker", broker, "--balance", balance, "--trials", "500",
         ])
-        _reply(token, chat_id,
-               "M5 optimization started.\n"
-               "(Resumes from study.db if previous progress exists.)")
+        _reply(
+            token, chat_id,
+            "📉 <b>M5 Optimisation started</b>\n"
+            "prob_threshold range: <b>0.50 – 0.55</b>\n"
+            "Target: <b>500 trials</b> (resumes from study.db if interrupted)\n\n"
+            "You will receive Telegram updates at every 10% milestone.",
+        )
 
     elif text == "📊 BOT STATUS":
+        # ── Process health ───────────────────────────────────────────────────
+        trading_icon   = "✅" if _proc_alive("trading")   else "❌"
+        optimizer_icon = "🔄" if _proc_alive("optimizer") else "💤"
+        proc_block = (
+            "<b>System Status</b>\n"
+            f"Trading Loop: {trading_icon} {'Running' if _proc_alive('trading') else 'Stopped'}\n"
+            f"Optimizer:    {optimizer_icon} {'Running' if _proc_alive('optimizer') else 'Idle'}\n"
+            f"{'—'*28}\n"
+        )
+
+        # ── P&L report from auditor ──────────────────────────────────────────
+        # Session limit: 2/day for small accounts (≤$50), 3 otherwise
+        session_limit = 2 if float(balance) <= 50 else 3
         try:
             from src.auditor import get_daily_report
-            report = get_daily_report(broker=broker)
+            pnl_block = get_daily_report(broker=broker, session_limit=session_limit)
         except Exception as exc:
-            report = f"Status unavailable: {exc}"
-        _reply(token, chat_id, report)
+            pnl_block = f"P&amp;L unavailable: {exc}"
+
+        _reply(token, chat_id, proc_block + pnl_block)
 
     else:
         _reply(token, chat_id, "Use the keyboard buttons below to control the bot.")
