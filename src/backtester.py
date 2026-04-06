@@ -65,14 +65,18 @@ def apply_session_limits(
     dates,
     account_size: float = 15.0,
     hmm_states: np.ndarray = None,
+    tf: str = "H1",
 ) -> np.ndarray:
-    """Cap signals to the adaptive daily limit based on account size and HMM state.
+    """Cap signals to the adaptive daily limit based on account size, HMM state and TF.
 
     Counts both BUY (+1) and SELL (-1) signals toward the daily cap.
 
     For growth accounts (> $50), the limit is market-state-dependent:
     - Bull / Bear: 3 signals/day
     - Chop: 2 signals/day
+
+    M5 small accounts get a higher cap (4/day) to match the 288-bar/day
+    frequency and allow the optimizer to generate enough OOS trades.
 
     Uses the majority HMM state within each calendar day to decide the cap.
     """
@@ -88,9 +92,9 @@ def apply_session_limits(
         if hmm_states is not None and not arm.is_small_account:
             day_states = hmm_states[start:end].astype(int)
             day_mode = int(np.bincount(day_states).argmax())
-            limits = arm.get_trade_limits(day_mode)
+            limits = arm.get_trade_limits(day_mode, tf=tf)
         else:
-            limits = arm.get_trade_limits()
+            limits = arm.get_trade_limits(tf=tf)
 
         max_daily = limits["max_daily_trades"]
         seg = result[start:end]
@@ -181,11 +185,11 @@ def vectorized_backtest(
         threshold=buy_th,
         short_threshold=short_threshold,   # None → symmetric default inside
     )
-    signals = apply_session_limits(raw_signals, df.index, account_size, hmm_states)
+    signals = apply_session_limits(raw_signals, df.index, account_size, hmm_states, tf=tf)
 
     # Determine pos_per_trade from the adaptive risk manager
     arm           = AdaptiveRiskManager(account_size)
-    base_limits   = arm.get_trade_limits()
+    base_limits   = arm.get_trade_limits(tf=tf)
     pos_per_trade = base_limits["pos_per_trade"]
 
     sizes = compute_position_sizes(signals, atr_norm, pos_per_trade=pos_per_trade)
@@ -201,7 +205,7 @@ def vectorized_backtest(
         "account_size":      account_size,
         "broker":            broker,
         "tf":                tf,
-        "session_max_trades": arm.get_trade_limits()["max_daily_trades"],
+        "session_max_trades": arm.get_trade_limits(tf=tf)["max_daily_trades"],
         "pos_per_trade":     pos_per_trade,
     })
 
@@ -233,7 +237,7 @@ def vectorized_backtest(
         broker,
         account_size,
         "small" if arm.is_small_account else "growth",
-        arm.get_trade_limits()["max_daily_trades"],
+        arm.get_trade_limits(tf=tf)["max_daily_trades"],
         pos_per_trade,
         BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0)
         + BROKER_CONFIGS.get(broker, {}).get("commission_frac", 0),

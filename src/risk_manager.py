@@ -105,15 +105,20 @@ class AdaptiveRiskManager:
     def is_small_account(self) -> bool:
         return self.balance <= SMALL_ACCOUNT_THRESHOLD
 
-    def get_trade_limits(self, market_state: int = None) -> dict:
+    def get_trade_limits(self, market_state: int = None, tf: str = None) -> dict:
         """Return trade limits for the current balance and optional HMM state.
 
         Args:
             market_state: Current HMM state index. If None, uses the most
                           permissive limit for the account tier.
+            tf: Timeframe string (e.g. ``"M5"``). M5 small accounts get a
+                higher daily cap (4) to match the higher bar frequency.
         """
         if self.is_small_account:
-            return {"max_daily_trades": 2, "pos_per_trade": 1, "total_daily_pos": 2}
+            # M5 generates ~288 bars/day — allow more signals so the optimizer
+            # can find frequent enough OOS trades to clear MIN_OOS_TRADES=300.
+            max_daily = 4 if (tf and tf.upper() == "M5") else 2
+            return {"max_daily_trades": max_daily, "pos_per_trade": 1, "total_daily_pos": max_daily}
 
         # Growth account: market-state-dependent
         in_chop = (market_state == self.CHOP_STATE) if market_state is not None else False

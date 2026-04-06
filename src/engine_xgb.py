@@ -13,9 +13,11 @@ ONNX_PATH        = Path("models/xgb_model.onnx")
 XGB_PKL_PATH     = Path("models/xgb_model.pkl")
 ENSEMBLE_PKL_PATH = Path("models/xgb_ensemble.pkl")
 
-# Base features always present; dxy_log_return is added when DXY data is available.
-FEATURE_COLS     = ["hmm_state", "rsi_slope", "atr_normalized", "prev_log_return"]
-DXY_FEATURE      = "dxy_log_return"
+# Base features always present; usdchf_log_return is added when the USDCHF
+# master CSV is available (run  python main.py --mode consolidate  first).
+FEATURE_COLS    = ["hmm_state", "rsi_slope", "atr_normalized", "prev_log_return"]
+USDCHF_FEATURE  = "usdchf_log_return"
+DXY_FEATURE     = USDCHF_FEATURE   # legacy alias — kept so old imports don't crash
 
 # Volatility bucket labels (ATR tertiles: low / med / high)
 VOL_BUCKETS = ["low", "med", "high"]
@@ -24,12 +26,12 @@ VOL_BUCKETS = ["low", "med", "high"]
 def get_feature_cols(df: pd.DataFrame) -> list[str]:
     """Return the feature column list for this DataFrame.
 
-    Includes ``dxy_log_return`` only when the column is present and has enough
-    non-null values to be useful (>50% coverage).
+    Includes ``usdchf_log_return`` only when the column is present and has
+    enough non-null values to be useful (>50% coverage).
     """
     cols = list(FEATURE_COLS)
-    if DXY_FEATURE in df.columns and df[DXY_FEATURE].notna().mean() > 0.5:
-        cols.append(DXY_FEATURE)
+    if USDCHF_FEATURE in df.columns and df[USDCHF_FEATURE].notna().mean() > 0.5:
+        cols.append(USDCHF_FEATURE)
     return cols
 
 

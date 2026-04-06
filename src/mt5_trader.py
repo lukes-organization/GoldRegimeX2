@@ -22,8 +22,8 @@ from src.notifier import send_telegram_msg
 from src.logger import setup_logger
 from src.processor import (
     TF_CONFIG,
-    DXY_RAW_PATH,
-    load_dxy_data,
+    USDCHF_MASTER_PATH,
+    load_usdchf_data,
     compute_log_returns,
     kalman_smooth,
     compute_volatility,
@@ -34,7 +34,6 @@ from src.engine_hmm import load_model as load_hmm, predict_states
 from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
 )
-from src.mt5_sync import DXY_SYMBOL_ALIASES, _find_dxy_symbol
 from src.risk_manager import AdaptiveRiskManager, CENT_MULTIPLIER
 
 logger = setup_logger(__name__)
@@ -75,24 +74,24 @@ TF_TP_CONFIG = {
 
 # Lazy MT5 timeframe map
 
-# ── DXY fallback cache ────────────────────────────────────────────────────────
-# When the broker doesn't carry DXY as a live symbol, we carry forward the
-# last known daily log return from DXY_data.csv (much closer to reality than 0.0).
-_DXY_FALLBACK_CACHE: float | None = None
+# ── USDCHF fallback cache ─────────────────────────────────────────────────────
+# When the live USDCHF bar fetch fails (e.g. symbol not subscribed), carry the
+# last known return from the master CSV — far better than assuming 0.0.
+_USDCHF_FALLBACK_CACHE: float | None = None
 
-def _get_dxy_fallback() -> float:
-    """Return the last known DXY log return from DXY_data.csv (cached after first load)."""
-    global _DXY_FALLBACK_CACHE
-    if _DXY_FALLBACK_CACHE is None:
+def _get_usdchf_fallback() -> float:
+    """Return the last known USDCHF log return from the master CSV (cached)."""
+    global _USDCHF_FALLBACK_CACHE
+    if _USDCHF_FALLBACK_CACHE is None:
         try:
-            dxy_df = load_dxy_data(DXY_RAW_PATH)
-            if dxy_df is not None:
-                _DXY_FALLBACK_CACHE = float(dxy_df["dxy_log_return"].dropna().iloc[-1])
+            usdchf_df = load_usdchf_data(USDCHF_MASTER_PATH)
+            if usdchf_df is not None:
+                _USDCHF_FALLBACK_CACHE = float(usdchf_df["usdchf_log_return"].dropna().iloc[-1])
             else:
-                _DXY_FALLBACK_CACHE = 0.0
+                _USDCHF_FALLBACK_CACHE = 0.0
         except Exception:
-            _DXY_FALLBACK_CACHE = 0.0
-    return _DXY_FALLBACK_CACHE
+            _USDCHF_FALLBACK_CACHE = 0.0
+    return _USDCHF_FALLBACK_CACHE
 _MT5_TF_MAP: dict | None = None
 
 
@@ -221,19 +220,19 @@ def check_margin(symbol: str, lot: float, order_type: int, price: float) -> bool
 # Signal derivation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_dxy_log_return(tf_mt5: int, mt5) -> float | None:
-    """Fetch the most recently completed DXY bar log return for live inference.
+def _fetch_usdchf_log_return(tf_mt5: int, mt5) -> float | None:
+    """Fetch the most recently completed USDCHF bar log return for live inference.
 
-    Returns ``None`` if no DXY symbol is found on the broker or data is
-    unavailable — callers should substitute ``0.0`` in that case.
+    USDCHF is always available on Headway as a standard Forex pair — unlike
+    DXY/USDX which many brokers don't carry.  Returns ``None`` only if the
+    data call fails (symbol not subscribed, no recent bars, etc.).
     """
-    dxy_sym = _find_dxy_symbol(mt5)
-    if dxy_sym is None:
-        return None
-    rates = mt5.copy_rates_from_pos(dxy_sym, tf_mt5, 1, 3)  # 3 completed bars
+    rates = mt5.copy_rates_from_pos("USDCHF", tf_mt5, 1, 3)   # 3 completed bars
     if rates is None or len(rates) < 2:
         return None
     closes = [r["close"] for r in rates]
+    if closes[-2] <= 0:
+        return None
     return float(np.log(closes[-1] / closes[-2]))
 
 
@@ -392,8 +391,8 @@ def compute_live_features(
         atr_price    (float): ATR in price terms for SL calculation.
 
     ``feature_cols`` is loaded from the ensemble metadata so the live vector
-    always matches what the models were trained on.  If ``dxy_log_return`` is
-    required and unavailable from the broker, it is filled with 0.0.
+    always matches what the models were trained on.  If ``usdchf_log_return`` is
+    required and the fetch fails, the last known value from the master CSV is used.
     """
     if feature_cols is None:
         feature_cols = FEATURE_COLS
@@ -413,18 +412,18 @@ def compute_live_features(
         "prev_log_return": prev_log_return,
     }
 
-    if "dxy_log_return" in feature_cols:
+    if "usdchf_log_return" in feature_cols:
         if mt5 is not None:
-            dxy_ret = _fetch_dxy_log_return(tf_mt5, mt5)
+            usdchf_ret = _fetch_usdchf_log_return(tf_mt5, mt5)
         else:
-            dxy_ret = None
-        if dxy_ret is None:
-            dxy_ret = _get_dxy_fallback()
+            usdchf_ret = None
+        if usdchf_ret is None:
+            usdchf_ret = _get_usdchf_fallback()
             logger.warning(
-                "DXY return unavailable — using last known value %.6f as fallback for dxy_log_return.",
-                dxy_ret,
+                "USDCHF return unavailable — using last known value %.6f as fallback.",
+                usdchf_ret,
             )
-        feature_dict["dxy_log_return"] = dxy_ret
+        feature_dict["usdchf_log_return"] = usdchf_ret
 
     features_df = pd.DataFrame([feature_dict])[feature_cols]
     atr_price   = atr_normalized * float(df["Close"].iloc[-1])

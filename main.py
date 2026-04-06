@@ -460,6 +460,19 @@ def cmd_guardian(args):
     )
 
 
+def cmd_consolidate(args):
+    """Consolidate all USDCHF CSV exports in data/raw/ into USDCHF_master.csv."""
+    from src.data_consolidator import consolidate_usdchf
+    result = consolidate_usdchf()
+    if result.empty:
+        logger.error(
+            "Consolidation produced no data. Place USDCHF CSV files in data/raw/ "
+            "with 'USDCHF' in the filename (e.g. USDCHF_5m_data.csv)."
+        )
+    else:
+        print(f"\nUSDCHF master built: {len(result)} rows → data/processed/USDCHF_master.csv\n")
+
+
 def cmd_listen(args):
     """Start the Telegram remote control listener + nightly report scheduler."""
     import threading
@@ -503,7 +516,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
-                 "sync_validate", "live", "audit", "guardian", "listen"],
+                 "sync_validate", "live", "audit", "guardian", "listen", "consolidate"],
         required=True,
     )
     parser.add_argument("--trials",   type=int,   default=250)
@@ -541,6 +554,7 @@ def main():
         "audit":         cmd_audit,
         "guardian":      cmd_guardian,
         "listen":        cmd_listen,
+        "consolidate":   cmd_consolidate,
     }[args.mode](args)
 
 

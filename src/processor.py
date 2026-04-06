@@ -10,9 +10,13 @@ logger = setup_logger(__name__)
 # in raw observations). M15 is ~4× noisier than H1; M5 uses a low obs_cov
 # (0.05) to keep the filter very responsive for fast scalping regime detection.
 # n_states_default: M5 uses 4 states to capture micro-noise; M15/H1 use 3.
-# Single DXY file — DXY is a daily index; one complete file is shared across all TFs.
-# Export from MT5 History Center (XAUUSD → H1, then switch to DXY/USDX) and save here.
-DXY_RAW_PATH = Path("data/raw/DXY_data.csv")
+# Single shared USDCHF master file — intraday proxy for DXY (correlates ~0.85
+# with USD Index for XAUUSD signals and is always available on Headway).
+# Run  python main.py --mode consolidate  to build this from MT5 exports.
+USDCHF_MASTER_PATH = Path("data/processed/USDCHF_master.csv")
+
+# Legacy alias kept for any callers that still reference the old name directly.
+DXY_RAW_PATH = USDCHF_MASTER_PATH
 
 TF_CONFIG = {
     "H1": {
@@ -58,50 +62,66 @@ def load_raw_data(path: Path = RAW_PATH) -> pd.DataFrame:
     return df
 
 
-def load_dxy_data(path: Path) -> pd.DataFrame | None:
-    """Load a DXY CSV and return a single-column DataFrame with ``dxy_log_return``.
+def load_usdchf_data(path: Path) -> pd.DataFrame | None:
+    """Load the USDCHF master CSV and return a ``usdchf_log_return`` column.
 
     Returns ``None`` if the file does not exist — callers treat this as
-    "DXY feature not available for this training run".
+    "USDCHF feature not available for this training run".
 
-    Expected format: same semicolon-delimited MT5 export as XAUUSD, with a
-    ``Close`` column.  File names follow the pattern ``DXY_{tf}_data.csv``
-    (e.g. ``data/raw/DXY_1h_data.csv``).
+    Run ``python main.py --mode consolidate`` to build the master from MT5
+    exports before training.
     """
     if not path.exists():
         return None
-    # DXY_data.csv is saved as YYYY-MM-DD (daily). Use infer to be format-agnostic.
-    df = pd.read_csv(path, sep=";", parse_dates=["Date"])
-    df.set_index("Date", inplace=True)
+    df = pd.read_csv(path, index_col="Date", parse_dates=True)
     df.sort_index(inplace=True)
-    df["dxy_log_return"] = np.log(df["Close"] / df["Close"].shift(1))
-    logger.info("Loaded DXY data: %d rows from %s", len(df), path)
-    return df[["dxy_log_return"]]
+    df["usdchf_log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+    logger.info("Loaded USDCHF master: %d rows from %s", len(df), path)
+    return df[["usdchf_log_return"]]
 
 
-def map_dxy_to_bars(df_index: pd.DatetimeIndex, dxy_df: pd.DataFrame) -> pd.Series:
-    """Map daily DXY log return onto an intraday bar index.
+def map_usdchf_to_bars(df_index: pd.DatetimeIndex, usdchf_df: pd.DataFrame) -> pd.Series:
+    """Align USDCHF log returns onto XAUUSD bar timestamps.
 
-    Handles two gap cases:
-    - Internal gaps (weekends / holidays inside the DXY date range) — filled via ffill.
-    - Future dates beyond the DXY file's end (e.g. live sync data newer than the
-      last DXY export) — the last known daily return is carried forward.
-
-    Also handles tz-aware indices (e.g. UTC from MT5 sync) by stripping timezone
-    before comparison with tz-naive DXY dates.
+    Handles both daily USDCHF data (e.g. annual CSV exports) and intraday data
+    (e.g. direct M5 MT5 export):
+    - Daily: normalise each bar's timestamp to midnight and ffill by date.
+    - Intraday: reindex directly onto bar timestamps with ffill.
     """
-    series = dxy_df["dxy_log_return"].copy()
-    # Strip timezone so tz-aware sync data can be compared against tz-naive DXY dates
-    normalized = df_index.tz_localize(None) if df_index.tz is not None else df_index
-    normalized = normalized.normalize()
-    max_date = normalized.max()
-    if max_date > series.index.max():
-        extension = pd.date_range(
-            series.index.max() + pd.Timedelta(days=1), max_date, freq="D"
-        )
-        series = pd.concat([series, pd.Series(series.iloc[-1], index=extension)])
-    series = series.ffill()
-    return normalized.map(series)
+    series = usdchf_df["usdchf_log_return"].copy()
+    # Strip timezone for tz-aware MT5 sync indices
+    idx = df_index.tz_localize(None) if df_index.tz is not None else df_index
+
+    # Detect daily vs intraday by checking whether all times are midnight
+    is_daily = (series.index == series.index.normalize()).all()
+
+    if is_daily:
+        # Daily data — map each intraday bar onto its calendar date
+        # Extend the series forward to cover any bars beyond the last date
+        normalized = idx.normalize()
+        max_date = normalized.max()
+        if max_date > series.index.max():
+            extension = pd.date_range(
+                series.index.max() + pd.Timedelta(days=1), max_date, freq="D"
+            )
+            series = pd.concat([series, pd.Series(series.iloc[-1], index=extension)])
+        series = series.ffill()
+        return normalized.map(series)
+    else:
+        # Intraday data — forward-fill onto bar timestamps directly
+        return series.reindex(idx, method="ffill")
+
+
+# Legacy aliases — kept so old imports don't crash if any caller still uses them.
+def load_dxy_data(path: Path) -> pd.DataFrame | None:              # noqa: D103
+    return load_usdchf_data(path)
+
+
+def map_dxy_to_bars(df_index: pd.DatetimeIndex, dxy_df: pd.DataFrame) -> pd.Series:  # noqa: D103
+    # Adapt old dxy_log_return column name if present (backwards compat)
+    if "dxy_log_return" in dxy_df.columns and "usdchf_log_return" not in dxy_df.columns:
+        dxy_df = dxy_df.rename(columns={"dxy_log_return": "usdchf_log_return"})
+    return map_usdchf_to_bars(df_index, dxy_df)
 
 
 def filter_data(df: pd.DataFrame, years: int = 10) -> pd.DataFrame:
@@ -192,23 +212,21 @@ def process_pipeline(
     df["rsi_slope"] = df["rsi"].diff()
     df["atr_normalized"] = compute_atr(df)
 
-    # ── Optional DXY cross-asset feature ────────────────────────────────────
-    # DXY is a daily index shared across all TFs — one file covers H1/M15/M5.
-    dxy_path = DXY_RAW_PATH
-    if dxy_path:
-        dxy_df = load_dxy_data(dxy_path)
-        if dxy_df is not None:
-            # DXY is daily — normalize each intraday bar's timestamp to midnight
-            # so it matches the DXY date index before mapping.
-            df["dxy_log_return"] = map_dxy_to_bars(df.index, dxy_df)
-            n_dxy = df["dxy_log_return"].notna().sum()
-            logger.info("DXY merged: %d non-null dxy_log_return values.", n_dxy)
-        else:
-            logger.info(
-                "DXY file not found at %s — pipeline running without cross-asset feature. "
-                "Export DXY from MT5 History Center to enable it.",
-                dxy_path,
-            )
+    # ── Optional USDCHF cross-asset feature ─────────────────────────────────
+    # USDCHF is an intraday DXY proxy — correlates ~0.85 with USD Index and
+    # is always available on Headway as a standard Forex pair.
+    # Build the master with:  python main.py --mode consolidate
+    usdchf_df = load_usdchf_data(USDCHF_MASTER_PATH)
+    if usdchf_df is not None:
+        df["usdchf_log_return"] = map_usdchf_to_bars(df.index, usdchf_df)
+        n_usdchf = df["usdchf_log_return"].notna().sum()
+        logger.info("USDCHF merged: %d non-null usdchf_log_return values.", n_usdchf)
+    else:
+        logger.info(
+            "USDCHF master not found at %s — pipeline running with 4 base features. "
+            "Run  python main.py --mode consolidate  to enable the 5th feature.",
+            USDCHF_MASTER_PATH,
+        )
 
     df.dropna(inplace=True)
     logger.info(

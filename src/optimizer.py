@@ -64,12 +64,18 @@ def _get_tier(balance: float) -> str:
 
 
 def _score_result(result: dict, tier: str, broker: str) -> float:
-    cfg = TIER_CONFIGS[tier]
-    if result["max_drawdown"] > cfg["dd_limit"]:
-        return -10.0
-    if broker == "headway_cent":
-        return result["sharpe_ratio"] - result["max_drawdown"] * cfg["dd_penalty"]
-    return result["sharpe_ratio"]
+    cfg  = TIER_CONFIGS[tier]
+    dd   = result["max_drawdown"]
+    base = (result["sharpe_ratio"] - dd * cfg["dd_penalty"]
+            if broker == "headway_cent"
+            else result["sharpe_ratio"])
+    if dd > cfg["dd_limit"]:
+        # Sliding penalty: -2.0 per 1% of DD over the limit.
+        # Replaces the hard -10.0 so trials with, e.g., 16% DD on a 15% limit
+        # can still score positively instead of being discarded outright.
+        overshoot = (dd - cfg["dd_limit"]) * 200   # 0.01 excess → -2.0
+        return base - overshoot
+    return base
 
 
 def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
@@ -104,14 +110,20 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         if short_threshold >= prob_threshold:
             return -10.0
 
-        max_depth        = trial.suggest_int("max_depth", 3, 5)
+        # M5 uses shallower trees (2-3) to prevent IS memorisation across the
+        # large bar count; heavier L1 reg (1-20) to sparsify feature weights.
+        if tf.upper() == "M5":
+            max_depth = trial.suggest_int("max_depth", 2, 3)
+            reg_alpha = trial.suggest_float("reg_alpha", 1.0, 20.0, log=True)
+        else:
+            max_depth = trial.suggest_int("max_depth", 3, 5)
+            reg_alpha = trial.suggest_float("reg_alpha", 0.01, 10.0, log=True)
         learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
         n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)
         subsample        = trial.suggest_float("subsample", 0.6, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
         min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
         gamma            = trial.suggest_float("gamma",     0.01, 5.0,  log=True)
-        reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 10.0, log=True)
 
         try:
             df = process_pipeline(

@@ -21,9 +21,9 @@ from pathlib import Path
 from src.logger import setup_logger
 from src.processor import (
     TF_CONFIG,
-    DXY_RAW_PATH,
-    load_dxy_data,
-    map_dxy_to_bars,
+    USDCHF_MASTER_PATH,
+    load_usdchf_data,
+    map_usdchf_to_bars,
     compute_log_returns,
     kalman_smooth,
     compute_volatility,
@@ -71,10 +71,10 @@ def _apply_features(
     df["rsi_slope"]      = df["rsi"].diff()
     df["atr_normalized"] = compute_atr(df)
 
-    # Mirror process_pipeline: add DXY if the shared file exists
-    dxy_df = load_dxy_data(DXY_RAW_PATH)
-    if dxy_df is not None:
-        df["dxy_log_return"] = map_dxy_to_bars(df.index, dxy_df)
+    # Mirror process_pipeline: add USDCHF if the master file exists
+    usdchf_df = load_usdchf_data(USDCHF_MASTER_PATH)
+    if usdchf_df is not None:
+        df["usdchf_log_return"] = map_usdchf_to_bars(df.index, usdchf_df)
 
     df.dropna(inplace=True)
     return df
