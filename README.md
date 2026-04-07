@@ -37,11 +37,11 @@ GaussianHMM   →  Regime Labels  (Bull=0, Bear=1, Chop=2)
       │
       ▼
 XGBoost       →  Three-Model Volatility Ensemble
-               Features: [hmm_state, rsi_slope, atr_normalized, prev_log_return, dxy_log_return*]
+               Features: [hmm_state, rsi_slope, atr_normalized, prev_log_return, usdchf_log_return*]
                Low ATR bucket  → XGBoost model (quiet market)
                Med ATR bucket  → XGBoost model (normal market)
                High ATR bucket → XGBoost model (volatile market)
-               * optional — requires data/raw/DXY_data.csv
+               * optional — requires data/processed/USDCHF_master.csv (run --mode consolidate first)
       │
       ▼
 Backtester    →  IS / OOS Sharpe, Drawdown, Trade Count
@@ -127,15 +127,17 @@ The system requires historical OHLCV CSV files exported from MetaTrader5. In MT5
 
 > The system works with H1, M15 and M5 timeframes. More data = better optimization. Aim for at least 2 years of history; the included H1 dataset covers 2004–2025.
 
-### DXY (US Dollar Index) — optional cross-asset feature
+### USDCHF — cross-asset USD strength feature (optional, recommended)
 
-DXY is a daily index — **one file covers all timeframes**. To enable the cross-asset `dxy_log_return` feature:
+USDCHF is used as an intraday DXY proxy (high correlation, natively available on Headway as a standard Forex pair). To enable the `usdchf_log_return` feature:
 
-1. In MT5 History Center, select **DXY** (or USDX / DOLLAR, depending on your broker)
-2. Export as CSV (semicolon-delimited, same format as above)
-3. Save to: `data/raw/DXY_data.csv`
-
-If the file is absent the pipeline runs without the DXY feature — all three timeframes degrade gracefully to the standard 4-feature model. No code change is needed; the presence of the file is the only switch.
+1. In MT5, export **USDCHF** CSV files for any timeframe (semicolon-delimited, same format as XAUUSD)
+2. Save them to `data/raw/` — any filename containing `USDCHF` works (e.g. `USDCHF_2024.csv`, `USDCHF_H1.csv`)
+3. Run the consolidator to merge them into the master file:
+```bash
+python main.py --mode consolidate
+```
+This produces `data/processed/USDCHF_master.csv`. The pipeline detects it automatically — no code change needed. If absent, all timeframes degrade gracefully to the standard 4-feature model.
 
 ---
 
@@ -172,6 +174,14 @@ LIVE_BALANCE=15
 
 ## Full Workflow
 
+### Step 0 — Consolidate USDCHF (if you have USDCHF CSV exports)
+
+```bash
+python main.py --mode consolidate
+```
+
+Merges all `*USDCHF*.csv` files in `data/raw/` into `data/processed/USDCHF_master.csv`. Run once before processing. Skip if you have no USDCHF data — the pipeline works without it (4-feature mode).
+
 ### Step 1 — Process raw data
 
 ```bash
@@ -204,7 +214,7 @@ Each trial is scored on **OOS Sharpe only** to prevent IS data leakage. Trials w
 python main.py --mode train --broker headway_cent --balance 15 --tf H1
 ```
 
-Trains HMM and the three-model XGBoost volatility ensemble using the best parameters found by the optimizer. Prints IS/OOS Sharpe, drawdown, and trade count per bucket. Saves `models/hmm_model.pkl` and `models/xgb_ensemble.pkl`.
+Trains HMM and the three-model XGBoost volatility ensemble using the best parameters found by the optimizer. Prints IS/OOS Sharpe, drawdown, and trade count per bucket. Saves **TF-specific model files**: `models/hmm_model_H1.pkl` and `models/xgb_ensemble_H1.pkl` (replacing `H1` with the target TF). Each timeframe gets its own model files — training M15 never overwrites H1 models.
 
 ### Step 4 — Compare timeframes (optional)
 
@@ -289,9 +299,10 @@ python main.py --mode <MODE> [OPTIONS]
 
 | Mode | Description |
 |------|-------------|
+| `consolidate` | Merge all `*USDCHF*.csv` files in `data/raw/` into the USDCHF master |
 | `process` | Process raw CSV → parquet |
 | `optimize` | Run / resume Optuna hyperparameter search |
-| `train` | Train HMM + XGBoost with best params |
+| `train` | Train HMM + XGBoost with best params (saves TF-specific model files) |
 | `compare` | Side-by-side OOS comparison across TFs |
 | `export` | Export XGBoost → ONNX |
 | `report` | Generate 5-chart visual report |
@@ -321,7 +332,7 @@ A trade fires when ALL of the following are true:
 
 | Condition | BUY | SELL |
 |-----------|-----|------|
-| XGBoost probability | `prob > prob_threshold` | `prob < (1 - prob_threshold)` |
+| XGBoost probability | `prob > prob_threshold` | `prob < short_threshold` |
 | HMM regime | Not Chop (state ≠ 2) | Not Chop (state ≠ 2) |
 | Session limit | Under daily cap | Under daily cap |
 | No open position | No existing GRX position | No existing GRX position |
@@ -371,10 +382,13 @@ During training, each model only sees bars from its own bucket (IS subset). Duri
 
 | File | Purpose |
 |------|---------|
-| `models/xgb_ensemble.pkl` | All three models + ATR thresholds + feature list |
+| `models/hmm_model_{TF}.pkl` | HMM regime model for a specific timeframe (e.g. `hmm_model_H1.pkl`) |
+| `models/xgb_ensemble_{TF}.pkl` | XGBoost ensemble + ATR thresholds + feature list for a TF |
 | `models/xgb_model_vol_low.onnx` | Low-volatility bucket (MQL5 EA use) |
 | `models/xgb_model_vol_med.onnx` | Medium-volatility bucket (MQL5 EA use) |
 | `models/xgb_model_vol_high.onnx` | High-volatility bucket (MQL5 EA use) |
+
+> The generic `models/hmm_model.pkl` / `models/xgb_ensemble.pkl` serve as backward-compatible fallbacks only. All new training creates TF-specific files.
 
 ### Features
 
@@ -384,19 +398,25 @@ During training, each model only sees bars from its own bucket (IS subset). Duri
 | `rsi_slope` | Rate of change of RSI — momentum direction |
 | `atr_normalized` | ATR / Close — normalised volatility |
 | `prev_log_return` | Previous bar log return — short-term momentum |
-| `dxy_log_return` | Daily DXY log return — USD strength signal *(optional)* |
+| `usdchf_log_return` | USDCHF log return — intraday USD strength proxy *(optional, run --mode consolidate)* |
 
-The DXY feature is included automatically when `data/raw/DXY_data.csv` exists. If the file is absent all three models run with 4 features — no code change needed.
+The USDCHF feature is included automatically when `data/processed/USDCHF_master.csv` exists. If absent, all three models run with 4 features — no code change needed.
 
 ### Probability threshold
 
-A single `prob_threshold` is optimised by Optuna (search range `0.505–0.60`) and applies symmetrically across all three models:
+`prob_threshold` and `short_threshold` are **both tuned independently by Optuna** and stored in the study. They are loaded automatically at live startup:
 
 - **BUY**: `prob > prob_threshold`
-- **SELL**: `prob < 1 − prob_threshold`
+- **SELL**: `prob < short_threshold`  (Optuna-tuned separately, not `1 − prob_threshold`)
 - **Chop state**: trades blocked regardless of probability
 
-The threshold is the same for Bull, Bear, and Chop regimes because the XGBoost model already internalises regime via the `hmm_state` feature — it naturally produces higher BUY probabilities in Bull conditions and higher SELL probabilities in Bear conditions.
+| TF | `prob_threshold` range | `short_threshold` range |
+|----|----------------------|------------------------|
+| M5 | 0.50 – 0.55 | 0.44 – 0.50 |
+| M15 | 0.52 – 0.65 | 0.35 – 0.48 |
+| H1 | 0.52 – 0.65 | 0.35 – 0.48 |
+
+The XGBoost model already internalises regime via the `hmm_state` feature — it naturally produces higher BUY probabilities in Bull conditions and higher SELL probabilities in Bear conditions.
 
 ---
 
@@ -412,11 +432,14 @@ Minimum lot is 0.01 (micro-lot). All lots are rounded to 2 decimal places.
 
 **Daily trade limits (adaptive):**
 
-| Account Balance | Regime | Max Trades/Day | Positions/Signal |
-|----------------|--------|----------------|-----------------|
-| ≤ $50 | Any | 2 | 1 |
-| > $50 | Bull / Bear | 3 | 2 |
-| > $50 | Chop | 2 | 2 |
+| Account Balance | TF | Regime | Max Trades/Day | Positions/Signal |
+|----------------|-----|--------|----------------|-----------------|
+| ≤ $50 | M5 | Any | 4 | 1 |
+| ≤ $50 | M15 / H1 | Any | 2 | 1 |
+| > $50 | Any | Bull / Bear | 3 | 2 |
+| > $50 | Any | Chop | 2 | 2 |
+
+M5 gets a higher daily cap (4 vs 2) because 288 bars/day means many more valid signal opportunities, and the optimizer needs enough OOS trades to clear its minimum trade count requirement (MIN_OOS_TRADES=300 for M5).
 
 **Cent Account (Headway):** MT5 displays $15 USD as `1500.00`. Pass `--broker headway_cent` and the bridge divides the raw balance by 100 automatically.
 
@@ -428,22 +451,48 @@ Minimum lot is 0.01 (micro-lot). All lots are rounded to 2 decimal places.
 |-----------|-----|-----|-----|
 | Kalman `obs_cov` default | 0.05 | 4.0 | 1.0 |
 | Bars/day (annualization) | 288 | 96 | 24 |
+| HMM `n_states` search | `{2, 4}` only | 2–4 | 2–4 |
+| Min OOS trades (optimizer) | 300 | 100 | 50 |
 | TP1 multiplier (trending) | 1.0× SL | 1.5× SL | 1.5× SL |
 | Base deviation | 30 pts | 20 pts | 20 pts |
+| Max trades/day (≤$50) | 4 | 2 | 2 |
 | Spread viability guard | Yes | No | No |
 | 5-day readiness gate | Yes | No | No |
+
+> **M5 `n_states` restriction:** n_states=3 is always degenerate for M5 (Bull and Chop collapse to identical means, producing 500K+ HMM transitions and covariance errors). The optimizer skips 3 and searches only `{2, 4}`.
 
 **M5 readiness gate:** `models/m5_meta.json` must exist and be less than 120 hours old. The optimizer creates this file automatically after completing an M5 study. If stale, `--mode live --tf M5` will exit with an error until you re-optimize.
 
 **M5 workflow:**
 ```bash
+python main.py --mode consolidate                                              # merge USDCHF CSVs (once)
 python main.py --mode process --tf M5
 python -c "import optuna; optuna.delete_study('gold_regime_x_small_headway_cent_M5', 'sqlite:///models/study.db')"
 python main.py --mode optimize --tf M5 --trials 300 --broker headway_cent --balance 15
-python main.py --mode train --tf M5 --broker headway_cent --balance 15
+python main.py --mode train --tf M5 --broker headway_cent --balance 15        # saves hmm_model_M5.pkl
 python main.py --mode sync_validate --tf M5 --period 3m --broker headway_cent --balance 15
 python main.py --mode live --tf M5 --account demo --broker headway_cent --balance 15
 ```
+
+**M15 workflow:**
+```bash
+python main.py --mode process --tf M15
+python main.py --mode optimize --tf M15 --trials 250 --broker headway_cent --balance 15
+python main.py --mode train --tf M15 --broker headway_cent --balance 15       # saves hmm_model_M15.pkl
+python main.py --mode sync_validate --tf M15 --period 6m --broker headway_cent --balance 15
+python main.py --mode live --tf M15 --account demo --broker headway_cent --balance 15
+```
+
+**H1 workflow:**
+```bash
+python main.py --mode process --tf H1
+python main.py --mode optimize --tf H1 --trials 250 --broker headway_cent --balance 15
+python main.py --mode train --tf H1 --broker headway_cent --balance 15        # saves hmm_model_H1.pkl
+python main.py --mode sync_validate --tf H1 --period 6m --broker headway_cent --balance 15
+python main.py --mode live --tf H1 --account demo --broker headway_cent --balance 15
+```
+
+> Use `--period 6m` (or `12m`) for H1/M15 sync_validate — a 3-month window produces very few H1 trades, making the Sharpe estimate unreliable.
 
 ---
 
@@ -518,7 +567,7 @@ To use the EA:
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | `ConnectionError: Could not connect to MT5` | Terminal not running | Open MT5 and log in first |
-| `FileNotFoundError: models/hmm_model.pkl` | Models not trained | Run `--mode train` |
+| `FileNotFoundError: models/hmm_model_H1.pkl` | Models not trained for this TF | Run `--mode train --tf H1` (or M15/M5) |
 | `FileNotFoundError: models/m5_meta.json` | M5 not optimized | Run `--mode optimize --tf M5` |
 | Validation FAIL every day | Model too old for current regime | Re-optimize and retrain |
 | `Order failed: retcode=10006` | No broker connection | Check MT5 connection indicator |

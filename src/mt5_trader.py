@@ -608,7 +608,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
     signal_tracker = {"tickets": [], "entry_price": 0.0,
                       "direction": None, "tp1_hit": False}
 
-    arm = AdaptiveRiskManager(account_size)
+    arm = AdaptiveRiskManager(account_size, tf=tf)
     logger.info(
         "Live loop started — TF=%s  broker=%s  balance=$%.2f  dry_run=%s  %s",
         tf, broker, account_size, dry_run, arm,
@@ -662,7 +662,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
             except Exception:
                 telemetry = {}
 
-            arm              = AdaptiveRiskManager(account_size)
+            arm              = AdaptiveRiskManager(account_size, tf=tf)
             arm.daily_trades = daily_trades   # restore session count
 
             # ── 4. Compute live features + probability ────────────────────

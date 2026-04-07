@@ -95,11 +95,12 @@ class AdaptiveRiskManager:
 
     CHOP_STATE = 2
 
-    def __init__(self, balance: float):
+    def __init__(self, balance: float, tf: str = "H1"):
         self.balance = max(float(balance), MIN_CAPITAL_USD)
+        self.tf = tf.upper()
         self.daily_trades = 0
         tier = "small" if self.balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
-        logger.debug("AdaptiveRiskManager: balance=$%.2f tier=%s", self.balance, tier)
+        logger.debug("AdaptiveRiskManager: balance=$%.2f tier=%s tf=%s", self.balance, tier, self.tf)
 
     @property
     def is_small_account(self) -> bool:
@@ -111,13 +112,15 @@ class AdaptiveRiskManager:
         Args:
             market_state: Current HMM state index. If None, uses the most
                           permissive limit for the account tier.
-            tf: Timeframe string (e.g. ``"M5"``). M5 small accounts get a
-                higher daily cap (4) to match the higher bar frequency.
+            tf: Timeframe string (e.g. ``"M5"``). Defaults to ``self.tf``
+                set at construction. M5 small accounts get a higher daily
+                cap (4) to match the higher bar frequency.
         """
+        _tf = (tf or self.tf).upper()
         if self.is_small_account:
             # M5 generates ~288 bars/day — allow more signals so the optimizer
             # can find frequent enough OOS trades to clear MIN_OOS_TRADES=300.
-            max_daily = 4 if (tf and tf.upper() == "M5") else 2
+            max_daily = 4 if _tf == "M5" else 2
             return {"max_daily_trades": max_daily, "pos_per_trade": 1, "total_daily_pos": max_daily}
 
         # Growth account: market-state-dependent
@@ -148,7 +151,7 @@ class AdaptiveRiskManager:
         return max(0.01, round(lot_size, 2))
 
     def can_trade(self, market_state: int = None) -> bool:
-        limits = self.get_trade_limits(market_state)
+        limits = self.get_trade_limits(market_state, tf=self.tf)
         return self.daily_trades < limits["max_daily_trades"]
 
     def log_trade(self):
