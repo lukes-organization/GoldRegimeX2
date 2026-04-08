@@ -93,7 +93,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             obs_cov = trial.suggest_float("obs_cov", 1.0, 5.0, log=True)
         else:
             obs_cov = trial.suggest_float("obs_cov", 0.1, 5.0, log=True)
-        trans_cov      = trial.suggest_float("trans_cov",      0.001, 0.1, log=True)
+        # M5 Kalman is calibrated for 5-min noise; H1/M15 have smoother signals
+        # so trans_cov above 0.03 tends to produce chaotic Bull/Chop oscillation
+        # (49K+ transitions, identical state means) that the persistence guard
+        # below must then reject.  Cap it early to save wasted trials.
+        if tf.upper() == "M5":
+            trans_cov = trial.suggest_float("trans_cov", 0.001, 0.1,  log=True)
+        else:
+            trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
         # M5: n_states=3 is always degenerate for 5-min bars — Bull and Chop
         # collapse to identical means (0.000016 return, 0.000340 vol) producing
         # 500K+ HMM transitions and a non-positive-definite covariance matrix.
@@ -147,6 +154,21 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 obs_cov=obs_cov, trans_cov=trans_cov, save=False, tf=tf
             )
             _hmm, states, _ = fit_hmm(df, n_states=n_states)
+
+            # ── HMM quality gate ─────────────────────────────────────────────
+            # Reject trials where any state has low self-transition probability.
+            # Persistence < 0.80 means the state flips nearly every bar (e.g.
+            # Bull↔Chop oscillating with identical means, 49K+ transitions).
+            # Those labels are noise and will corrupt backtester P&L.
+            _min_persist = min(_hmm.transmat_[i, i] for i in range(n_states))
+            if _min_persist < 0.80:
+                logger.warning(
+                    "Trial %d: degenerate HMM (min state persistence=%.4f < 0.80) "
+                    "— penalising.",
+                    trial.number, _min_persist,
+                )
+                return -100.0
+
             X, y, df_aligned     = prepare_features(df, states)
             models, thresholds, metrics = train_xgb_ensemble(
                 X, y,
