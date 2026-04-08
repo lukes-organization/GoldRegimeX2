@@ -454,18 +454,39 @@ def get_best_params(
     tier = _get_tier(balance)
     name = _study_name(broker=broker, tier=tier, tf=tf)
     storage = _study_db(broker)
-    try:
-        study = optuna.load_study(study_name=name, storage=storage)
-        return study.best_params
-    except Exception:
-        if tier == "small":
-            raise   # small tier is the baseline — nothing to fall back to
-        # Growth (or future tiers) — reuse the small-tier study params so live
-        # trading always benefits from Optuna thresholds.
-        fallback = _study_name(broker=broker, tier="small", tf=tf)
-        logger.info(
-            "Growth study '%s' not found — using small-tier params from '%s'.",
-            name, fallback,
-        )
-        study = optuna.load_study(study_name=fallback, storage=storage)
-        return study.best_params
+
+    def _try_load(db: str) -> dict | None:
+        try:
+            study = optuna.load_study(study_name=name, storage=db)
+            return study.best_params
+        except Exception:
+            return None
+
+    params = _try_load(storage)
+    if params is not None:
+        return params
+
+    # Legacy fallback: studies optimised before per-broker DB split were saved
+    # to models/study.db.  Try it so users don't lose their optimisation work.
+    _legacy = "sqlite:///models/study.db"
+    if storage != _legacy and os.path.exists("models/study.db"):
+        params = _try_load(_legacy)
+        if params is not None:
+            logger.info(
+                "Loaded params for study '%s' from legacy models/study.db. "
+                "Re-run --mode optimize to persist to study_%s.db.",
+                name, broker,
+            )
+            return params
+
+    if tier == "small":
+        raise KeyError(f"No Optuna study '{name}' found in {storage} or study.db")
+    # Growth (or future tiers) — reuse the small-tier study params so live
+    # trading always benefits from Optuna thresholds.
+    fallback = _study_name(broker=broker, tier="small", tf=tf)
+    logger.info(
+        "Growth study '%s' not found — using small-tier params from '%s'.",
+        name, fallback,
+    )
+    study = optuna.load_study(study_name=fallback, storage=storage)
+    return study.best_params

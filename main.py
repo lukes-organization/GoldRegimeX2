@@ -172,6 +172,25 @@ def cmd_train(args):
         params = {}
 
     result, model_hmm, state_map, models_ensemble, thresholds, metrics, *_ = _train_for_tf(tf, balance, broker, params)
+
+    # Guard: refuse to save a degenerate HMM — identical state means + near-zero persistence
+    # indicate the Kalman/HMM params were bad (usually because Optuna params weren't loaded).
+    _min_persist = min(model_hmm.transmat_[i, i] for i in range(model_hmm.n_components))
+    if _min_persist < 0.70:
+        logger.critical(
+            "TRAINING ABORTED: degenerate HMM (min persistence=%.4f). "
+            "Model NOT saved. Usually caused by missing Optuna study for tf=%s broker=%s. "
+            "Ensure --mode optimize has completed and re-run --mode train.",
+            _min_persist, tf, broker,
+        )
+        print(
+            f"\nERROR: Degenerate HMM detected (min state persistence={_min_persist:.4f} < 0.70).\n"
+            f"The model was NOT saved — saving it would only produce garbage signals.\n"
+            f"\nFix: python main.py --mode optimize --tf {tf} --broker {broker} --trials 300\n"
+            f"Then: python main.py --mode train    --tf {tf} --broker {broker}\n"
+        )
+        sys.exit(1)
+
     save_hmm(model_hmm, hmm_model_path(tf, broker))
     save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf, broker))
 
