@@ -94,6 +94,13 @@ def train_xgb(
     train_acc = accuracy_score(y_train, model.predict(X_train))
     test_acc = accuracy_score(y_test, model.predict(X_test))
     importance = dict(zip(list(X.columns), model.feature_importances_))
+    if importance.get("hmm_state", 1.0) == 0.0:
+        logger.warning(
+            "hmm_state importance=0: XGBoost ignores the HMM regime. "
+            "The regime-aligned filter gates signals on a feature XGB deems "
+            "uninformative — likely caused by heavy regularisation or n_states=2. "
+            "Consider re-optimising with n_states>=3 or lower reg_alpha/gamma."
+        )
 
     logger.info("XGB Train Acc: %.4f | Test Acc: %.4f", train_acc, test_acc)
     logger.info("Feature importance: %s", importance)

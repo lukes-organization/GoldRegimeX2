@@ -98,10 +98,17 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # collapse to identical means (0.000016 return, 0.000340 vol) producing
         # 500K+ HMM transitions and a non-positive-definite covariance matrix.
         # Restrict M5 to {2, 4} which are both stable.
+        #
+        # H1/M15: n_states=2 has no Chop state.  With the regime-aligned filter
+        # (BUY only in Bull, SELL only in Bear) every bar is forced into one
+        # direction — in a strong trending market the HMM mislabels many bars as
+        # the wrong regime and the model fires signals counter to the trend.
+        # Require at least 3 states so ambiguous bars enter Chop (no signal) and
+        # only clean Bull/Bear periods generate trades.
         if tf.upper() == "M5":
             n_states = trial.suggest_categorical("n_states", [2, 4])
         else:
-            n_states   = trial.suggest_int("n_states", 2, 4)
+            n_states   = trial.suggest_int("n_states", 3, 4)
         # M5 probs cluster below 0.56 in live — narrow range forces the
         # optimizer to find high-frequency signals in the 0.50–0.55 window.
         # H1/M15: ceiling cut to 0.58 (was 0.65) — prevents ultra-conservative
