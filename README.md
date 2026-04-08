@@ -441,11 +441,12 @@ Minimum lot is 0.01 (micro-lot). All lots are rounded to 2 decimal places.
 | Account Balance | TF | Regime | Max Trades/Day | Positions/Signal |
 |----------------|-----|--------|----------------|-----------------|
 | ≤ $50 | M5 | Any | 4 | 1 |
-| ≤ $50 | M15 / H1 | Any | 2 | 1 |
+| ≤ $50 | M15 | Any | 4 | 1 |
+| ≤ $50 | H1 | Any | 2 | 1 |
 | > $50 | Any | Bull / Bear | 3 | 2 |
 | > $50 | Any | Chop | 2 | 2 |
 
-M5 gets a higher daily cap (4 vs 2) because 288 bars/day means many more valid signal opportunities, and the optimizer needs enough OOS trades to clear its minimum trade count requirement (MIN_OOS_TRADES=300 for M5).
+M5 and M15 both get a 4/day cap — M5 has ~288 bars/day and M15 ~96 bars/day, giving enough signal opportunities to clear the optimizer's MIN_OOS_TRADES=200 requirement. H1 remains at 2/day.
 
 **Cent Account (Headway):** MT5 displays $15 USD as `1500.00`. Pass `--broker headway_cent` and the bridge divides the raw balance by 100 automatically.
 

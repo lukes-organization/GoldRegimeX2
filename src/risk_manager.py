@@ -118,9 +118,9 @@ class AdaptiveRiskManager:
         """
         _tf = (tf or self.tf).upper()
         if self.is_small_account:
-            # M5 generates ~288 bars/day — allow more signals so the optimizer
-            # can find frequent enough OOS trades to clear MIN_OOS_TRADES=300.
-            max_daily = 4 if _tf == "M5" else 2
+            # M5 generates ~288 bars/day, M15 ~96 bars/day — both get a higher
+            # daily cap so the optimizer can clear MIN_OOS_TRADES thresholds.
+            max_daily = 4 if _tf in ("M5", "M15") else 2
             return {"max_daily_trades": max_daily, "pos_per_trade": 1, "total_daily_pos": max_daily}
 
         # Growth account: market-state-dependent
