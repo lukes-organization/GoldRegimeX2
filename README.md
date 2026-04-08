@@ -343,15 +343,21 @@ A trade fires when ALL of the following are true:
 
 ### Staged Take-Profits
 
-Each signal places multiple positions with different TPs (SL distance = ATR × 2.0):
+Each signal places multiple positions with different TPs (SL distance = ATR × TF multiplier):
 
-| Regime | TP1 | TP2 (Runner) |
-|--------|-----|--------------|
-| Bull / Bear — M5 | 1.0 × SL | 3.0 × SL |
-| Bull / Bear — M15/H1 | 1.5 × SL | 3.0 × SL |
-| Chop — all TFs | 0.8 × SL | None (single position) |
+| Regime | TP1 | TP2 (Runner) | SL ATR mult |
+|--------|-----|--------------|-------------|
+| Bull / Bear — M5 | 0.8 × SL | 1.5 × SL | 1.5× |
+| Bull / Bear — M15 | 1.0 × SL | 2.0 × SL | 2.0× |
+| Bull / Bear — H1 | 1.0 × SL | 2.0 × SL | 2.0× |
+| Chop — M5 | 0.5 × SL | None (single) | 1.5× |
+| Chop — M15 | 0.8 × SL | None (single) | 2.0× |
+| Chop — H1 | 1.0 × SL | None (single) | 2.0× |
 
-When TP1 fills, the runner's stop-loss is automatically moved to break-even. If the regime shifts to Chop while a runner is active, the runner is closed immediately at market.
+**Profit protection chain (all timeframes):**
+1. **Profit guard** — when price reaches 70% of TP1 distance, SL moves to `entry + 2×spread` (risk-free before TP1 fills)
+2. **Break-even** — when TP1 fills, runner SL moves to exact entry price
+3. **Chop-exit** — if HMM shifts to Chop while runner is active, runner closed at market immediately
 
 ### Deviation (Slippage Tolerance)
 
@@ -452,8 +458,12 @@ M5 gets a higher daily cap (4 vs 2) because 288 bars/day means many more valid s
 | Kalman `obs_cov` default | 0.05 | 4.0 | 1.0 |
 | Bars/day (annualization) | 288 | 96 | 24 |
 | HMM `n_states` search | `{2, 4}` only | 2–4 | 2–4 |
-| Min OOS trades (optimizer) | 300 | 100 | 50 |
-| TP1 multiplier (trending) | 1.0× SL | 1.5× SL | 1.5× SL |
+| Min OOS trades (optimizer) | 300 | 200 | 200 |
+| TP1 multiplier (trending) | 0.8× SL | 1.0× SL | 1.0× SL |
+| TP2 multiplier (runner) | 1.5× SL | 2.0× SL | 2.0× SL |
+| Chop TP (single position) | 0.5× SL | 0.8× SL | 1.0× SL |
+| Profit guard trigger | 70% to TP1 | 70% to TP1 | 70% to TP1 |
+| Break-even after TP1 | Yes | Yes | Yes |
 | Base deviation | 30 pts | 20 pts | 20 pts |
 | Max trades/day (≤$50) | 4 | 2 | 2 |
 | Spread viability guard | Yes | No | No |

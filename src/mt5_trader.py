@@ -69,8 +69,8 @@ TF_HIGH_VOL_DEV    = {"M5": 50,   "M15": 50,   "H1": 50}
 # for a scalp runner vs the original [1.0, 3.0] which rarely filled on M5.
 TF_TP_CONFIG = {
     "M5":  {"trending": [0.8, 1.5], "chop": [0.5]},   # fast partial 0.8x, runner 1.5x
-    "M15": {"trending": [1.0, 2.0], "chop": [0.8]},
-    "H1":  {"trending": [1.5, 3.0], "chop": [1.0]},
+    "M15": {"trending": [1.0, 2.0], "chop": [0.8]},   # partial at 1:1, runner at 2:1
+    "H1":  {"trending": [1.0, 2.0], "chop": [1.0]},   # same ratio as M15 — 3.0x was rarely filled
 }
 
 # Lazy MT5 timeframe map
