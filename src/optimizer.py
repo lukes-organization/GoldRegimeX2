@@ -36,7 +36,9 @@ except ImportError:
     _PSUTIL_OK = False
     logger.debug("psutil not installed — RAM guard disabled.")
 
-STUDY_DB        = "sqlite:///models/study.db"
+def _study_db(broker: str) -> str:
+    """Return the SQLite storage URL for a given broker, e.g. sqlite:///models/study_headway_cent.db."""
+    return f"sqlite:///models/study_{broker}.db"
 DD_HARD_LIMIT   = 0.15
 # Minimum OOS trades before a trial is considered scoreable.
 # M5 has 288 bars/day — the OOS window (~2yr) allows up to ~870 trades at
@@ -350,12 +352,13 @@ def run_optimization(
     """
     tier = _get_tier(balance)
     name = _study_name(broker=broker, tier=tier, tf=tf)
+    storage = _study_db(broker)
 
     os.makedirs("models", exist_ok=True)
 
     study = optuna.create_study(
         study_name=name,
-        storage=STUDY_DB,
+        storage=storage,
         direction="maximize",
         load_if_exists=True,       # crash-safe resume
         pruner=optuna.pruners.MedianPruner(),
@@ -370,7 +373,7 @@ def run_optimization(
     if already_done > 0:
         pct = already_done / n_trials * 100
         print(
-            f"\nFailsafe: {already_done}/{n_trials} trials already in study.db "
+            f"\nFailsafe: {already_done}/{n_trials} trials already in study_{broker}.db "
             f"({pct:.0f}% complete). "
             f"Resuming from trial #{already_done + 1} — {remaining} remaining.\n"
         )
@@ -450,8 +453,9 @@ def get_best_params(
     """
     tier = _get_tier(balance)
     name = _study_name(broker=broker, tier=tier, tf=tf)
+    storage = _study_db(broker)
     try:
-        study = optuna.load_study(study_name=name, storage=STUDY_DB)
+        study = optuna.load_study(study_name=name, storage=storage)
         return study.best_params
     except Exception:
         if tier == "small":
@@ -463,5 +467,5 @@ def get_best_params(
             "Growth study '%s' not found — using small-tier params from '%s'.",
             name, fallback,
         )
-        study = optuna.load_study(study_name=fallback, storage=STUDY_DB)
+        study = optuna.load_study(study_name=fallback, storage=storage)
         return study.best_params

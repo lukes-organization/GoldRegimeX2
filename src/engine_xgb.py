@@ -14,9 +14,13 @@ XGB_PKL_PATH     = Path("models/xgb_model.pkl")
 ENSEMBLE_PKL_PATH = Path("models/xgb_ensemble.pkl")
 
 
-def get_ensemble_path(tf: str) -> Path:
-    """Return the TF-specific XGB ensemble path, e.g. models/xgb_ensemble_H1.pkl."""
-    return Path(f"models/xgb_ensemble_{tf.upper()}.pkl")
+def get_ensemble_path(tf: str, broker: str = "headway_cent") -> Path:
+    """Return the TF+broker-specific XGB ensemble path.
+
+    Example: get_ensemble_path("H1", "headway_cent") → models/xgb_ensemble_H1_headway_cent.pkl
+    Falls back to the generic models/xgb_ensemble_H1.pkl (then ENSEMBLE_PKL_PATH) if absent.
+    """
+    return Path(f"models/xgb_ensemble_{tf.upper()}_{broker}.pkl")
 
 # Base features always present; usdchf_log_return is added when the USDCHF
 # master CSV is available (run  python main.py --mode consolidate  first).

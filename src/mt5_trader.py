@@ -645,8 +645,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
 
     display_account_info(trading_balance=account_size)
 
-    # Load models — prefer TF-specific file; fall back to generic
-    hmm_path = hmm_model_path(tf)
+    # Load models — prefer broker+TF specific file; fall back to generic
+    hmm_path = hmm_model_path(tf, broker)
     if not hmm_path.exists():
         hmm_path = HMM_GENERIC_PATH
     try:
@@ -654,7 +654,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     except FileNotFoundError:
         raise FileNotFoundError("HMM model not found. Run --mode train first.")
 
-    xgb_path = get_ensemble_path(tf)
+    xgb_path = get_ensemble_path(tf, broker)
     if not xgb_path.exists():
         xgb_path = XGB_GENERIC_PATH
     try:

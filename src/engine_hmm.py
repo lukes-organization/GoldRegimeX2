@@ -10,9 +10,13 @@ logger = setup_logger(__name__)
 MODEL_PATH = Path("models/hmm_model.pkl")
 
 
-def get_model_path(tf: str) -> Path:
-    """Return the TF-specific HMM model path, e.g. models/hmm_model_H1.pkl."""
-    return Path(f"models/hmm_model_{tf.upper()}.pkl")
+def get_model_path(tf: str, broker: str = "headway_cent") -> Path:
+    """Return the TF+broker-specific HMM model path.
+
+    Example: get_model_path("H1", "headway_cent") → models/hmm_model_H1_headway_cent.pkl
+    Falls back to the generic models/hmm_model_H1.pkl (then MODEL_PATH) if absent.
+    """
+    return Path(f"models/hmm_model_{tf.upper()}_{broker}.pkl")
 STATE_NAMES_3 = {0: "Bull", 1: "Bear", 2: "Chop"}
 STATE_NAMES_2 = {0: "Bull", 1: "Bear"}
 STATE_NAMES_4 = {0: "Bull", 1: "Bear", 2: "Chop_Low", 3: "Chop_High"}

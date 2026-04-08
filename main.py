@@ -36,11 +36,14 @@ def _resolve_balance(args) -> float:
     return args.balance if args.balance is not None else args.min_cap
 
 
-_M5_META_PATH      = Path("models/m5_meta.json")
 _M5_EXPIRY_HOURS   = 120   # 5 days
 
 
-def _check_m5_readiness(tf: str) -> bool:
+def _m5_meta_path(broker: str) -> Path:
+    return Path(f"models/m5_meta_{broker}.json")
+
+
+def _check_m5_readiness(tf: str, broker: str = "headway_cent") -> bool:
     """Return True if the M5 model is fresh enough for live trading.
 
     The M5 timeframe is sensitive to microstructure changes, so the model
@@ -49,13 +52,14 @@ def _check_m5_readiness(tf: str) -> bool:
     """
     if tf.upper() != "M5":
         return True
-    if not _M5_META_PATH.exists():
+    meta_path = _m5_meta_path(broker)
+    if not meta_path.exists():
         print(
             "\nERROR: M5 model meta-data not found.\n"
             "Run  python main.py --mode optimize --tf M5  before live trading."
         )
         return False
-    meta     = json.loads(_M5_META_PATH.read_text())
+    meta     = json.loads(meta_path.read_text())
     age_h    = (time.time() - meta.get("timestamp", 0)) / 3600
     if age_h > _M5_EXPIRY_HOURS:
         print(
@@ -142,8 +146,9 @@ def cmd_optimize(args):
         for k, v in study.best_params.items():
             print(f"  {k}: {v}")
         if tf == "M5":
-            _M5_META_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _M5_META_PATH.write_text(json.dumps({
+            meta_path = _m5_meta_path(broker)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps({
                 "timestamp":  time.time(),
                 "tf":         "M5",
                 "best_score": study.best_value,
@@ -167,8 +172,8 @@ def cmd_train(args):
         params = {}
 
     result, model_hmm, state_map, models_ensemble, thresholds, metrics, *_ = _train_for_tf(tf, balance, broker, params)
-    save_hmm(model_hmm, hmm_model_path(tf))
-    save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf))
+    save_hmm(model_hmm, hmm_model_path(tf, broker))
+    save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf, broker))
 
     arm = AdaptiveRiskManager(balance, broker=broker)
     limits = arm.get_trade_limits()
@@ -258,8 +263,9 @@ def cmd_compare(args):
 
 
 def cmd_export(args):
-    tf = args.tf.upper()
-    xgb_path = get_ensemble_path(tf)
+    tf     = args.tf.upper()
+    broker = args.broker
+    xgb_path = get_ensemble_path(tf, broker)
     if not xgb_path.exists():
         xgb_path = ENSEMBLE_PKL_PATH
     try:
@@ -327,11 +333,10 @@ def cmd_demo(args):
     balance = _resolve_balance(args)
     tf      = args.tf.upper()
 
-    if not _check_m5_readiness(tf):
+    if not _check_m5_readiness(tf, args.broker):
         sys.exit(1)
 
-    logger.info(
-        "Starting demo loop — TF=%s  broker=%s  balance=$%.0f",
+    logger.info("Starting demo loop — TF=%s  broker=%s  balance=$%.0f",
         tf, args.broker, balance,
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
@@ -346,7 +351,7 @@ def cmd_live(args):
     balance = _resolve_balance(args)
     tf      = args.tf.upper()
 
-    if not _check_m5_readiness(tf):
+    if not _check_m5_readiness(tf, args.broker):
         sys.exit(1)
 
     if not args.yes:
@@ -382,7 +387,7 @@ def cmd_report(args):
     df = process_pipeline(obs_cov=params.get("obs_cov"), trans_cov=params.get("trans_cov"),
                           save=False, tf=tf)
 
-    _hmm_path = hmm_model_path(tf)
+    _hmm_path = hmm_model_path(tf, broker)
     if not _hmm_path.exists():
         _hmm_path = None  # let the except branch fit a fresh one
     try:
@@ -398,7 +403,7 @@ def cmd_report(args):
 
     X, y, df_aligned = prepare_features(df, states)
 
-    _xgb_path = get_ensemble_path(tf)
+    _xgb_path = get_ensemble_path(tf, broker)
     if not _xgb_path.exists():
         _xgb_path = ENSEMBLE_PKL_PATH
     try:

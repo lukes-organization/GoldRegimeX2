@@ -127,8 +127,8 @@ def run_validation(
     logger.info("Loaded %d bars from %s for validation", len(df), sync_data_path)
     df = _apply_features(df, tf, obs_cov, trans_cov)
 
-    # Load models — prefer TF-specific file; fall back to generic
-    hmm_path = hmm_model_path(tf)
+    # Load models — prefer broker+TF specific file; fall back to generic
+    hmm_path = hmm_model_path(tf, broker)
     if not hmm_path.exists():
         hmm_path = HMM_GENERIC_PATH
         if hmm_path.exists():
@@ -144,13 +144,13 @@ def run_validation(
             "Run  python main.py --mode train  first."
         )
 
-    xgb_path = get_ensemble_path(tf)
+    xgb_path = get_ensemble_path(tf, broker)
     if not xgb_path.exists():
         xgb_path = XGB_GENERIC_PATH
         if xgb_path.exists():
             logger.warning(
-                "No TF-specific XGB ensemble found for %s; falling back to %s. "
-                "Run --mode train --tf %s to create a dedicated model.", tf, xgb_path, tf
+                "No broker+TF XGB ensemble found for %s/%s; falling back to %s. "
+                "Run --mode train --tf %s --broker %s to create a dedicated model.", tf, broker, xgb_path, tf, broker
             )
     try:
         models_xgb, thresholds_xgb, _ = load_xgb_ensemble(xgb_path)
