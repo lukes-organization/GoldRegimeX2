@@ -1,6 +1,6 @@
 # Gold Regime X
 
-A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hidden Markov Models for regime detection with XGBoost for trade signal classification. Designed for live execution through MetaTrader 5 on small cent accounts, with full Telegram remote control and health monitoring.
+A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hidden Markov Models for regime detection with XGBoost for trade signal classification. Designed for live execution through MetaTrader 5 on both **Headway Cent** (micro) and **Standard** accounts, with full Telegram remote control and health monitoring.
 
 ---
 
@@ -8,19 +8,20 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 
 1. [How It Works](#how-it-works)
 2. [Architecture](#architecture)
-3. [Prerequisites](#prerequisites)
-4. [Installation](#installation)
-5. [Data Setup](#data-setup)
-6. [Configuration](#configuration)
-7. [Full Workflow](#full-workflow)
-8. [Command Reference](#command-reference)
-9. [Signal Logic](#signal-logic)
-10. [Risk Management](#risk-management)
-11. [Timeframe Configurations](#timeframe-configurations)
-12. [Telegram Remote Control](#telegram-remote-control)
-13. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
-14. [Troubleshooting](#troubleshooting)
-15. [Security Notes](#security-notes)
+3. [Account Types — Cent vs Standard](#account-types--cent-vs-standard)
+4. [Prerequisites](#prerequisites)
+5. [Installation](#installation)
+6. [Data Setup](#data-setup)
+7. [Configuration](#configuration)
+8. [Full Workflow](#full-workflow)
+9. [Command Reference](#command-reference)
+10. [Signal Logic](#signal-logic)
+11. [Risk Management](#risk-management)
+12. [Timeframe Configurations](#timeframe-configurations)
+13. [Telegram Remote Control](#telegram-remote-control)
+14. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
+15. [Troubleshooting](#troubleshooting)
+16. [Security Notes](#security-notes)
 
 ---
 
@@ -50,7 +51,7 @@ Backtester    →  IS / OOS Sharpe, Drawdown, Trade Count
 Live Bridge   →  MT5 Market Orders  (IOC fill, ATR-based SL, staged TPs)
 ```
 
-The optimizer (Optuna) searches across Kalman parameters, HMM states, XGBoost hyperparameters, and the signal probability threshold simultaneously, scoring every trial on **out-of-sample Sharpe only** to prevent overfitting.
+The optimizer (Optuna) searches across Kalman parameters, HMM states, XGBoost hyperparameters, and the signal probability thresholds simultaneously, scoring every trial on **out-of-sample Sharpe only** to prevent overfitting.
 
 ---
 
@@ -62,9 +63,9 @@ The optimizer (Optuna) searches across Kalman parameters, HMM states, XGBoost hy
 | `src/engine_hmm.py` | GaussianHMM training and regime prediction |
 | `src/engine_xgb.py` | XGBoost training, ONNX export |
 | `src/backtester.py` | Vectorized NumPy backtest with IS/OOS split, session limits, broker costs |
-| `src/optimizer.py` | Optuna study with SQLite crash-safe resume, RAM guard, Telegram heartbeat |
+| `src/optimizer.py` | Optuna study with per-broker SQLite crash-safe resume, RAM guard, Telegram heartbeat |
 | `src/risk_manager.py` | AdaptiveRiskManager, CentConverter, broker cost configs |
-| `src/visualizer.py` | 5 chart report: regime overlay, equity curve, features, transition matrix, dashboard |
+| `src/visualizer.py` | 5-chart report: regime overlay, equity curve, features, transition matrix, dashboard |
 | `src/mt5_sync.py` | MT5 data downloader |
 | `src/validator.py` | Pre-live validation gate (Sharpe threshold check) |
 | `src/mt5_trader.py` | Live execution loop: bar detection, feature inference, order placement |
@@ -74,6 +75,52 @@ The optimizer (Optuna) searches across Kalman parameters, HMM states, XGBoost hy
 | `src/remote_control.py` | Telegram long-polling bot for remote commands |
 | `main.py` | CLI entry point for all modes |
 | `mql5/GoldRegimeX.mq5` | MT5 Expert Advisor with ONNX inference (alternative to Python bridge) |
+
+---
+
+## Account Types — Cent vs Standard
+
+Choose your account type before running any command. The `--broker` flag controls
+lot sizing, P&L conversion, spread guards, and probability thresholds throughout
+the entire pipeline (optimization, training, live trading).
+
+### Headway Cent Account (`--broker headway_cent`)
+
+A cent account converts your real USD deposit into "cents" displayed 100× larger
+in the MT5 terminal. This makes small accounts easier to manage and reduces
+per-trade risk to 1/100th of a standard account.
+
+| Item | Cent Account | Example |
+|------|-------------|---------|
+| Real deposit | $15 USD | Wired to Headway |
+| MT5 balance display | 1500.00 USC | (real USD × 100) |
+| Minimum lot | 0.01 | = 0.01 oz gold |
+| P&L per $1 gold move at 0.01 lot | 0.01 USC | = **$0.0001 real USD** |
+| Trade history shows `+15.00` | ÷ 100 | = **$0.15 real USD** |
+| Bridge balance handling | Divides raw balance by 100 automatically | Pass `--balance 15` (real USD) |
+| Spread viability guard (M5) | TP1 ≥ 1.5× spread | |
+
+**Best for:** Learning the system, verifying that signals and lot sizing work correctly with real broker execution, and starting with minimal capital at risk. All gains and losses are 1/100th of what a standard account would show.
+
+---
+
+### Headway Standard Account (`--broker standard`)
+
+A standard account operates at full contract size in real USD. What you see in MT5 is what you earn or lose.
+
+| Item | Standard Account | Example |
+|------|-----------------|---------|
+| Minimum recommended balance | $500+ USD | For safe lot sizing |
+| Minimum lot | 0.01 | = 1 oz gold |
+| P&L per $1 gold move at 0.01 lot | **$1.00 real USD** | 100× more than cent |
+| Trade history shows `+2.40` | = **$2.40 real USD** | No conversion needed |
+| Bridge balance handling | Uses raw balance directly | Pass `--balance 500` |
+| Spread viability guard | TP1 ≥ 3.0× spread | Applied on **all timeframes** |
+| Small-balance guard | `pos_per_trade = 1` enforced when balance < $50 | Prevents margin overuse |
+
+**Best for:** Scaling to meaningful P&L once the strategy is proven on cent. The stricter 3× spread guard prevents entering trades where the spread eats too much of the expected move.
+
+> **Key practical difference:** On a cent account a trade shown as `+$2.40` in MT5 history is actually `$0.024` real USD. On a standard account it is exactly `$2.40`. The bridge automatically handles cent conversion — the P&L it logs and sends to Telegram is always in **real USD**, regardless of account type.
 
 ---
 
@@ -127,17 +174,23 @@ The system requires historical OHLCV CSV files exported from MetaTrader5. In MT5
 
 > The system works with H1, M15 and M5 timeframes. More data = better optimization. Aim for at least 2 years of history; the included H1 dataset covers 2004–2025.
 
+### Keep your data fresh
+
+The processor filters to the **last 10 years anchored at the end of your CSV** (not today's date). If your CSV ends in December 2025, the 20% OOS window closes at December 2025 — but `sync_validate` pulls **live MT5 data up to today**. Any months after your CSV ends will be out-of-distribution for the model.
+
+**Export fresh data from MT5 before each full pipeline re-run** to keep the OOS window aligned with the current market.
+
 ### USDCHF — cross-asset USD strength feature (optional, recommended)
 
-USDCHF is used as an intraday DXY proxy (high correlation, natively available on Headway as a standard Forex pair). To enable the `usdchf_log_return` feature:
+USDCHF is used as an intraday DXY proxy (high correlation, natively available on Headway). To enable the `usdchf_log_return` feature:
 
-1. In MT5, export **USDCHF** CSV files for any timeframe (semicolon-delimited, same format as XAUUSD)
-2. Save them to `data/raw/` — any filename containing `USDCHF` works (e.g. `USDCHF_2024.csv`, `USDCHF_H1.csv`)
-3. Run the consolidator to merge them into the master file:
+1. In MT5, export **USDCHF** CSV files (any timeframe, same semicolon format as XAUUSD)
+2. Save to `data/raw/` — any filename containing `USDCHF` works (e.g. `USDCHF_2024.csv`)
+3. Run the consolidator:
 ```bash
 python main.py --mode consolidate
 ```
-This produces `data/processed/USDCHF_master.csv`. The pipeline detects it automatically — no code change needed. If absent, all timeframes degrade gracefully to the standard 4-feature model.
+This produces `data/processed/USDCHF_master.csv`. The pipeline adds it automatically as a 5th feature. If absent, all timeframes degrade gracefully to the 4-feature model.
 
 ---
 
@@ -180,7 +233,7 @@ LIVE_BALANCE=15
 python main.py --mode consolidate
 ```
 
-Merges all `*USDCHF*.csv` files in `data/raw/` into `data/processed/USDCHF_master.csv`. Run once before processing. Skip if you have no USDCHF data — the pipeline works without it (4-feature mode).
+Merges all `*USDCHF*.csv` files in `data/raw/` into `data/processed/USDCHF_master.csv`. Run once before processing. Skip if you have no USDCHF data.
 
 ### Step 1 — Process raw data
 
@@ -198,15 +251,26 @@ python main.py --mode optimize --trials 300 --broker headway_cent --balance 15 -
 
 Runs an Optuna study that searches across:
 - Kalman filter parameters (`obs_cov`, `trans_cov`)
-- HMM state count (`n_states`: 2–4)
-- Signal probability threshold (`prob_threshold`: 0.505–0.60)
+- HMM state count (`n_states`: 3–4 for H1/M15; `{2, 4}` for M5)
+- Signal probability thresholds (`prob_threshold`, `short_threshold` — tuned independently)
 - XGBoost parameters (`max_depth`, `learning_rate`, `n_estimators`, `subsample`, `colsample_bytree`, `min_child_weight`, `gamma`, `reg_alpha`)
 
-Each trial is scored on **OOS Sharpe only** to prevent IS data leakage. Trials with fewer than 50 OOS trades are discarded. Progress is saved to `models/study.db` after every trial — safe to interrupt with Ctrl+C and resume later.
+Each trial is scored on **OOS Sharpe only** to prevent IS data leakage. Trials with degenerate HMM (any state self-transition < 0.80) are discarded. Progress is saved to a **per-broker SQLite database** after every trial — safe to interrupt with Ctrl+C and resume later:
 
-**To resume after interruption**, run the exact same command. Optuna detects the existing study and picks up where it left off.
+| Broker | Study database |
+|--------|---------------|
+| `headway_cent` | `models/study_headway_cent.db` |
+| `standard` | `models/study_standard.db` |
 
-**To start fresh**, delete `models/study.db` manually before running.
+The two databases are completely independent. You can optimize both accounts without interference.
+
+**To resume after interruption**, run the exact same command. `--trials N` is a **total target** — if 200 trials already exist and you pass `--trials 300`, it runs 100 more.
+
+**To start completely fresh**, delete only the target broker database:
+```bash
+del models\study_headway_cent.db   # cent only — standard study untouched
+del models\study_standard.db       # standard only
+```
 
 ### Step 3 — Train final model
 
@@ -214,7 +278,16 @@ Each trial is scored on **OOS Sharpe only** to prevent IS data leakage. Trials w
 python main.py --mode train --broker headway_cent --balance 15 --tf H1
 ```
 
-Trains HMM and the three-model XGBoost volatility ensemble using the best parameters found by the optimizer. Prints IS/OOS Sharpe, drawdown, and trade count per bucket. Saves **TF-specific model files**: `models/hmm_model_H1.pkl` and `models/xgb_ensemble_H1.pkl` (replacing `H1` with the target TF). Each timeframe gets its own model files — training M15 never overwrites H1 models.
+Trains HMM and the three-model XGBoost volatility ensemble using the best optimizer parameters. Prints IS/OOS Sharpe, drawdown, and trade count. Saves **broker- and TF-specific model files**:
+
+```
+models/hmm_model_H1_headway_cent.pkl
+models/xgb_ensemble_H1_headway_cent.pkl
+```
+
+Each broker+TF combination gets its own files — training M15 on standard never overwrites H1 on cent.
+
+> Training will **abort** if the resulting HMM is degenerate (any state self-transition < 0.70). This prevents saving a garbage model. If this happens, it means the optimizer study is missing or stale — re-run `--mode optimize` first.
 
 ### Step 4 — Compare timeframes (optional)
 
@@ -227,15 +300,10 @@ Side-by-side OOS performance for multiple timeframes. Supports any comma-separat
 ### Step 5 — Export ONNX model (for MQL5 EA)
 
 ```bash
-python main.py --mode export
+python main.py --mode export --tf H1 --broker headway_cent
 ```
 
-Converts each volatility-bucket XGBoost model to ONNX format for use with the MQL5 Expert Advisor. Produces three files:
-- `models/xgb_model_vol_low.onnx` — quiet market model
-- `models/xgb_model_vol_med.onnx` — normal market model
-- `models/xgb_model_vol_high.onnx` — volatile market model
-
-Required only if you want to use the EA instead of the Python bridge.
+Converts the XGBoost volatility ensemble to ONNX format for use with the MQL5 Expert Advisor. Required only if you want to use the EA instead of the Python bridge.
 
 ### Step 6 — Generate visual report
 
@@ -256,7 +324,7 @@ Saves 5 charts to `reports/H1/`:
 python main.py --mode sync_validate --period 3m --broker headway_cent --balance 15 --tf H1
 ```
 
-Downloads the last 3 months of live MT5 data, runs the full pipeline, and checks recent Sharpe ratio.
+Downloads the last 3 months of live MT5 data, runs the full inference pipeline, and checks recent Sharpe ratio.
 
 | Status | Sharpe | Action |
 |--------|--------|--------|
@@ -266,26 +334,36 @@ Downloads the last 3 months of live MT5 data, runs the full pipeline, and checks
 
 FAIL exits with code 1 and blocks the live script.
 
-### Step 8 — Paper trade first
+> Use `--period 6m` or `--period 8m` for H1 — a 3-month window produces very few H1 trades (42 trades vs 300+ needed), making the Sharpe estimate unreliable.
+
+### Step 8 — Test on demo account
+
+Log MT5 into your **demo** account, then run:
 
 ```bash
-python main.py --mode live --account demo --broker headway_cent --balance 15 --tf H1
+python main.py --mode demo --tf H1 --broker headway_cent --balance 15
 ```
 
-Logs every signal with full detail but sends no orders to MT5. Run for a few days to verify signals look correct before going live.
+`--mode demo` sends **real orders to MT5** on whatever account MT5 is currently logged into. Use a demo account to verify that signals, lot sizes, session limits, and TP/SL logic all behave correctly before risking real money.
+
+> There is no paper trading / simulation mode. All testing is done on a real demo MT5 account so execution behaviour (fills, slippage, spread) is exactly as in live.
 
 ### Step 9 — Go live
 
+Log MT5 into your **live** account, then run:
+
 ```bash
-python main.py --mode live --account live --broker headway_cent --balance 15 --tf H1
+python main.py --mode live --tf H1 --broker headway_cent --balance 15
 ```
 
-You will be prompted to type `YES` to confirm. The loop then:
+You will be prompted to type `YES` to confirm. This is the **only difference** from `--mode demo` — both modes send real orders. After confirming, the loop:
+
 1. Detects each newly completed bar (polls every 5 seconds)
-2. Fetches 200 bars of OHLCV data for warm-up
+2. Fetches 200 bars of OHLCV data for Kalman/HMM warm-up
 3. Runs Kalman → HMM → XGBoost inference
 4. Applies session limits, margin check, and spread viability guard
 5. Places IOC market orders with ATR-based SL and staged TPs
+6. Logs closed P&L in real USD with pip movement after every trade
 
 **Important**: Remove the GoldRegimeX.mq5 EA from the XAUUSD chart before starting the Python bridge. Both use `MAGIC_NUMBER = 123456` — running both simultaneously will double-count daily trades.
 
@@ -302,12 +380,13 @@ python main.py --mode <MODE> [OPTIONS]
 | `consolidate` | Merge all `*USDCHF*.csv` files in `data/raw/` into the USDCHF master |
 | `process` | Process raw CSV → parquet |
 | `optimize` | Run / resume Optuna hyperparameter search |
-| `train` | Train HMM + XGBoost with best params (saves TF-specific model files) |
+| `train` | Train HMM + XGBoost with best params; saves broker+TF-specific model files |
 | `compare` | Side-by-side OOS comparison across TFs |
-| `export` | Export XGBoost → ONNX |
+| `export` | Export XGBoost ensemble → ONNX |
 | `report` | Generate 5-chart visual report |
-| `sync_validate` | Download live data + validate model health |
-| `live` | Run the live execution loop |
+| `sync_validate` | Download live MT5 data + validate model health |
+| `demo` | Connect to MT5 demo account and run the live execution loop (no YES prompt) |
+| `live` | Connect to MT5 live account and run the live execution loop (requires YES) |
 | `audit` | Generate and send daily MT5 deal report |
 | `guardian` | Continuous rolling Sharpe health monitor |
 | `listen` | Start Telegram remote control bot |
@@ -316,53 +395,77 @@ python main.py --mode <MODE> [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--tf` | `H1` | Timeframe: `H1`, `M15`, `M5` (or comma-separated for compare) |
-| `--broker` | `standard` | Broker profile: `headway_cent`, `standard` |
-| `--balance` | `15` | Account size in USD (used for lot sizing and risk tier) |
-| `--trials` | `250` | Number of Optuna trials (optimize mode) |
+| `--tf` | `H1` | Timeframe: `H1`, `M15`, `M5` (or comma-separated for compare/guardian) |
+| `--broker` | `standard` | Broker profile: `headway_cent` or `standard` |
+| `--balance` | `15` | Account size in **real USD** — used for lot sizing and risk tier |
+| `--trials` | `250` | Total target Optuna trials (optimize mode) |
 | `--period` | `3m` | Lookback period for sync/validate: `3m`, `6m`, `12m` |
-| `--account` | `live` | `demo` (dry run, no orders) or `live` (real orders) |
 | `--interval` | `3600` | Guardian check interval in seconds |
+| `--prob_threshold` | (from Optuna) | Override BUY probability threshold for live |
+| `--short_threshold` | (from Optuna) | Override SELL probability threshold for live |
+
+> **Note:** `--balance` is always in **real USD**. For a Headway Cent account with a $15 deposit, pass `--balance 15` — the bridge handles the ×100 display conversion internally.
 
 ---
 
 ## Signal Logic
 
-A trade fires when ALL of the following are true:
+A trade fires when **all** of the following are true:
 
 | Condition | BUY | SELL |
 |-----------|-----|------|
 | XGBoost probability | `prob > prob_threshold` | `prob < short_threshold` |
-| HMM regime | Not Chop (state ≠ 2) | Not Chop (state ≠ 2) |
+| HMM regime (regime-aligned) | **Bull state (0) only** | **Bear state (1) only** |
+| Chop state (2) | Blocked — no signal ever | Blocked — no signal ever |
 | Session limit | Under daily cap | Under daily cap |
 | No open position | No existing GRX position | No existing GRX position |
 | Margin check | Sufficient free margin | Sufficient free margin |
-| Spread viability (M5) | TP1 distance ≥ 1.5× spread | TP1 distance ≥ 1.5× spread |
+| Spread viability | TP1 ≥ spread × ratio | TP1 ≥ spread × ratio |
 
-**`prob_threshold` is tuned by the optimizer per TF/study** and loaded automatically at live startup. If no optimized value exists, the hardcoded TF defaults are used (H1: 0.65, M15: 0.65, M5: 0.70).
+**Regime-aligned filter:** BUY signals only fire when the HMM is in Bull state. SELL signals only fire in Bear state. Chop state (sideways market) suppresses all signals regardless of XGBoost probability. This ensures the signal direction always agrees with the detected market regime.
+
+**`prob_threshold` and `short_threshold` are tuned independently by Optuna** per broker and timeframe, then loaded automatically at live startup. The search ranges are:
+
+| TF | Broker | BUY threshold range | SELL threshold range |
+|----|--------|--------------------|--------------------|
+| M5 | `headway_cent` | 0.50 – 0.53 | 0.44 – 0.50 |
+| M5 | `standard` | 0.55 – 0.60 | 0.40 – 0.45 |
+| M15 | `headway_cent` | 0.50 – 0.58 | 0.42 – 0.50 |
+| M15 | `standard` | 0.50 – 0.58 | 0.42 – 0.50 |
+| H1 | `headway_cent` | 0.50 – 0.58 | 0.42 – 0.50 |
+| H1 | `standard` | 0.50 – 0.58 | 0.42 – 0.50 |
+
+M5 standard uses a stricter floor (0.55–0.60) because standard lots cost proportionally more per trade — the model needs higher conviction before entering to cover the spread.
+
+**Spread viability guard:**
+
+| Broker | Applied on | Minimum ratio |
+|--------|-----------|--------------|
+| `headway_cent` | M5 only | TP1 ≥ 1.5× spread |
+| `standard` | All timeframes | TP1 ≥ 3.0× spread |
 
 ### Staged Take-Profits
 
-Each signal places multiple positions with different TPs (SL distance = ATR × TF multiplier):
+Each signal places multiple positions when `pos_per_trade = 2` (SL = ATR × TF multiplier):
 
-| Regime | TP1 | TP2 (Runner) | SL ATR mult |
-|--------|-----|--------------|-------------|
-| Bull / Bear — M5 | 0.8 × SL | 1.5 × SL | 1.5× |
-| Bull / Bear — M15 | 1.0 × SL | 2.0 × SL | 2.0× |
-| Bull / Bear — H1 | 1.0 × SL | 2.0 × SL | 2.0× |
-| Chop — M5 | 0.5 × SL | None (single) | 1.5× |
-| Chop — M15 | 0.8 × SL | None (single) | 2.0× |
-| Chop — H1 | 1.0 × SL | None (single) | 2.0× |
+| Regime | TF | TP1 | TP2 (Runner) | SL ATR mult |
+|--------|----|-----|--------------|-------------|
+| Bull / Bear | M5 | 0.8× SL | 1.5× SL | 1.5× |
+| Bull / Bear | M15 | 1.0× SL | 2.0× SL | 2.0× |
+| Bull / Bear | H1 | 1.5× SL | 3.0× SL | 2.0× |
+| Chop | M5 | 0.5× SL | None (single) | 1.5× |
+| Chop | M15 | 0.8× SL | None (single) | 2.0× |
+| Chop | H1 | 1.0× SL | None (single) | 2.0× |
 
 **Profit protection chain (all timeframes):**
-1. **Profit guard** — when price reaches 70% of TP1 distance, SL moves to `entry + 2×spread` (risk-free before TP1 fills)
-2. **Break-even** — when TP1 fills, runner SL moves to exact entry price
-3. **Chop-exit** — if HMM shifts to Chop while runner is active, runner closed at market immediately
+1. **Profit guard** — when price reaches 70% of TP1 distance, SL moves to `entry + 2×spread` (trade becomes risk-free before TP1 fills)
+2. **Break-even** — when TP1 fills and closes position 1, the runner's SL moves to exact entry price
+3. **Chop-exit** — if HMM shifts to Chop while a runner is active, the runner is closed at market immediately
 
 ### Deviation (Slippage Tolerance)
 
-| Condition | M5 | M15/H1 |
-|-----------|----|--------|
+| Condition | M5 | M15 / H1 |
+|-----------|----|----------|
 | Normal | 30 pts | 20 pts |
 | High-vol (HMM self-transition < 0.70) | 50 pts | 50 pts |
 
@@ -370,11 +473,7 @@ Each signal places multiple positions with different TPs (SL distance = ATR × T
 
 ## Volatility Ensemble (Three-Model XGBoost)
 
-Instead of a single XGBoost model, the system trains **three separate models**, each specialising in a different market volatility regime. This prevents a model tuned for quiet markets from misfiring during high-volatility events, and vice versa.
-
-### How bucketing works
-
-ATR percentile thresholds are computed on the **in-sample** portion of the training data only (no look-ahead bias). Each bar is assigned a bucket based on its `atr_normalized` value:
+Instead of a single XGBoost model, the system trains **three separate models**, each specialising in a different market volatility regime. ATR percentile thresholds are computed on **in-sample data only** (no look-ahead bias):
 
 | Bucket | ATR condition | Description |
 |--------|--------------|-------------|
@@ -382,19 +481,30 @@ ATR percentile thresholds are computed on the **in-sample** portion of the train
 | `med` | `p33 < atr_normalized ≤ p66` | Normal trending market |
 | `high` | `atr_normalized > p66` | High-volatility / news-driven |
 
-During training, each model only sees bars from its own bucket (IS subset). During inference (live or backtest), each bar is routed to the correct model based on its real-time `atr_normalized`.
+During inference each bar is automatically routed to the correct bucket model based on its live `atr_normalized` value.
 
-### Model files
+### Model Files (Broker + TF Specific)
 
-| File | Purpose |
-|------|---------|
-| `models/hmm_model_{TF}.pkl` | HMM regime model for a specific timeframe (e.g. `hmm_model_H1.pkl`) |
-| `models/xgb_ensemble_{TF}.pkl` | XGBoost ensemble + ATR thresholds + feature list for a TF |
-| `models/xgb_model_vol_low.onnx` | Low-volatility bucket (MQL5 EA use) |
-| `models/xgb_model_vol_med.onnx` | Medium-volatility bucket (MQL5 EA use) |
-| `models/xgb_model_vol_high.onnx` | High-volatility bucket (MQL5 EA use) |
+Each broker and timeframe combination produces entirely separate model files:
 
-> The generic `models/hmm_model.pkl` / `models/xgb_ensemble.pkl` serve as backward-compatible fallbacks only. All new training creates TF-specific files.
+```
+models/
+├── hmm_model_H1_headway_cent.pkl       ← H1 cent HMM
+├── hmm_model_H1_standard.pkl           ← H1 standard HMM
+├── hmm_model_M15_headway_cent.pkl
+├── hmm_model_M5_headway_cent.pkl
+├── hmm_model_M5_standard.pkl
+├── xgb_ensemble_H1_headway_cent.pkl    ← H1 cent XGBoost ensemble
+├── xgb_ensemble_H1_standard.pkl
+├── xgb_ensemble_M5_headway_cent.pkl
+├── xgb_ensemble_M5_standard.pkl
+├── study_headway_cent.db               ← Optuna: cent account trials
+├── study_standard.db                   ← Optuna: standard account trials
+├── m5_meta_headway_cent.json           ← M5 freshness gate (cent)
+└── m5_meta_standard.json               ← M5 freshness gate (standard)
+```
+
+Optimizing or training for one broker+TF never affects any other combination.
 
 ### Features
 
@@ -404,51 +514,33 @@ During training, each model only sees bars from its own bucket (IS subset). Duri
 | `rsi_slope` | Rate of change of RSI — momentum direction |
 | `atr_normalized` | ATR / Close — normalised volatility |
 | `prev_log_return` | Previous bar log return — short-term momentum |
-| `usdchf_log_return` | USDCHF log return — intraday USD strength proxy *(optional, run --mode consolidate)* |
-
-The USDCHF feature is included automatically when `data/processed/USDCHF_master.csv` exists. If absent, all three models run with 4 features — no code change needed.
-
-### Probability threshold
-
-`prob_threshold` and `short_threshold` are **both tuned independently by Optuna** and stored in the study. They are loaded automatically at live startup:
-
-- **BUY**: `prob > prob_threshold`
-- **SELL**: `prob < short_threshold`  (Optuna-tuned separately, not `1 − prob_threshold`)
-- **Chop state**: trades blocked regardless of probability
-
-| TF | `prob_threshold` range | `short_threshold` range |
-|----|----------------------|------------------------|
-| M5 | 0.50 – 0.55 | 0.44 – 0.50 |
-| M15 | 0.50 – 0.58 | 0.42 – 0.50 |
-| H1 | 0.50 – 0.58 | 0.42 – 0.50 |
-
-The XGBoost model already internalises regime via the `hmm_state` feature — it naturally produces higher BUY probabilities in Bull conditions and higher SELL probabilities in Bear conditions.
+| `usdchf_log_return` | USDCHF log return — intraday USD strength proxy *(optional)* |
 
 ---
 
 ## Risk Management
 
-Position sizing uses a fixed 1% risk rule per position:
+Position sizing uses a fixed **1% risk rule** per position:
 
 ```
-lot_size = (1% × account_balance_USD) / (ATR(14) × 2.0)
+lot_size = (1% × account_balance_USD) / (ATR(14) × SL_multiplier)
 ```
 
-Minimum lot is 0.01 (micro-lot). All lots are rounded to 2 decimal places.
+Minimum lot is always 0.01 (micro-lot). All lots are rounded to 2 decimal places.
 
-**Daily trade limits (adaptive):**
+### Daily Trade Limits
 
-| Account Balance | TF | Regime | Max Trades/Day | Positions/Signal |
-|----------------|-----|--------|----------------|-----------------|
-| ≤ $50 | M5 | Any | 4 | 1 |
-| ≤ $50 | M15 | Any | 4 | 1 |
-| ≤ $50 | H1 | Any | 2 | 1 |
-| > $50 | Any | Bull / Bear | 3 | 2 |
-| > $50 | Any | Chop | 2 | 2 |
+| Account Balance | Broker | TF | Regime | Max Trades/Day | Positions/Signal |
+|----------------|--------|----|--------|----------------|-----------------|
+| ≤ $50 | Any | M5 / M15 | Any | 4 | 1 |
+| ≤ $50 | Any | H1 | Any | 2 | 1 |
+| > $50 | Any | Any | Bull / Bear | 3 | 2 |
+| > $50 | Any | Any | Chop | 2 | 2 |
+| > $50 | `standard` + balance < $50 | Any | Any | 3 / 2 | **1** |
 
-M5 and M15 both get a 4/day cap — M5 has ~288 bars/day and M15 ~96 bars/day, giving enough signal opportunities to clear the optimizer's MIN_OOS_TRADES=200 requirement. H1 remains at 2/day.
+**Standard account guard:** When `--broker standard` is used with balance < $50, `pos_per_trade` is forced to 1 regardless of tier. One 0.01 standard lot on XAUUSD carries ~$48 notional value — running two simultaneously on a $15 account would exceed safe margin.
 
-**Cent Account (Headway):** MT5 displays $15 USD as `1500.00`. Pass `--broker headway_cent` and the bridge divides the raw balance by 100 automatically.
+M5 and M15 get a higher daily cap (4/day) because their higher bar frequency means more signal opportunities per session. H1 stays at 2/day.
 
 ---
 
@@ -458,52 +550,69 @@ M5 and M15 both get a 4/day cap — M5 has ~288 bars/day and M15 ~96 bars/day, g
 |-----------|-----|-----|-----|
 | Kalman `obs_cov` default | 0.05 | 4.0 | 1.0 |
 | Bars/day (annualization) | 288 | 96 | 24 |
-| HMM `n_states` search | `{2, 4}` only | 2–4 | 2–4 |
+| HMM `n_states` search space | `{2, 4}` only | 3–4 | 3–4 |
 | Min OOS trades (optimizer) | 300 | 200 | 200 |
-| TP1 multiplier (trending) | 0.8× SL | 1.0× SL | 1.0× SL |
-| TP2 multiplier (runner) | 1.5× SL | 2.0× SL | 2.0× SL |
+| Max trades/day (≤ $50) | 4 | 4 | 2 |
+| TP1 multiplier (trending) | 0.8× SL | 1.0× SL | 1.5× SL |
+| TP2 multiplier (runner) | 1.5× SL | 2.0× SL | 3.0× SL |
 | Chop TP (single position) | 0.5× SL | 0.8× SL | 1.0× SL |
+| SL ATR multiplier | 1.5× | 2.0× | 2.0× |
 | Profit guard trigger | 70% to TP1 | 70% to TP1 | 70% to TP1 |
 | Break-even after TP1 | Yes | Yes | Yes |
 | Base deviation | 30 pts | 20 pts | 20 pts |
-| Max trades/day (≤$50) | 4 | 2 | 2 |
-| Spread viability guard | Yes | No | No |
+| Spread viability guard | Yes (cent: M5 only, standard: all) | standard only | standard only |
 | 5-day readiness gate | Yes | No | No |
 
-> **M5 `n_states` restriction:** n_states=3 is always degenerate for M5 (Bull and Chop collapse to identical means, producing 500K+ HMM transitions and covariance errors). The optimizer skips 3 and searches only `{2, 4}`.
+> **M5 `n_states` restriction:** n_states=3 is always degenerate for M5 (Bull and Chop collapse to identical means, producing 500K+ HMM transitions). The optimizer searches only `{2, 4}` for M5.
+>
+> **H1/M15 `n_states` restriction:** n_states=2 is banned when the regime-aligned filter is active — with only Bull and Bear states, every bar gets assigned to one of the two signal-generating states, creating excessive counter-trend signals. Minimum is 3.
 
-**M5 readiness gate:** `models/m5_meta.json` must exist and be less than 120 hours old. The optimizer creates this file automatically after completing an M5 study. If stale, `--mode live --tf M5` will exit with an error until you re-optimize.
+**M5 readiness gate:** `models/m5_meta_<broker>.json` must exist and be less than 120 hours (5 days) old. The optimizer writes this file automatically after completing an M5 study. If stale, `--mode demo/live --tf M5` will exit with an error.
 
-**M5 workflow:**
+### Per-Timeframe Workflows
+
+**H1 — Headway Cent:**
 ```bash
-python main.py --mode consolidate                                              # merge USDCHF CSVs (once)
-python main.py --mode process --tf M5
-python -c "import optuna; optuna.delete_study('gold_regime_x_small_headway_cent_M5', 'sqlite:///models/study.db')"
-python main.py --mode optimize --tf M5 --trials 300 --broker headway_cent --balance 15
-python main.py --mode train --tf M5 --broker headway_cent --balance 15        # saves hmm_model_M5.pkl
-python main.py --mode sync_validate --tf M5 --period 3m --broker headway_cent --balance 15
-python main.py --mode live --tf M5 --account demo --broker headway_cent --balance 15
+python main.py --mode process       --tf H1
+python main.py --mode optimize      --tf H1 --broker headway_cent --balance 15 --trials 300
+python main.py --mode train         --tf H1 --broker headway_cent --balance 15
+python main.py --mode export        --tf H1 --broker headway_cent
+python main.py --mode sync_validate --tf H1 --broker headway_cent --balance 15 --period 6m
+python main.py --mode demo          --tf H1 --broker headway_cent --balance 15
+python main.py --mode live          --tf H1 --broker headway_cent --balance 15
 ```
 
-**M15 workflow:**
+**M15 — Headway Cent:**
 ```bash
-python main.py --mode process --tf M15
-python main.py --mode optimize --tf M15 --trials 250 --broker headway_cent --balance 15
-python main.py --mode train --tf M15 --broker headway_cent --balance 15       # saves hmm_model_M15.pkl
-python main.py --mode sync_validate --tf M15 --period 6m --broker headway_cent --balance 15
-python main.py --mode live --tf M15 --account demo --broker headway_cent --balance 15
+python main.py --mode process       --tf M15
+python main.py --mode optimize      --tf M15 --broker headway_cent --balance 15 --trials 300
+python main.py --mode train         --tf M15 --broker headway_cent --balance 15
+python main.py --mode sync_validate --tf M15 --broker headway_cent --balance 15 --period 3m
+python main.py --mode demo          --tf M15 --broker headway_cent --balance 15
+python main.py --mode live          --tf M15 --broker headway_cent --balance 15
 ```
 
-**H1 workflow:**
+**M5 — Headway Cent:**
 ```bash
-python main.py --mode process --tf H1
-python main.py --mode optimize --tf H1 --trials 250 --broker headway_cent --balance 15
-python main.py --mode train --tf H1 --broker headway_cent --balance 15        # saves hmm_model_H1.pkl
-python main.py --mode sync_validate --tf H1 --period 6m --broker headway_cent --balance 15
-python main.py --mode live --tf H1 --account demo --broker headway_cent --balance 15
+python main.py --mode process       --tf M5
+python main.py --mode optimize      --tf M5 --broker headway_cent --balance 15 --trials 300
+python main.py --mode train         --tf M5 --broker headway_cent --balance 15
+python main.py --mode sync_validate --tf M5 --broker headway_cent --balance 15 --period 3m
+python main.py --mode demo          --tf M5 --broker headway_cent --balance 15
+python main.py --mode live          --tf M5 --broker headway_cent --balance 15
 ```
 
-> Use `--period 6m` (or `12m`) for H1/M15 sync_validate — a 3-month window produces very few H1 trades, making the Sharpe estimate unreliable.
+**M5 — Standard account:**
+```bash
+python main.py --mode process       --tf M5
+python main.py --mode optimize      --tf M5 --broker standard --balance 15 --trials 300
+python main.py --mode train         --tf M5 --broker standard --balance 15
+python main.py --mode sync_validate --tf M5 --broker standard --balance 15 --period 3m
+python main.py --mode demo          --tf M5 --broker standard --balance 15
+python main.py --mode live          --tf M5 --broker standard --balance 15
+```
+
+> Standard M5 optimization uses `prob_threshold` range 0.55–0.60 (vs 0.50–0.53 for cent) because each trade costs proportionally more with standard spreads. The stricter threshold ensures the model only enters when conviction is sufficiently high to overcome the spread cost.
 
 ---
 
@@ -519,10 +628,10 @@ A keyboard appears in your Telegram chat:
 
 | Button | Action |
 |--------|--------|
-| 🚀 START TRADING | Launches the live loop using `.env` defaults |
+| 🚀 START TRADING | Launches `--mode live` using `.env` TF/broker/balance defaults |
 | 🛑 STOP TRADING | Kills the running live loop process |
-| 📉 START OPTIMIZE (M5) | Starts/resumes M5 Optuna study |
-| 📊 BOT STATUS | Last 24h P&L, win rate, and floating positions |
+| 📉 START OPTIMIZE (M5) | Starts/resumes M5 Optuna study (saves to `study_headway_cent.db`) |
+| 📊 BOT STATUS | Last 24h P&L (real USD), win rate, and floating positions |
 
 A nightly summary is automatically sent to your chat at **23:55 UTC** while the listener runs.
 
@@ -540,34 +649,36 @@ Checks rolling Sharpe for each TF every hour. Sends a Telegram alert if any TF d
 python main.py --mode audit --broker headway_cent --balance 15
 ```
 
-Prints and sends the last 24h deal summary with P&L breakdown.
+Prints and sends the last 24h deal summary with P&L in real USD per trade.
 
 ### Parallel Optimization
 
-Open multiple terminals and run the same optimize command in each — they share `study.db` safely via SQLite locking:
+Open multiple terminals and run the same optimize command in each — they share the broker-specific study database safely via SQLite locking:
 
 ```bash
 # Terminal 1
-python main.py --mode optimize --tf M5 --trials 500 --broker headway_cent --balance 15
+python main.py --mode optimize --tf M5 --broker headway_cent --trials 500 --balance 15
 # Terminal 2 (same command)
-python main.py --mode optimize --tf M5 --trials 500 --broker headway_cent --balance 15
+python main.py --mode optimize --tf M5 --broker headway_cent --trials 500 --balance 15
 ```
+
+Each terminal runs an independent Optuna worker. This is more reliable than `--n_jobs` for CPU-bound HMM+XGBoost objectives.
 
 ---
 
 ## MQL5 EA (Alternative Execution)
 
-`mql5/GoldRegimeX.mq5` is a fully self-contained MetaTrader5 Expert Advisor that:
-- Loads `models/xgb_model.onnx` directly inside MT5
+`mql5/GoldRegimeX.mq5` is a fully self-contained MT5 Expert Advisor that:
+- Loads the exported ONNX model directly inside MT5
 - Replicates the same regime → signal → risk logic in MQL5
-- Supports cent accounts via the `IsCentAccount` input
+- Supports both cent and standard accounts via the `IsCentAccount` input
 - Uses the same `MAGIC_NUMBER = 123456`
 
-**Do not run the EA and the Python bridge simultaneously** — they share the magic number and will double-count trades.
+**Do not run the EA and the Python bridge simultaneously** — they share the magic number and will double-count daily trades.
 
 To use the EA:
-1. Run `--mode export` to generate `models/xgb_model.onnx`
-2. Copy `mql5/GoldRegimeX.mq5` and `models/xgb_model.onnx` to your MT5 `MQL5/Experts/` folder
+1. Run `--mode export --tf H1 --broker headway_cent` to generate the ONNX file
+2. Copy `mql5/GoldRegimeX.mq5` and the generated `.onnx` file to your MT5 `MQL5/Experts/` folder
 3. Compile in MetaEditor (F7)
 4. Attach to the XAUUSD chart
 
@@ -578,26 +689,28 @@ To use the EA:
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | `ConnectionError: Could not connect to MT5` | Terminal not running | Open MT5 and log in first |
-| `FileNotFoundError: models/hmm_model_H1.pkl` | Models not trained for this TF | Run `--mode train --tf H1` (or M15/M5) |
-| `FileNotFoundError: models/m5_meta.json` | M5 not optimized | Run `--mode optimize --tf M5` |
-| Validation FAIL every day | Model too old for current regime | Re-optimize and retrain |
-| `Order failed: retcode=10006` | No broker connection | Check MT5 connection indicator |
-| `Order failed: retcode=10015` | Price moved past deviation | Will retry next bar; try a slower TF |
-| `Insufficient margin` repeated | Account below minimum for lot | Top up account or pass a lower `--balance` |
-| No trades firing all session | prob_threshold too strict for model | Re-optimize — the optimizer will tune the threshold |
-| Signals logged but no MT5 orders | Running in demo mode | Switch to `--account live` |
+| `FileNotFoundError: hmm_model_H1_headway_cent.pkl` | Models not trained for this broker+TF | Run `--mode train --tf H1 --broker headway_cent` |
+| `FileNotFoundError: m5_meta_headway_cent.json` | M5 not optimized for this broker | Run `--mode optimize --tf M5 --broker headway_cent` |
+| `WARNING: No Optuna study found` | Study DB not found or wrong broker | Run `--mode optimize` with matching `--broker` flag |
+| `ERROR: Degenerate HMM` during train | Optuna study missing or stale params | Delete `study_<broker>.db`, re-run optimize, then train |
+| Validation FAIL every day | Model OOS ends before MT5 sync window | Export fresh CSV from MT5, re-run full pipeline |
+| `Order failed: retcode=10006` | No broker connection | Check MT5 connection indicator (bottom-right) |
+| `Order failed: retcode=10015` | Price moved past deviation window | Will retry next bar; elevated deviation auto-applies on high-vol |
+| `Insufficient margin` repeated | Account below safe minimum for lot | Top up account or check `--balance` value |
+| No signals firing — standard M5 | Default threshold too low (0.50) | Re-optimize with `--broker standard` to use the 0.55–0.60 range |
 | Double positions appearing | EA still attached to chart | Remove GoldRegimeX.mq5 EA from XAUUSD chart |
-| Telegram errors in log | No internet or wrong token | Check `.env` credentials; revoke and regenerate from @BotFather if exposed |
+| Cent P&L logged as $0.00 | Exit deal not yet posted to MT5 history | Bridge waits up to 20 retries (~30s) — this is expected |
+| Telegram errors in log | Wrong token or no internet | Check `.env`; regenerate bot token via @BotFather if needed |
 
-**Emergency stop:** Press **Ctrl+C** in the terminal. The loop handles `KeyboardInterrupt` cleanly, logs the shutdown, and disconnects from MT5. All open positions remain open — close manually from the MT5 Trade tab.
+**Emergency stop:** Press **Ctrl+C** in the terminal. The loop handles `KeyboardInterrupt` cleanly, logs the shutdown, and disconnects from MT5. All open positions remain open — close them manually from the MT5 Trade tab.
 
 ---
 
 ## Security Notes
 
-- **Never commit `.env`** — it contains your live Telegram token and is listed in `.gitignore`
-- **`.env.example` contains only placeholders** — fill in your real values in `.env` only
-- `ALLOWED_USER_ID` is the single security gate for Telegram remote commands — only your Telegram ID can issue them
+- **Never commit `.env`** — it contains your live Telegram token and is in `.gitignore`
+- **`.env.example` contains only placeholders** — fill in real values in `.env` only
+- `ALLOWED_USER_ID` is the single security gate for Telegram remote commands
 - If credentials are accidentally committed, immediately revoke the bot token via @BotFather `/revoke` and generate a new one
 - The listener uses Telegram's long-polling API — no public webhook or open port needed
 
@@ -609,6 +722,6 @@ These are hardcoded across all Python modules and the MQL5 EA — do not change:
 
 | Label | Integer | Meaning |
 |-------|---------|---------|
-| Bull | 0 | Trending upward |
-| Bear | 1 | Trending downward |
-| Chop | 2 | Sideways / low conviction |
+| Bull | 0 | Trending upward — BUY signals eligible |
+| Bear | 1 | Trending downward — SELL signals eligible |
+| Chop | 2 | Sideways / low conviction — all signals suppressed |
