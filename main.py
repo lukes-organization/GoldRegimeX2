@@ -368,7 +368,8 @@ def cmd_demo(args):
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
                   prob_threshold_override=getattr(args, "prob_threshold", None),
-                  short_threshold_override=getattr(args, "short_threshold", None))
+                  short_threshold_override=getattr(args, "short_threshold", None),
+                  profit_target=getattr(args, "profit_target", None))
 
 
 def cmd_live(args):
@@ -398,7 +399,8 @@ def cmd_live(args):
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
                   prob_threshold_override=getattr(args, "prob_threshold", None),
-                  short_threshold_override=getattr(args, "short_threshold", None))
+                  short_threshold_override=getattr(args, "short_threshold", None),
+                  profit_target=getattr(args, "profit_target", None))
 
 
 def cmd_report(args):
@@ -606,6 +608,9 @@ def main():
                         help="Override BUY probability threshold for --mode live (skips Optuna lookup).")
     parser.add_argument("--short_threshold", type=float, default=None,
                         help="Override SELL probability threshold for --mode live (skips Optuna lookup).")
+    parser.add_argument("--profit_target",  type=float, default=None,
+                        help="Quick-profit close threshold in USD.  M5 defaults to 4.0; "
+                             "other TFs disabled unless set.  Pass 0 to disable on M5.")
 
     args = parser.parse_args()
     {

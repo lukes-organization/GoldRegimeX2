@@ -58,6 +58,18 @@ MIN_SPREAD_RATIO = {"headway_cent": 1.5, "standard": 3.0}  # TP1 vs spread floor
 # SL = ATR × multiplier (per TF — M5 tighter to avoid noise-outs on scalps)
 TF_ATR_MULTIPLIER  = {"M5": 1.5, "M15": 2.0, "H1": 2.0}
 
+# Quick-profit target for M5 scalping: close early when floating P&L reaches
+# this USD amount rather than waiting for the full TP.  Re-entry is allowed on
+# the next bar if signal conditions are still met.  Set to None to disable.
+QUICK_PROFIT_TARGET_M5 = 4.0
+
+# Trailing P&L stop ("Chop Buffer"): once a position's peak floating P&L has
+# reached TRAILING_ACTIVATION_USD, close it if P&L drops back below
+# peak × TRAILING_DRAWDOWN_PCT.  Catches stalling/reversing scalps that never
+# reach the fixed target, bypassing the 1-bar HMM state detection delay.
+TRAILING_ACTIVATION_USD  = 2.0   # start protecting once P&L first exceeds this
+TRAILING_DRAWDOWN_PCT    = 0.50  # close if P&L falls below 50 % of observed peak
+
 # ── Per-timeframe signal thresholds and order parameters ──────────────────────
 TF_PROB_THRESHOLD  = {"M5": 0.52, "M15": 0.54, "H1": 0.54}   # fallback — Optuna value used when available
 TF_SHORT_THRESHOLD = {"M5": 0.48, "M15": 0.46, "H1": 0.46}   # fallback only
@@ -71,7 +83,11 @@ TF_HIGH_VOL_DEV    = {"M5": 50,   "M15": 50,   "H1": 50}
 # M5 uses tighter mults (0.8 / 2.0) — TP1 locks in quick profit, TP2 is realistic
 # for a scalp runner vs the original [1.0, 3.0] which rarely filled on M5.
 TF_TP_CONFIG = {
-    "M5":  {"trending": [0.8, 1.5], "chop": [0.5]},   # fast partial 0.8x, runner 1.5x
+    # M5 growth accounts (pos_per_trade=3) use all three TPs.
+    # Small accounts (pos_per_trade=2) only use TP1+TP2 — TP3 entry is ignored.
+    # TP3 (3.0x) only fills on genuine momentum sessions; trailing guard exits
+    # position 3 gracefully when momentum fades before the target.
+    "M5":  {"trending": [0.8, 1.5, 3.0], "chop": [0.5]},
     "M15": {"trending": [1.0, 2.0], "chop": [0.8]},   # partial at 1:1, runner at 2:1
     "H1":  {"trending": [1.0, 2.0], "chop": [1.0]},   # same ratio as M15 — 3.0x was rarely filled
 }
@@ -321,7 +337,7 @@ def _apply_profit_guard(signal_tracker: dict, mt5) -> None:
         )
 
 
-def _close_position(ticket: int, mt5) -> None:
+def _close_position(ticket: int, mt5, comment: str = "GRX_close_chop") -> None:
     """Close a specific open position at market price."""
     positions = mt5.positions_get(ticket=ticket)
     if not positions:
@@ -339,18 +355,18 @@ def _close_position(ticket: int, mt5) -> None:
         "price":        price,
         "deviation":    20,
         "magic":        MAGIC_NUMBER,
-        "comment":      "GRX_close_chop",
+        "comment":      comment,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
     res = mt5.order_send(request)
     if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-        logger.info("Position closed (Chop exit): ticket=%d", ticket)
+        logger.info("Position closed (%s): ticket=%d", comment, ticket)
     else:
         logger.warning("Position close failed: ticket=%d  retcode=%s",
                        ticket, res.retcode if res else "None")
 
 
-def _log_closed_pnl(tickets: list, mt5) -> None:
+def _log_closed_pnl(tickets: list, mt5, broker: str = "headway_cent") -> None:
     """Query MT5 deal history for each closed ticket and log realized P&L.
 
     MT5 deal profits are reported in the account currency.  On Headway Cent
@@ -361,18 +377,21 @@ def _log_closed_pnl(tickets: list, mt5) -> None:
     now   = datetime.now(timezone.utc)
     start = now - timedelta(hours=48)   # wide window covers overnight gaps
 
-    # Detect cent account once per call — raw balance > 10 000 → cents display
-    try:
-        raw_balance = mt5.account_info().balance
-        is_cent     = raw_balance > 10_000
-    except Exception:
-        is_cent = False
+    # Cent accounts report P&L in cUSD — divide by 100 to get real USD.
+    # Use the broker parameter directly; do NOT rely on raw balance because
+    # demo standard accounts routinely have balances > 10 000 USD.
+    is_cent = (broker == "headway_cent")
 
     for ticket in tickets:
         try:
             deals = None
             for _ in range(20):          # retry — exit deal can lag 10–15 s after close
-                deals = mt5.history_deals_get(start, now, position=ticket)
+                raw = mt5.history_deals_get(start, now, position=ticket)
+                # Explicitly filter by position_id — mt5.history_deals_get with
+                # position= can return all deals on some brokers/builds if the
+                # filter is silently ignored.  Filtering here guarantees we only
+                # process deals that belong to this specific position.
+                deals = [d for d in (raw or []) if d.position_id == ticket]
                 # Only accept once we have the closing fill (DEAL_ENTRY_OUT = 1)
                 # The opening deal (entry=0) appears immediately; that is why a
                 # shorter retry loop returns pnl=0.0 — it only finds the open fill.
@@ -602,6 +621,7 @@ def run_live_loop(
     account_size: float = None,
     prob_threshold_override: float = None,
     short_threshold_override: float = None,
+    profit_target: float = None,
 ) -> None:
     """Connect to MT5 and run the signal → order loop until interrupted.
 
@@ -609,10 +629,13 @@ def run_live_loop(
     margin validation are enforced before every order.
 
     Args:
-        tf:           Timeframe to trade — "H1", "M15", or "M5".
-        broker:       Broker config key from risk_manager.BROKER_CONFIGS.
-        account_size: USD balance used for lot-sizing.  If None, reads from MT5
-                      and normalises for cent accounts automatically.
+        tf:            Timeframe to trade — "H1", "M15", or "M5".
+        broker:        Broker config key from risk_manager.BROKER_CONFIGS.
+        account_size:  USD balance used for lot-sizing.  If None, reads from MT5
+                       and normalises for cent accounts automatically.
+        profit_target: Close early when floating P&L reaches this USD amount.
+                       Defaults to QUICK_PROFIT_TARGET_M5 for M5, disabled for
+                       other TFs.  Pass 0 to disable on M5 explicitly.
     """
     import MetaTrader5 as mt5
     from src.mt5_sync import connect_mt5, disconnect_mt5
@@ -622,7 +645,8 @@ def run_live_loop(
 
     try:
         _run_loop_inner(tf, broker, account_size, mt5,
-                        prob_threshold_override, short_threshold_override)
+                        prob_threshold_override, short_threshold_override,
+                        profit_target)
     finally:
         disconnect_mt5()
         logger.info("Live loop terminated.  MT5 disconnected.")
@@ -630,7 +654,8 @@ def run_live_loop(
 
 def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     prob_threshold_override: float = None,
-                    short_threshold_override: float = None) -> None:
+                    short_threshold_override: float = None,
+                    profit_target: float = None) -> None:
     """Inner loop extracted to allow clean finally / disconnect in run_live_loop."""
     tf_mt5 = _get_tf_map()[tf.upper()]
 
@@ -704,6 +729,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     signal_tracker = {"tickets": [], "entry_price": 0.0,
                       "direction": None, "tp1_hit": False,
                       "tp1_level": None, "guard_hit": False}
+    # Per-ticket high-water-mark for trailing P&L stop  {ticket: peak_usd}
+    peak_pnl_tracker: dict = {}
 
     arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
     logger.info(
@@ -716,6 +743,32 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         "override" if (prob_threshold_override or short_threshold_override)
         else ("optuna" if prob_threshold_opt is not None else "hardcoded"),
     )
+
+    # Resolve quick-profit target: CLI override > M5 default > disabled
+    if profit_target is None:
+        profit_target = QUICK_PROFIT_TARGET_M5 if tf.upper() == "M5" else None
+    elif profit_target <= 0:
+        profit_target = None   # explicit CLI disable (--profit_target 0)
+    if profit_target is not None:
+        logger.info(
+            "Hybrid Scalp Protection — Fixed target: $%.2f | "
+            "Trailing guard: activation $%.2f / drawdown %.0f%%.",
+            profit_target, TRAILING_ACTIVATION_USD, TRAILING_DRAWDOWN_PCT * 100,
+        )
+
+    # Warn if the MQL5 EA (same MAGIC_NUMBER) already has open positions.
+    # Running both simultaneously causes Python to see EA positions as its own
+    # and block all signal generation via the "Open position — holding" guard.
+    _startup_positions = mt5.positions_get(symbol=DEFAULT_SYMBOL) or []
+    _ea_conflict = [p for p in _startup_positions if p.magic == MAGIC_NUMBER]
+    if _ea_conflict:
+        logger.warning(
+            "CONFLICT: %d open position(s) with MAGIC_NUMBER=%d detected at startup. "
+            "These were likely placed by the MQL5 EA (GoldRegimeX.mq5). "
+            "Running both EA and Python bridge simultaneously causes signal blocking. "
+            "Detach the EA from the chart before continuing.",
+            len(_ea_conflict), MAGIC_NUMBER,
+        )
 
     while True:
         try:
@@ -743,11 +796,55 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     closed = [t for t in signal_tracker["tickets"] if t not in open_set]
                     if closed:
                         _log_closed_pnl(closed, mt5)
+                        for _t in closed:
+                            peak_pnl_tracker.pop(_t, None)
                         signal_tracker["tickets"] = [
                             t for t in signal_tracker["tickets"] if t in open_set
                         ]
                         if not signal_tracker["tickets"]:
                             signal_tracker["tp1_hit"] = False
+
+                # ── Hybrid Scalp Protection (per-position) ────────────────
+                # Runs every poll cycle (5 s) — bypasses the 5-min bar delay.
+                # Condition A — Fixed target  : close when P&L >= profit_target
+                # Condition B — Trailing guard: once P&L peaked >= $2, close if
+                #               it pulls back to ≤ 50 % of that peak (chop buffer)
+                if profit_target is not None and signal_tracker["tickets"]:
+                    _pnl_divisor = 100 if broker == "headway_cent" else 1
+                    _open_pos = [
+                        p for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
+                        if p.magic == MAGIC_NUMBER
+                        and p.ticket in set(signal_tracker["tickets"])
+                    ]
+                    for _pos in _open_pos:
+                        _cur  = _pos.profit / _pnl_divisor
+                        _peak = peak_pnl_tracker.get(_pos.ticket, _cur)
+
+                        # Update high-water mark
+                        if _cur > _peak:
+                            _peak = _cur
+                            peak_pnl_tracker[_pos.ticket] = _peak
+
+                        # Condition A: fixed scalp target (per position)
+                        if _cur >= profit_target:
+                            logger.info(
+                                "Fixed scalp target #%d: P&L=+$%.2f >= $%.2f — closing.",
+                                _pos.ticket, _cur, profit_target,
+                            )
+                            _close_position(_pos.ticket, mt5,
+                                            comment="GRX_Fixed_Scalp_Target")
+                            continue
+
+                        # Condition B: trailing guard — activation $2, drawdown 50 %
+                        if (_peak >= TRAILING_ACTIVATION_USD
+                                and _cur <= _peak * TRAILING_DRAWDOWN_PCT):
+                            logger.info(
+                                "Trailing guard #%d: P&L=$%.2f <= 50%% of peak $%.2f "
+                                "(activation $%.2f) — closing.",
+                                _pos.ticket, _cur, _peak, TRAILING_ACTIVATION_USD,
+                            )
+                            _close_position(_pos.ticket, mt5,
+                                            comment="GRX_Trailing_Profit_Guard")
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
             last_bar_time = bar_time
@@ -798,7 +895,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 closed = [t for t in signal_tracker["tickets"] if t not in open_set]
                 # Log P&L for any positions that closed since last bar
                 if closed:
-                    _log_closed_pnl(closed, mt5)
+                    _log_closed_pnl(closed, mt5, broker=broker)
                 # Profit guard: move SL to entry+spread when 70% to TP1 (all TFs)
                 if active:
                     _apply_profit_guard(signal_tracker, mt5)
@@ -904,6 +1001,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             signal_tracker = {"tickets": [], "entry_price": entry_price,
                               "direction": direction, "tp1_hit": False,
                               "tp1_level": tp_levels[0], "guard_hit": False}
+            peak_pnl_tracker = {}
             logger.info(
                 "SIGNAL %s | state=%d | prob=%.3f | lot×%d=%.2f | sl=%.2f | tp=%s | dev=%d",
                 direction, hmm_state, prob, pos_per_trade, lot_per_pos,

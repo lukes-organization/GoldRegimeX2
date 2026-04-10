@@ -126,24 +126,28 @@ class AdaptiveRiskManager:
             tf: Timeframe string (e.g. ``"M5"``). Defaults to ``self.tf``
                 set at construction. M5 small accounts get a higher daily
                 cap (4) to match the higher bar frequency.
+
+        Lot sizing note: pos_per_trade controls how many orders are placed per
+        signal.  Each order is individually floored to 0.01 lots in the trader
+        (``max(0.01, lot_per_pos)``), so even on a $15 account every position
+        uses minimum notional sizing — 2 positions simply gives two independent
+        entries with separate TPs for performance monitoring.
         """
         _tf = (tf or self.tf).upper()
         if self.is_small_account:
-            # M5 generates ~288 bars/day, M15 ~96 bars/day — both get a higher
-            # daily cap so the optimizer can clear MIN_OOS_TRADES thresholds.
+            # M5/M15 small accounts: 4 daily position slots (2 signals × 2 positions).
+            # Both standard and cent use pos_per_trade=2; lot floor (0.01) in mt5_trader
+            # ensures notional stays minimal per position.
             max_daily = 4 if _tf in ("M5", "M15") else 2
-            return {"max_daily_trades": max_daily, "pos_per_trade": 1, "total_daily_pos": max_daily}
+            return {"max_daily_trades": max_daily, "pos_per_trade": 2, "total_daily_pos": max_daily}
 
-        # Growth account: market-state-dependent
+        # Growth account (>$50): 3 positions per signal for staged TPs.
         in_chop = (market_state == self.CHOP_STATE) if market_state is not None else False
         max_daily = 2 if in_chop else 3
-        # Standard account guard: a 0.01 standard lot on XAUUSD has ~$48 notional;
-        # dual positions on a sub-$50 standard account exceed safe margin usage.
-        pos_per_trade = 1 if (self.broker == "standard" and self.balance < SMALL_ACCOUNT_THRESHOLD) else 2
         return {
             "max_daily_trades": max_daily,
-            "pos_per_trade": pos_per_trade,
-            "total_daily_pos": max_daily * pos_per_trade,
+            "pos_per_trade": 3,
+            "total_daily_pos": max_daily * 3,
         }
 
     def calculate_lot_size(self, stop_loss_pips: float) -> float:
