@@ -135,6 +135,12 @@ class AdaptiveRiskManager:
         """
         _tf = (tf or self.tf).upper()
         if self.is_small_account:
+            # H1 on a small cent account: cap at 1 trade + 1 position per day.
+            # A single H1 swing can fill most of the 15% daily DD limit on a $15
+            # account — forcing 1 clean setup prevents compounding losses from
+            # multiple marginal entries.
+            if _tf == "H1" and self.broker == "headway_cent":
+                return {"max_daily_trades": 1, "pos_per_trade": 1, "total_daily_pos": 1}
             # M5/M15 small accounts: 4 daily position slots (2 signals × 2 positions).
             # Both standard and cent use pos_per_trade=2; lot floor (0.01) in mt5_trader
             # ensures notional stays minimal per position.

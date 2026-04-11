@@ -66,10 +66,17 @@ def _get_tier(balance: float) -> str:
     return "small" if balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
 
 
-def _score_result(result: dict, tier: str, broker: str) -> float:
+def _score_result(result: dict, tier: str, broker: str, tf: str = "H1") -> float:
     cfg  = TIER_CONFIGS[tier]
     dd   = result["max_drawdown"]
-    base = (result["sharpe_ratio"] - dd * cfg["dd_penalty"]
+    # H1 on a small account is more vulnerable to drawdown: a single "normal"
+    # H1 swing can consume 10-15 % of a $15 balance.  Double the penalty to
+    # force the optimizer towards lower-drawdown, safer entries over raw Sharpe.
+    if tf.upper() == "H1" and tier == "small":
+        dd_penalty = cfg["dd_penalty"] * 2.0
+    else:
+        dd_penalty = cfg["dd_penalty"]
+    base = (result["sharpe_ratio"] - dd * dd_penalty
             if broker == "headway_cent"
             else result["sharpe_ratio"])
     if dd > cfg["dd_limit"]:
@@ -116,6 +123,11 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # only clean Bull/Bear periods generate trades.
         if tf.upper() == "M5":
             n_states = trial.suggest_categorical("n_states", [2, 4])
+        elif tf.upper() == "H1":
+            # Lock H1 to 3 states (Bull/Bear/Chop_Low ≈ Chop).  n_states=4 adds
+            # a Chop_High micro-regime on hourly bars that increases IS complexity
+            # without improving OOS performance on a small-capital account.
+            n_states = trial.suggest_int("n_states", 3, 3)
         else:
             n_states   = trial.suggest_int("n_states", 3, 4)
         # M5 probs cluster below 0.56 in live — narrow range forces the
@@ -144,17 +156,25 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
         # M5 uses shallower trees (2-3) to prevent IS memorisation across the
         # large bar count; heavier L1 reg (1-20) to sparsify feature weights.
+        # H1: max_depth capped at 4 (vs M15's 5) — hourly bars carry more signal
+        # per bar but overfit faster on small datasets; min_child_weight raised
+        # to 15-30 to require statistically significant split nodes.
         if tf.upper() == "M5":
-            max_depth = trial.suggest_int("max_depth", 2, 3)
-            reg_alpha = trial.suggest_float("reg_alpha", 1.0, 20.0, log=True)
+            max_depth        = trial.suggest_int("max_depth", 2, 3)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1.0, 20.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
+        elif tf.upper() == "H1":
+            max_depth        = trial.suggest_int("max_depth", 2, 4)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 10.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 15, 30)
         else:
-            max_depth = trial.suggest_int("max_depth", 3, 5)
-            reg_alpha = trial.suggest_float("reg_alpha", 0.01, 10.0, log=True)
+            max_depth        = trial.suggest_int("max_depth", 3, 5)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 10.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
         learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
         n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)
         subsample        = trial.suggest_float("subsample", 0.6, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
-        min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
         gamma            = trial.suggest_float("gamma",     0.01, 5.0,  log=True)
 
         try:
@@ -211,9 +231,9 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                     "sharpe_ratio": result["oos_sharpe_ratio"],
                     "max_drawdown": result["oos_max_drawdown"],
                 }
-                score = _score_result(oos_result, tier, broker)
+                score = _score_result(oos_result, tier, broker, tf)
             else:
-                score = _score_result(result, tier, broker)
+                score = _score_result(result, tier, broker, tf)
 
             logger.info(
                 "Trial %d [%s/%s tier=%s $%.0f]: score=%.3f  "
