@@ -486,13 +486,13 @@ def cmd_report(args):
     paths = generate_full_report(
         df_aligned, states_aligned, state_names, model_hmm,
         X, probabilities, metrics, result, display_params,
-        split_idx=split_idx, tf=tf,
+        split_idx=split_idx, tf=tf, broker=broker,
     )
 
-    print(f"\n=== Report Generated [{tf}] ===")
+    print(f"\n=== Report Generated [{tf} / {broker}] ===")
     for p in paths:
         print(f"  {p}")
-    print(f"\n5 charts saved to reports/{tf}/")
+    print(f"\n5 charts saved to reports/{tf}_{broker}/")
 
 
 def cmd_audit(args):

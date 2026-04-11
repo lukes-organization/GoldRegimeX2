@@ -34,16 +34,16 @@ def _downsample(df: pd.DataFrame, states: np.ndarray, max_bars: int = _MAX_DISPL
     return df.iloc[::step], states[::step]
 
 
-def _tf_dir(tf: str = "H1") -> Path:
-    """Return the TF-specific report subdirectory, creating it if needed."""
-    d = REPORT_DIR / tf.upper()
+def _tf_dir(tf: str = "H1", broker: str = "headway_cent") -> Path:
+    """Return the TF+broker-specific report subdirectory, creating it if needed."""
+    d = REPORT_DIR / f"{tf.upper()}_{broker}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def plot_regime_overlay(df, hmm_states, state_names, tf="H1", save_path=None):
+def plot_regime_overlay(df, hmm_states, state_names, tf="H1", broker="headway_cent", save_path=None):
     """Price chart with HMM regime shading."""
-    save_path = save_path or _tf_dir(tf) / "1_regime_overlay.png"
+    save_path = save_path or _tf_dir(tf, broker) / "1_regime_overlay.png"
 
     # Downsample for display — avoids straight-line weekend-gap artefacts and
     # noisy regime fills that appear white at high bar density (e.g. M5 10yr).
@@ -89,9 +89,9 @@ def plot_regime_overlay(df, hmm_states, state_names, tf="H1", save_path=None):
     return str(save_path)
 
 
-def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", save_path=None):
+def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", broker="headway_cent", save_path=None):
     """Equity curve, drawdown, and signal markers with train/test split."""
-    save_path = save_path or _tf_dir(tf) / "2_equity_curve.png"
+    save_path = save_path or _tf_dir(tf, broker) / "2_equity_curve.png"
 
     from src.backtester import compute_signals, compute_position_sizes
 
@@ -179,9 +179,9 @@ def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", sa
     return str(save_path)
 
 
-def plot_feature_analysis(X, hmm_states, metrics, tf="H1", save_path=None):
+def plot_feature_analysis(X, hmm_states, metrics, tf="H1", broker="headway_cent", save_path=None):
     """Feature importance, distributions per regime, and correlation."""
-    save_path = save_path or _tf_dir(tf) / "3_feature_analysis.png"
+    save_path = save_path or _tf_dir(tf, broker) / "3_feature_analysis.png"
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
@@ -241,9 +241,9 @@ def plot_feature_analysis(X, hmm_states, metrics, tf="H1", save_path=None):
     return str(save_path)
 
 
-def plot_transition_matrix(model_hmm, state_names, tf="H1", save_path=None):
+def plot_transition_matrix(model_hmm, state_names, tf="H1", broker="headway_cent", save_path=None):
     """HMM transition matrix heatmap."""
-    save_path = save_path or _tf_dir(tf) / "4_transition_matrix.png"
+    save_path = save_path or _tf_dir(tf, broker) / "4_transition_matrix.png"
 
     n = model_hmm.n_components
     trans = model_hmm.transmat_
@@ -274,9 +274,9 @@ def plot_transition_matrix(model_hmm, state_names, tf="H1", save_path=None):
     return str(save_path)
 
 
-def plot_summary_dashboard(result, params, tf="H1", save_path=None):
+def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent", save_path=None):
     """Single-panel summary card with key metrics and params."""
-    save_path = save_path or _tf_dir(tf) / "5_summary_dashboard.png"
+    save_path = save_path or _tf_dir(tf, broker) / "5_summary_dashboard.png"
 
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.axis("off")
@@ -371,13 +371,14 @@ def plot_summary_dashboard(result, params, tf="H1", save_path=None):
 
 def generate_full_report(df, hmm_states, state_names, model_hmm,
                          X, probabilities, metrics, result, params=None,
-                         split_idx=None, tf="H1"):
-    """Generate all 5 charts into reports/<TF>/ and return list of file paths."""
+                         split_idx=None, tf="H1", broker="headway_cent"):
+    """Generate all 5 charts into reports/<TF>_<broker>/ and return list of file paths."""
     paths = []
-    paths.append(plot_regime_overlay(df, hmm_states, state_names, tf=tf))
-    paths.append(plot_equity_curve(df, probabilities, hmm_states, split_idx=split_idx, tf=tf))
-    paths.append(plot_feature_analysis(X, hmm_states, metrics, tf=tf))
-    paths.append(plot_transition_matrix(model_hmm, state_names, tf=tf))
-    paths.append(plot_summary_dashboard(result, params or {}, tf=tf))
-    logger.info("Full report [%s]: %d charts in %s", tf, len(paths), REPORT_DIR / tf.upper())
+    paths.append(plot_regime_overlay(df, hmm_states, state_names, tf=tf, broker=broker))
+    paths.append(plot_equity_curve(df, probabilities, hmm_states, split_idx=split_idx, tf=tf, broker=broker))
+    paths.append(plot_feature_analysis(X, hmm_states, metrics, tf=tf, broker=broker))
+    paths.append(plot_transition_matrix(model_hmm, state_names, tf=tf, broker=broker))
+    paths.append(plot_summary_dashboard(result, params or {}, tf=tf, broker=broker))
+    logger.info("Full report [%s/%s]: %d charts in %s", tf, broker, len(paths),
+                REPORT_DIR / f"{tf.upper()}_{broker}")
     return paths

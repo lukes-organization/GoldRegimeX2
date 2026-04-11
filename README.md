@@ -311,12 +311,23 @@ Converts the XGBoost volatility ensemble to ONNX format for use with the MQL5 Ex
 python main.py --mode report --broker headway_cent --balance 15 --tf H1
 ```
 
-Saves 5 charts to `reports/H1/`:
+Saves 5 charts to `reports/H1_headway_cent/`:
 1. Regime overlay on price
 2. Equity curve (IS vs OOS)
 3. Feature analysis
 4. HMM transition matrix
 5. Summary dashboard
+
+Reports are saved to a **broker- and TF-specific folder** so cent and standard charts never overwrite each other:
+
+```
+reports/
+├── H1_headway_cent/      ← H1 cent charts
+├── H1_standard/          ← H1 standard charts
+├── M15_headway_cent/
+├── M5_headway_cent/
+└── M5_standard/
+```
 
 ### Step 7 — Validate before going live
 
@@ -383,7 +394,7 @@ python main.py --mode <MODE> [OPTIONS]
 | `train` | Train HMM + XGBoost with best params; saves broker+TF-specific model files |
 | `compare` | Side-by-side OOS comparison across TFs |
 | `export` | Export XGBoost ensemble → ONNX |
-| `report` | Generate 5-chart visual report |
+| `report` | Generate 5-chart visual report saved to `reports/<TF>_<broker>/` |
 | `sync_validate` | Download live MT5 data + validate model health |
 | `demo` | Connect to MT5 demo account and run the live execution loop (no YES prompt) |
 | `live` | Connect to MT5 live account and run the live execution loop (requires YES) |
@@ -605,6 +616,7 @@ M5 and M15 get a higher cap (4 positions/day) because their higher bar frequency
 python main.py --mode process       --tf H1
 python main.py --mode optimize      --tf H1 --broker headway_cent --balance 15 --trials 300
 python main.py --mode train         --tf H1 --broker headway_cent --balance 15
+python main.py --mode report        --tf H1 --broker headway_cent --balance 15
 python main.py --mode export        --tf H1 --broker headway_cent
 python main.py --mode sync_validate --tf H1 --broker headway_cent --balance 15 --period 6m
 python main.py --mode demo          --tf H1 --broker headway_cent --balance 15
@@ -616,6 +628,7 @@ python main.py --mode live          --tf H1 --broker headway_cent --balance 15
 python main.py --mode process       --tf M15
 python main.py --mode optimize      --tf M15 --broker headway_cent --balance 15 --trials 300
 python main.py --mode train         --tf M15 --broker headway_cent --balance 15
+python main.py --mode report        --tf M15 --broker headway_cent --balance 15
 python main.py --mode sync_validate --tf M15 --broker headway_cent --balance 15 --period 3m
 python main.py --mode demo          --tf M15 --broker headway_cent --balance 15
 python main.py --mode live          --tf M15 --broker headway_cent --balance 15
@@ -626,6 +639,7 @@ python main.py --mode live          --tf M15 --broker headway_cent --balance 15
 python main.py --mode process       --tf M5
 python main.py --mode optimize      --tf M5 --broker headway_cent --balance 15 --trials 300
 python main.py --mode train         --tf M5 --broker headway_cent --balance 15
+python main.py --mode report        --tf M5 --broker headway_cent --balance 15
 python main.py --mode sync_validate --tf M5 --broker headway_cent --balance 15 --period 3m
 python main.py --mode demo          --tf M5 --broker headway_cent --balance 15
 python main.py --mode live          --tf M5 --broker headway_cent --balance 15
@@ -636,6 +650,7 @@ python main.py --mode live          --tf M5 --broker headway_cent --balance 15
 python main.py --mode process       --tf M5
 python main.py --mode optimize      --tf M5 --broker standard --balance 15 --trials 300
 python main.py --mode train         --tf M5 --broker standard --balance 15
+python main.py --mode report        --tf M5 --broker standard --balance 15
 python main.py --mode sync_validate --tf M5 --broker standard --balance 15 --period 3m
 python main.py --mode demo          --tf M5 --broker standard --balance 15
 python main.py --mode live          --tf M5 --broker standard --balance 15
