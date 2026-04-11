@@ -94,12 +94,19 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
     min_oos_trades = MIN_OOS_TRADES_BY_TF.get(tf.upper(), MIN_OOS_TRADES)
 
     def objective(trial: optuna.Trial) -> float:
-        # M5: obs_cov floor raised to 1.0 — values below ~0.5 produce a
-        # degenerate Kalman filter where Bull/Chop become identical states
-        # and the HMM fires 500K+ transitions (every 5-min bar).
-        # H1/M15 keep the wide range since their bars carry more information.
+        # obs_cov floor per TF — prevents degenerate Kalman configs where
+        # Bull/Chop collapse to identical states and fire 49K-500K transitions.
+        # M5: floor=1.0 (5-min noise needs high obs_cov to separate states).
+        # H1: floor=0.5 (hourly bars carry more signal but still degenerate < 0.5).
+        # M15: floor=0.1 (15-min retains the full wide range).
         if tf.upper() == "M5":
             obs_cov = trial.suggest_float("obs_cov", 1.0, 5.0, log=True)
+        elif tf.upper() == "H1":
+            # H1: floor raised to 0.5 — values below this with n_states=3 produce
+            # identical Bull/Chop means (49K+ transitions) on hourly bars.
+            # n_states=4 is more resilient but raising the floor avoids wasting
+            # trials in the known-degenerate low-obs_cov region.
+            obs_cov = trial.suggest_float("obs_cov", 0.5, 5.0, log=True)
         else:
             obs_cov = trial.suggest_float("obs_cov", 0.1, 5.0, log=True)
         # M5 Kalman is calibrated for 5-min noise; H1/M15 have smoother signals
@@ -124,10 +131,13 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         if tf.upper() == "M5":
             n_states = trial.suggest_categorical("n_states", [2, 4])
         elif tf.upper() == "H1":
-            # Lock H1 to 3 states (Bull/Bear/Chop_Low ≈ Chop).  n_states=4 adds
-            # a Chop_High micro-regime on hourly bars that increases IS complexity
-            # without improving OOS performance on a small-capital account.
-            n_states = trial.suggest_int("n_states", 3, 3)
+            # H1: require [3,4].  n_states=3 with obs_cov < ~1.0 collapses Bull
+            # and Chop to identical means (49K+ transitions) — the same degenerate
+            # pattern seen on M5 with 3 states.  Allowing n_states=4 gives Optuna a
+            # stable fallback (Chop_Low / Chop_High micro-regimes) while still
+            # producing clean Bull/Bear signals.  n_states=2 excluded: no Chop
+            # state causes counter-trend signals via regime-aligned filter.
+            n_states = trial.suggest_int("n_states", 3, 4)
         else:
             n_states   = trial.suggest_int("n_states", 3, 4)
         # M5 probs cluster below 0.56 in live — narrow range forces the

@@ -963,8 +963,27 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             limits        = arm.get_trade_limits(hmm_state)
             pos_per_trade = min(limits["pos_per_trade"], len(tp_mults))
             sl_distance   = max(atr_price * TF_ATR_MULTIPLIER.get(tf.upper(), 2.0), 0.01)
-            lot_total     = arm.calculate_lot_size(stop_loss_pips=sl_distance)
-            lot_per_pos   = max(0.01, round(lot_total / pos_per_trade, 2))
+
+            # $15 accounts use hardcoded lot splits — bypass AdaptiveRiskManager.
+            # Cent:     0.02 (pos1) + 0.03 (pos2) = 0.05 micro-lots total.
+            # Standard: 0.01 single position only — margin safety on $15 standard.
+            # Accounts > $50: dynamic ARM sizing as normal.
+            if round(account_size) == 15:
+                if broker == "headway_cent":
+                    forced_lots = [0.02, 0.03]
+                else:
+                    forced_lots   = [0.01]
+                    pos_per_trade = 1
+                pos_per_trade = min(pos_per_trade, len(forced_lots))
+                logger.info(
+                    "[SPECIAL] $15 Account Detected: Enforcing forced lot sizing "
+                    "(Broker: %s)  lots=%s  pos_per_trade=%d",
+                    broker, forced_lots, pos_per_trade,
+                )
+            else:
+                lot_total   = arm.calculate_lot_size(stop_loss_pips=sl_distance)
+                lot_per_pos = max(0.01, round(lot_total / pos_per_trade, 2))
+                forced_lots = [lot_per_pos] * pos_per_trade
 
             # ── 10. Deviation (TF-specific + regime stability) ────────────
             deviation = compute_deviation(model_hmm, hmm_state, tf)
@@ -995,10 +1014,10 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     continue
 
             # ── 12. Margin check ──────────────────────────────────────────
-            if not check_margin(DEFAULT_SYMBOL, lot_per_pos, order_type, entry_price):
+            if not check_margin(DEFAULT_SYMBOL, max(forced_lots), order_type, entry_price):
                 logger.warning(
                     "Insufficient margin for %s lot=%.2f. Skipping. Free margin: %.2f",
-                    direction, lot_per_pos, telemetry.get("free_margin", 0),
+                    direction, max(forced_lots), telemetry.get("free_margin", 0),
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -1009,17 +1028,19 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                               "tp1_level": tp_levels[0], "guard_hit": False}
             peak_pnl_tracker = {}
             logger.info(
-                "SIGNAL %s | state=%d | prob=%.3f | lot×%d=%.2f | sl=%.2f | tp=%s | dev=%d",
-                direction, hmm_state, prob, pos_per_trade, lot_per_pos,
+                "SIGNAL %s | state=%d | prob=%.3f | lots=%s | sl=%.2f | tp=%s | dev=%d",
+                direction, hmm_state, prob,
+                "+".join(f"{l:.2f}" for l in forced_lots[:pos_per_trade]),
                 sl_price, "/".join(f"{t:.2f}" for t in tp_levels), deviation,
             )
             for p in range(pos_per_trade):
-                tp_price = tp_levels[p]
-                comment  = f"GRX_{direction}_p{p+1}of{pos_per_trade}_s{hmm_state}_tp{p+1}"
+                tp_price    = tp_levels[p]
+                current_lot = forced_lots[p] if p < len(forced_lots) else forced_lots[-1]
+                comment     = f"GRX_{direction}_p{p+1}of{pos_per_trade}_s{hmm_state}_tp{p+1}"
                 result = send_market_order(
                     symbol=DEFAULT_SYMBOL,
                     order_type=order_type,
-                    lot=lot_per_pos,
+                    lot=current_lot,
                     sl=sl_price,
                     tp=tp_price,
                     deviation=deviation,
@@ -1045,7 +1066,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 send_telegram_msg(
                     f"{_emoji} <b>Trade opened</b> [{tf}]\n"
                     f"<b>{direction}</b>  Regime: <b>{state_lbl}</b>  Prob: <b>{prob:.3f}</b>\n"
-                    f"Lot: <b>{pos_per_trade}×{lot_per_pos:.2f}</b>  "
+                    f"Lots: <b>{'+'.join(f'{l:.2f}' for l in forced_lots[:pos_per_trade])}</b>  "
                     f"SL: <b>{sl_price:.2f}</b>  TP: <b>{_tp_str}</b>\n"
                     f"Tickets: {_tix}"
                 )
