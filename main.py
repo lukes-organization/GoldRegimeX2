@@ -38,6 +38,12 @@ def _resolve_balance(args) -> float:
 
 _M5_EXPIRY_HOURS   = 120   # 5 days
 
+# Staleness thresholds per TF (days).  If the saved model is older than this
+# the live gate aborts with a warning and Telegram alert.
+# M5 is tightest (14d) — microstructure regimes shift weekly.
+# H1/M15 are more stable but should still re-optimise monthly.
+_MODEL_STALE_DAYS  = {"M5": 14, "M15": 30, "H1": 30}
+
 
 def _m5_meta_path(broker: str) -> Path:
     return Path(f"models/m5_meta_{broker}.json")
@@ -118,6 +124,168 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         short_threshold=params.get("short_threshold"),
     )
     return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
+
+
+def _check_model_staleness(tf: str, broker: str, args) -> None:
+    """Abort live/demo start if the saved model exceeds the staleness threshold.
+
+    Sends a Telegram alert and calls ``sys.exit(1)`` when the model is too old.
+    Pass ``--skip_stale_check`` on the CLI to bypass this gate (e.g. for demo
+    testing when you intentionally don't want to re-optimise).
+
+    Does nothing for unknown TFs or when ``--skip_stale_check`` is set.
+    """
+    if getattr(args, "skip_stale_check", False):
+        logger.info("Staleness gate bypassed (--skip_stale_check).")
+        return
+
+    from src.validator import check_model_age
+    from src.notifier import send_telegram_msg
+
+    max_age  = _MODEL_STALE_DAYS.get(tf.upper(), 30)
+    age_days = check_model_age(tf=tf, broker=broker)
+
+    if age_days <= max_age:
+        logger.info(
+            "Model freshness OK: %s/%s is %.1f days old (limit %d).",
+            tf, broker, age_days, max_age,
+        )
+        return
+
+    age_str = f"{age_days:.0f}" if age_days != float("inf") else "unknown (file missing)"
+    msg = (
+        f"⚠️ Market Drift/Staleness detected. Pausing trade loop — "
+        f"[{tf}] model is {age_str} days old (limit: {max_age} days).\n"
+        f"Re-optimise before going live:\n"
+        f"  python main.py --mode optimize --tf {tf} --broker {broker} --trials 500\n"
+        f"  python main.py --mode train    --tf {tf} --broker {broker}\n"
+        f"Add --skip_stale_check to the live command to bypass this gate."
+    )
+    logger.warning("STALE MODEL [%s/%s]: %.0f days old — aborting.", tf, broker, age_days)
+    send_telegram_msg(f"<b>{msg}</b>")
+    print(f"\n{msg}")
+    sys.exit(1)
+
+
+def cmd_wfa(args):
+    """Walk-Forward Analysis: evaluate model consistency across rolling time windows.
+
+    Uses the globally-trained model's probability outputs (no per-window retraining)
+    to score IS + OOS Sharpe across every train_days/test_days window.  Prints a
+    per-window breakdown and the aggregate Walk-Forward Efficiency (WFE) ratio.
+
+    WFE target: > 50%.  A WFE of 60% means the model's OOS performance is 60% of
+    its IS performance — i.e. it generalises well rather than curve-fitting a few
+    favourable years.
+    """
+    from src.backtester import run_walk_forward
+    from src.notifier import send_telegram_msg
+
+    balance = _resolve_balance(args)
+    broker  = args.broker
+    tf      = args.tf.upper()
+
+    # TF-specific defaults (calendar days) — tuned to each bar frequency
+    _wfa_defaults = {"H1": (365, 90), "M15": (180, 60), "M5": (90, 30)}
+    default_train, default_test = _wfa_defaults.get(tf, (365, 90))
+    train_days = getattr(args, "train_days", None) or default_train
+    test_days  = getattr(args, "test_days",  None) or default_test
+
+    try:
+        params = get_best_params(balance=balance, broker=broker, tf=tf)
+        logger.info("WFA using Optuna params [%s/%s]: %s", tf, broker, params)
+    except Exception:
+        logger.warning("No Optuna study found for %s/%s — using defaults.", tf, broker)
+        params = {}
+
+    logger.info(
+        "Walk-Forward Analysis [%s/%s] balance=$%.0f  train=%dd  test=%dd",
+        tf, broker, balance, train_days, test_days,
+    )
+    print(f"\n=== Walk-Forward Analysis [{tf} / {broker}] ===")
+    print(f"  Train window : {train_days} days  |  Test step : {test_days} days")
+    print("  Loading full dataset...")
+
+    df = process_pipeline(
+        obs_cov=params.get("obs_cov"),
+        trans_cov=params.get("trans_cov"),
+        save=False,
+        tf=tf,
+    )
+
+    n_states = params.get("n_states", TF_CONFIG[tf].get("n_states_default", 3))
+    model_hmm, states, _ = fit_hmm(df, n_states=n_states)
+
+    _min_persist = min(model_hmm.transmat_[i, i] for i in range(model_hmm.n_components))
+    if _min_persist < 0.70:
+        print(
+            f"\nERROR: Degenerate HMM (min persistence={_min_persist:.4f}). "
+            "Run --mode optimize first to find stable Kalman parameters."
+        )
+        sys.exit(1)
+
+    X, y, df_aligned = prepare_features(df, states)
+    models_e, thresholds_e, metrics_e = train_xgb_ensemble(
+        X, y,
+        max_depth        = params.get("max_depth", 4),
+        learning_rate    = params.get("learning_rate", 0.1),
+        n_estimators     = params.get("n_estimators", 200),
+        subsample        = params.get("subsample", 0.8),
+        colsample_bytree = params.get("colsample_bytree", 0.8),
+        min_child_weight = params.get("min_child_weight", 5),
+        gamma            = params.get("gamma", 1.0),
+        reg_alpha        = params.get("reg_alpha", 0.1),
+    )
+    _, probs    = get_predictions_ensemble(models_e, thresholds_e, X)
+    states_aln  = states[df.index.isin(df_aligned.index)]
+
+    print(
+        f"  Dataset: {len(df_aligned)} bars  "
+        f"({df_aligned.index[0].date()} – {df_aligned.index[-1].date()})"
+    )
+    print("  Evaluating rolling windows (fixed model — no per-window retraining)...")
+
+    wfa = run_walk_forward(
+        df_aligned, probs, states_aln,
+        train_days      = train_days,
+        test_days       = test_days,
+        account_size    = balance,
+        broker          = broker,
+        tf              = tf,
+        prob_threshold  = params.get("prob_threshold"),
+        short_threshold = params.get("short_threshold"),
+    )
+
+    n_win    = wfa["n_windows"]
+    wfe      = wfa["wfe_ratio"]
+    mean_is  = wfa["mean_is_sharpe"]
+    mean_oos = wfa["mean_oos_sharpe"]
+    verdict  = "ROBUST ✅" if wfe >= 0.50 else "FRAGILE ⚠️ — consider re-optimising"
+
+    print(f"\n  Windows evaluated : {n_win}")
+    print(f"  Mean IS  Sharpe   : {mean_is:+.3f}")
+    print(f"  Mean OOS Sharpe   : {mean_oos:+.3f}")
+    print(f"  Walk-Forward Eff  : {wfe * 100:.1f}%  [{verdict}]")
+
+    if n_win > 0:
+        print("\n  Per-window OOS breakdown:")
+        for w in wfa["windows"]:
+            oos_s  = w.get("oos_sharpe_ratio", 0.0)
+            oos_t  = w.get("oos_n_trades",    0)
+            period = (
+                f"{w['oos_start'].strftime('%Y-%m')} → "
+                f"{w['oos_end'].strftime('%Y-%m')}"
+            )
+            flag = "✅" if oos_s >= 0.5 else ("⚠️" if oos_s >= 0 else "❌")
+            print(f"    {period}  OOS={oos_s:+.3f}  trades={oos_t}  {flag}")
+
+    send_telegram_msg(
+        f"📊 <b>Walk-Forward Analysis [{tf}]</b>\n"
+        f"Windows: <b>{n_win}</b>  |  "
+        f"IS: <b>{mean_is:+.3f}</b>  |  OOS: <b>{mean_oos:+.3f}</b>\n"
+        f"WFE: <b>{wfe * 100:.1f}%</b>  "
+        + ("✅ Robust" if wfe >= 0.50 else "⚠️ Fragile — re-optimise recommended")
+    )
 
 
 def cmd_process(args):
@@ -363,6 +531,8 @@ def cmd_demo(args):
     if not _check_m5_readiness(tf, args.broker):
         sys.exit(1)
 
+    _check_model_staleness(tf, args.broker, args)
+
     logger.info("Starting demo loop — TF=%s  broker=%s  balance=$%.0f",
         tf, args.broker, balance,
     )
@@ -381,6 +551,8 @@ def cmd_live(args):
 
     if not _check_m5_readiness(tf, args.broker):
         sys.exit(1)
+
+    _check_model_staleness(tf, args.broker, args)
 
     if not args.yes:
         print("\n" + "=" * 60)
@@ -585,7 +757,8 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
-                 "sync_validate", "demo", "live", "audit", "guardian", "listen", "consolidate"],
+                 "sync_validate", "demo", "live", "audit", "guardian", "listen",
+                 "consolidate", "wfa"],
         required=True,
     )
     parser.add_argument("--trials",   type=int,   default=250)
@@ -613,6 +786,13 @@ def main():
     parser.add_argument("--profit_target",  type=float, default=None,
                         help="Quick-profit close threshold in USD.  M5 defaults to 4.0; "
                              "other TFs disabled unless set.  Pass 0 to disable on M5.")
+    parser.add_argument("--skip_stale_check", action="store_true",
+                        help="Bypass the model-staleness gate on --mode live/demo. "
+                             "Use when intentionally running an older model (e.g. demo testing).")
+    parser.add_argument("--train_days", type=int, default=None,
+                        help="WFA IS window in calendar days (default: H1=365, M15=180, M5=90).")
+    parser.add_argument("--test_days",  type=int, default=None,
+                        help="WFA OOS step size in calendar days (default: H1=90, M15=60, M5=30).")
 
     args = parser.parse_args()
     {
@@ -629,6 +809,7 @@ def main():
         "guardian":      cmd_guardian,
         "listen":        cmd_listen,
         "consolidate":   cmd_consolidate,
+        "wfa":           cmd_wfa,
     }[args.mode](args)
 
 

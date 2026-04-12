@@ -20,8 +20,9 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 12. [Timeframe Configurations](#timeframe-configurations)
 13. [Telegram Remote Control](#telegram-remote-control)
 14. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
-15. [Troubleshooting](#troubleshooting)
-16. [Security Notes](#security-notes)
+15. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
+16. [Troubleshooting](#troubleshooting)
+17. [Security Notes](#security-notes)
 
 ---
 
@@ -784,3 +785,107 @@ sorted by mean return (low → high):
 Chop_Low typically appears during mild pullbacks or consolidation after a downward move. Chop_High appears during sideways drift after upward momentum. Both suppress signals — the division gives the HMM finer resolution when sorting out ambiguous bars, reducing mislabelling that would otherwise push bars into Bull or Bear incorrectly.
 
 During optimization and training logs, you will see these printed as `Chop_Low` and `Chop_High` in the transition matrix output. In the live log the bar status line shows `state=2` or `state=3`, both labelled `Chop` in the human-readable "No signal" message.
+
+---
+
+## Walk-Forward Analysis & Staleness Gate
+
+### What is Walk-Forward Analysis (WFA)?
+
+A static 80/20 IS/OOS split tells you whether the model generalises from early data to later data — once.  Walk-Forward Analysis rolls that split across the entire dataset to ask: *does the model work consistently across all time periods, or only in a few favourable years?*
+
+```
+Full dataset (10 years)
+  ├── Window 1:  Train [Y1–Y2]  →  Test [Y2 Q3]
+  ├── Window 2:  Train [Y1 Q3–Y2 Q3]  →  Test [Y3 Q1]
+  ├── Window N:  Train [...]  →  Test [...]
+  └── Aggregate: WFE = mean(OOS Sharpe) / mean(IS Sharpe)
+```
+
+**Walk-Forward Efficiency (WFE)** is the key metric:
+
+| WFE | Interpretation |
+|-----|----------------|
+| ≥ 60% | Robust — safe to go live |
+| 50–60% | Acceptable — monitor closely |
+| < 50% | Fragile — the model curve-fits specific years |
+
+### Run Walk-Forward Analysis
+
+After training, evaluate stability before going live:
+
+```bash
+# H1 (default: 365-day IS, 90-day OOS windows)
+python main.py --mode wfa --tf H1 --broker headway_cent --balance 15
+
+# M15 (default: 180-day IS, 60-day OOS windows)
+python main.py --mode wfa --tf M15 --broker headway_cent --balance 15
+
+# M5 (default: 90-day IS, 30-day OOS windows)
+python main.py --mode wfa --tf M5 --broker headway_cent --balance 15
+
+# Custom windows
+python main.py --mode wfa --tf H1 --train_days 180 --test_days 45 --broker headway_cent
+```
+
+Sample output:
+```
+=== Walk-Forward Analysis [H1 / headway_cent] ===
+  Windows evaluated : 12
+  Mean IS  Sharpe   : +1.847
+  Mean OOS Sharpe   : +1.023
+  Walk-Forward Eff  : 55.4%  [ROBUST ✅]
+
+  Per-window OOS breakdown:
+    2021-03 → 2021-06  OOS=+0.923  trades=18  ✅
+    2021-06 → 2021-09  OOS=+1.241  trades=22  ✅
+    2021-09 → 2021-12  OOS=-0.112  trades=9   ❌
+    ...
+```
+
+Results are also sent to Telegram.
+
+### Model Staleness Gate
+
+The `--mode live` and `--mode demo` commands automatically check how old the saved model is before starting.  If the model exceeds the staleness threshold for the given timeframe, the live loop aborts and sends a Telegram alert.
+
+| Timeframe | Max model age | Reason |
+|-----------|--------------|--------|
+| M5  | 14 days | Microstructure regimes shift weekly |
+| M15 | 30 days | Intraday momentum patterns change monthly |
+| H1  | 30 days | Swing regimes are more stable but drift over months |
+
+When staleness is detected:
+
+```
+⚠️ Market Drift/Staleness detected. Pausing trade loop — [M5] model is 18 days old (limit: 14 days).
+Re-optimise before going live:
+  python main.py --mode optimize --tf M5 --broker headway_cent --trials 500
+  python main.py --mode train    --tf M5 --broker headway_cent
+```
+
+The same message is sent to Telegram.
+
+**To bypass the gate** (e.g. for demo testing with an older model):
+
+```bash
+python main.py --mode live --tf M5 --broker headway_cent --balance 15 --skip_stale_check
+```
+
+### Recommended Maintenance Schedule
+
+```bash
+# Weekly (M5): check freshness before every live session
+python main.py --mode sync_validate --tf M5 --period 3m --broker headway_cent --balance 15
+python main.py --mode wfa           --tf M5 --broker headway_cent --balance 15
+
+# If WFE < 50% or sync_validate fails:
+python main.py --mode optimize --tf M5  --broker headway_cent --balance 15 --trials 500
+python main.py --mode train    --tf M5  --broker headway_cent --balance 15
+
+# Monthly (H1 / M15): same pattern with longer intervals
+python main.py --mode wfa     --tf H1  --broker headway_cent --balance 15
+python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --trials 250
+python main.py --mode train    --tf H1 --broker headway_cent --balance 15
+```
+

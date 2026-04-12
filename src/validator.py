@@ -14,6 +14,8 @@ an 80/20 chronological split of the full 10-year dataset.  Both metrics matter,
 but they answer different questions.
 """
 
+import time as _time
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -227,3 +229,22 @@ def run_validation(
         "status":   status,
         "message":  message,
     }
+
+
+def check_model_age(tf: str = "H1", broker: str = "headway_cent") -> float:
+    """Return the age of the saved ensemble model in days, based on file mtime.
+
+    Checks the broker+TF specific ensemble pkl first; falls back to the generic
+    path.  Returns ``float('inf')`` if no model file exists anywhere — the caller
+    should treat this as an infinitely stale model.
+    """
+    from src.engine_xgb import get_ensemble_path, ENSEMBLE_PKL_PATH as _GENERIC
+
+    path = get_ensemble_path(tf, broker)
+    if not path.exists():
+        path = _GENERIC
+    if not path.exists():
+        return float("inf")
+
+    age_sec = _time.time() - path.stat().st_mtime
+    return age_sec / 86_400   # convert seconds → days

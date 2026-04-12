@@ -249,6 +249,131 @@ def vectorized_backtest(
     return result
 
 
+def run_walk_forward(
+    df: pd.DataFrame,
+    probabilities: np.ndarray,
+    states: np.ndarray,
+    train_days: int        = 365,
+    test_days: int         = 90,
+    account_size: float    = 15.0,
+    broker: str            = "headway_cent",
+    tf: str                = "H1",
+    prob_threshold: float  = None,
+    short_threshold: float = None,
+) -> dict:
+    """Roll a fixed-weight model across time to compute Walk-Forward Efficiency.
+
+    Uses pre-computed *probabilities* and *states* — no model retraining.
+    Measures whether signals are consistent across all time periods rather
+    than concentrated in a few favourable years.
+
+    Walk-Forward Efficiency (WFE):
+        WFE = mean(OOS Sharpe) / mean(IS Sharpe)
+        WFE > 0.50 means the strategy retains at least 50% of its IS
+        performance on unseen forward-walk windows.
+
+    Args:
+        df:             Full featurised DataFrame (must have a DatetimeIndex).
+        probabilities:  XGBoost output array aligned with *df*.
+        states:         HMM state array aligned with *df*.
+        train_days:     IS window length in calendar days.
+        test_days:      OOS step/window size in calendar days.
+        account_size, broker, tf, prob_threshold, short_threshold:
+                        Forwarded to vectorized_backtest unchanged.
+
+    Returns a dict with keys:
+        wfe_ratio        — Walk-Forward Efficiency (OOS/IS Sharpe ratio)
+        mean_is_sharpe   — average IS Sharpe across all windows
+        mean_oos_sharpe  — average OOS Sharpe across all windows
+        n_windows        — number of walk-forward windows evaluated
+        windows          — list of per-window result dicts (IS+OOS metrics)
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("df.index must be a DatetimeIndex for walk-forward windowing.")
+
+    train_td = pd.Timedelta(days=train_days)
+    test_td  = pd.Timedelta(days=test_days)
+    start    = df.index[0]
+    end      = df.index[-1]
+    cursor   = start
+    windows: list[dict] = []
+
+    while cursor + train_td + test_td <= end:
+        is_mask  = (df.index >= cursor) & (df.index < cursor + train_td)
+        oos_mask = (df.index >= cursor + train_td) & (df.index < cursor + train_td + test_td)
+        n_is  = int(is_mask.sum())
+        n_oos = int(oos_mask.sum())
+
+        # Skip windows that are too thin for meaningful statistics
+        if n_is < 20 or n_oos < 5:
+            cursor += test_td
+            continue
+
+        window_mask = is_mask | oos_mask
+        idx         = np.where(window_mask)[0]
+        df_w     = df.iloc[idx]
+        probs_w  = probabilities[idx]
+        states_w = states[idx]
+
+        try:
+            result_w = vectorized_backtest(
+                df_w, probs_w, states_w,
+                split_idx=n_is,
+                account_size=account_size,
+                broker=broker,
+                tf=tf,
+                prob_threshold=prob_threshold,
+                short_threshold=short_threshold,
+            )
+            windows.append({
+                "is_start":  cursor,
+                "oos_start": cursor + train_td,
+                "oos_end":   cursor + train_td + test_td,
+                **result_w,
+            })
+        except Exception as exc:
+            logger.warning(
+                "WFA window %s skipped: %s",
+                cursor.strftime("%Y-%m"), exc,
+            )
+        cursor += test_td
+
+    if not windows:
+        logger.warning(
+            "Walk-Forward: no windows produced. "
+            "Dataset may be too short for train_days=%d + test_days=%d.",
+            train_days, test_days,
+        )
+        return {
+            "wfe_ratio": 0.0, "mean_is_sharpe": 0.0,
+            "mean_oos_sharpe": 0.0, "n_windows": 0, "windows": [],
+        }
+
+    # Only count windows with enough trades for a meaningful Sharpe
+    valid = [
+        w for w in windows
+        if w.get("is_n_trades", 0) >= 5 and w.get("oos_n_trades", 0) >= 1
+    ]
+    is_sharpes  = [w["is_sharpe_ratio"]  for w in valid]
+    oos_sharpes = [w["oos_sharpe_ratio"] for w in valid]
+
+    mean_is  = float(np.mean(is_sharpes))  if is_sharpes  else 0.0
+    mean_oos = float(np.mean(oos_sharpes)) if oos_sharpes else 0.0
+    wfe      = mean_oos / mean_is          if mean_is > 0 else 0.0
+
+    logger.info(
+        "Walk-Forward [%s/%s]: %d windows | IS=%.3f | OOS=%.3f | WFE=%.1f%%",
+        tf, broker, len(windows), mean_is, mean_oos, wfe * 100,
+    )
+    return {
+        "wfe_ratio":       wfe,
+        "mean_is_sharpe":  mean_is,
+        "mean_oos_sharpe": mean_oos,
+        "n_windows":       len(windows),
+        "windows":         windows,
+    }
+
+
 def compare_timeframes(m15_result: dict, h1_result: dict) -> tuple[dict, str]:
     """Compare M15 vs H1 backtest results and recommend the better timeframe.
 
