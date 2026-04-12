@@ -114,22 +114,21 @@ def map_usdchf_to_bars(df_index: pd.DatetimeIndex, usdchf_df: pd.DataFrame) -> p
             )
             series = pd.concat([series, pd.Series(series.iloc[-1], index=extension)])
         series = series.ffill()
-        return normalized.map(series)
+        return pd.Series(normalized.map(series).values, index=df_index, name="usdchf_log_return")
     else:
         # Intraday data — forward-fill onto bar timestamps.
-        # pandas 2.0 changed the default DatetimeIndex resolution: CSV reads
-        # produce 's' or 'us' while tz_localize(None) on a UTC-aware MT5 sync
-        # index gives 'ns'.  reindex silently returns all-NaN when the two sides
-        # have different resolutions.  Fix: normalise both to nanoseconds using
-        # the pandas-2.0 as_unit() API before calling reindex.
+        # Implementation note: we must return a Series indexed by the ORIGINAL
+        # df_index (tz-aware) not the tz-stripped idx, otherwise pandas 2.0
+        # realigns by index when the caller does df["usdchf_log_return"] = result
+        # and tz-aware vs tz-naive timestamps never match → all-NaN column.
         _series = series.copy()
         try:
             _series.index = _series.index.as_unit("ns")
             _idx = idx.as_unit("ns")
         except AttributeError:
-            # pandas < 2.0 — all DatetimeIndexes are already 'ns', no-op
             _idx = idx
-        return _series.reindex(_idx, method="ffill")
+        values = _series.reindex(_idx, method="ffill")
+        return pd.Series(values.values, index=df_index, name="usdchf_log_return")
 
 
 # Legacy aliases — kept so old imports don't crash if any caller still uses them.
