@@ -101,14 +101,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # obs_cov floor per TF — prevents degenerate Kalman configs where
         # Bull/Chop collapse to identical states and fire 49K-500K transitions.
         # M5: floor=1.0 (5-min noise needs high obs_cov to separate states).
-        # H1: floor=0.5 (hourly bars carry more signal but still degenerate < 0.5).
-        # M15: floor=0.1 (15-min retains the full wide range).
+        # H1/M15: floor=0.5 (sub-hourly bars still degenerate below this threshold).
+        # Other TFs: 0.1 (full range).
         if tf.upper() == "M5":
             obs_cov = trial.suggest_float("obs_cov", 1.0, 5.0, log=True)
-        elif tf.upper() == "H1":
-            # H1: floor raised to 0.5 — values below this with n_states=3 produce
-            # identical Bull/Chop means (49K+ transitions) on hourly bars.
-            # n_states=4 is more resilient but raising the floor avoids wasting
+        elif tf.upper() in ("H1", "M15"):
+            # H1/M15: floor raised to 0.5 — values below this with n_states=3/4
+            # produce identical Bull/Chop means (49K+ transitions) on sub-hourly
+            # bars.  n_states=4 is more resilient but the floor avoids wasting
             # trials in the known-degenerate low-obs_cov region.
             obs_cov = trial.suggest_float("obs_cov", 0.5, 5.0, log=True)
         else:
@@ -142,6 +142,13 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             # producing clean Bull/Bear signals.  n_states=2 excluded: no Chop
             # state causes counter-trend signals via regime-aligned filter.
             n_states = trial.suggest_int("n_states", 3, 4)
+        elif tf.upper() == "M15":
+            # M15: n_states=3 degenerates identically to M5 — Bull and Chop
+            # collapse to identical means (~return 0.000022, vol ~0.000595) producing
+            # 177K–194K transitions and non-positive-definite covariance errors.
+            # Restrict to n_states=4 only.  n_states=2 excluded: no Chop state
+            # causes counter-trend signals via regime-aligned filter.
+            n_states = trial.suggest_categorical("n_states", [4])
         else:
             n_states   = trial.suggest_int("n_states", 3, 4)
         # M5 probs cluster below 0.56 in live — narrow range forces the

@@ -34,7 +34,9 @@ MASTER_PATH_M5  = Path("data/processed/USDCHF_master_M5.csv")
 def _read_usdchf_csv(f: Path) -> pd.DataFrame | None:
     """Read a single USDCHF CSV, auto-detecting delimiter and header presence.
 
-    Handles two formats:
+    Handles three formats:
+    - MT5 History Center exports with separate ``<DATE>`` and ``<TIME>`` columns
+      (tab-delimited, angle-bracket column names like ``<DATE>\t<TIME>\t<OPEN>…``)
     - Named-column exports (``Date;Open;High;Low;Close;Volume`` header) from MT5
       History Center or the annual XTUP files downloaded with a ``MM/DD/YYYY`` date
     - Headerless MT5 bar exports (``USDCHF_H1.csv`` etc.) where the first column
@@ -42,6 +44,27 @@ def _read_usdchf_csv(f: Path) -> pd.DataFrame | None:
     """
     try:
         first_line = f.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+
+        # MT5 History Center format: tab-delimited with <DATE> <TIME> columns
+        if "<DATE>" in first_line and "<TIME>" in first_line:
+            df = pd.read_csv(f, sep="\t")
+            df.columns = [c.strip("<>").lower() for c in df.columns]
+            df["Date"] = pd.to_datetime(
+                df["date"].astype(str) + " " + df["time"].astype(str),
+                format="%Y.%m.%d %H:%M:%S",
+            )
+            df.set_index("Date", inplace=True)
+            # Keep only OHLCV columns; rename to match expected schema
+            df = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                                    "close": "Close", "tickvol": "Volume"})
+            keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+            df = df[keep]
+            if pd.api.types.is_datetime64_any_dtype(df.index):
+                logger.info("Loaded %d rows (MT5 History format) from %s", len(df), f)
+                return df
+            logger.warning("Could not parse dates in MT5 History format %s — skipping.", f)
+            return None
+
         sep = ";" if ";" in first_line else ","
 
         # If the first character is a digit the file has no header row —
