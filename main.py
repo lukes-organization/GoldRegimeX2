@@ -702,16 +702,28 @@ def cmd_guardian(args):
 
 
 def cmd_consolidate(args):
-    """Consolidate all USDCHF CSV exports in data/raw/ into USDCHF_master.csv."""
-    from src.data_consolidator import consolidate_usdchf
-    result = consolidate_usdchf()
-    if result.empty:
-        logger.error(
-            "Consolidation produced no data. Place USDCHF CSV files in data/raw/ "
-            "with 'USDCHF' in the filename (e.g. USDCHF_5m_data.csv)."
-        )
-    else:
-        print(f"\nUSDCHF master built: {len(result)} rows → data/processed/USDCHF_master.csv\n")
+    """Consolidate USDCHF CSV exports in data/raw/ into per-TF master files.
+
+    Produces:
+      data/processed/USDCHF_master.csv      (H1  — source: USDCHF_H1.csv)
+      data/processed/USDCHF_master_M15.csv  (M15 — source: USDCHF_M15_*.csv)
+      data/processed/USDCHF_master_M5.csv   (M5  — source: USDCHF_M5_*.csv)
+    """
+    from src.data_consolidator import (
+        consolidate_usdchf,
+        consolidate_usdchf_m15,
+        consolidate_usdchf_m5,
+    )
+    for fn, label, out in [
+        (consolidate_usdchf,     "H1",  "data/processed/USDCHF_master.csv"),
+        (consolidate_usdchf_m15, "M15", "data/processed/USDCHF_master_M15.csv"),
+        (consolidate_usdchf_m5,  "M5",  "data/processed/USDCHF_master_M5.csv"),
+    ]:
+        result = fn()
+        if not result.empty:
+            print(f"  USDCHF {label}: {len(result)} rows → {out}")
+        else:
+            logger.warning("USDCHF %s consolidation produced no data — skipping.", label)
 
 
 def cmd_listen(args):

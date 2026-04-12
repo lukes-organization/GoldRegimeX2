@@ -175,6 +175,19 @@ The system requires historical OHLCV CSV files exported from MetaTrader5. In MT5
 
 > The system works with H1, M15 and M5 timeframes. More data = better optimization. Aim for at least 2 years of history; the included H1 dataset covers 2004–2025.
 
+### Getting deep history from MT5 (any symbol, any timeframe)
+
+Since you are already using MT5, you can download historical data directly — provided you adjust your terminal settings to allow for 10 years of bars.
+
+**Action Required:**
+- Go to **Tools → Options → Charts**. Change **"Max bars in chart"** to a very high number (e.g., `99,999,999` or just type `unlimited`).
+- Go to **View → Symbols** (or `Ctrl+U`). Search for the symbol you want (e.g., **XAUUSD** or **USDCHF**).
+- Select the **Bars** tab. Choose your timeframe (M5, M15, H1, etc.) and click **Request**.
+- Keep clicking **"Request"** or scroll back the chart until the desired start year is reached.
+- Once loaded, click **Export Bars** to save as a `.csv`.
+
+> **Pro Tip:** If your broker (Headway) doesn't have 10 years of history, open a free **MetaQuotes-Demo** account inside MT5. MetaQuotes usually provides much deeper history than individual brokers.
+
 ### Keep your data fresh
 
 The processor filters to the **last 10 years anchored at the end of your CSV** (not today's date). If your CSV ends in December 2025, the 20% OOS window closes at December 2025 — but `sync_validate` pulls **live MT5 data up to today**. Any months after your CSV ends will be out-of-distribution for the model.
@@ -183,15 +196,29 @@ The processor filters to the **last 10 years anchored at the end of your CSV** (
 
 ### USDCHF — cross-asset USD strength feature (optional, recommended)
 
-USDCHF is used as an intraday DXY proxy (high correlation, natively available on Headway). To enable the `usdchf_log_return` feature:
+USDCHF is used as an intraday DXY proxy (high correlation, natively available on Headway). Each trading timeframe uses a **matching-frequency USDCHF master file** so bars are aligned during feature merging.
 
-1. In MT5, export **USDCHF** CSV files (any timeframe, same semicolon format as XAUUSD)
-2. Save to `data/raw/` — any filename containing `USDCHF` works (e.g. `USDCHF_2024.csv`)
-3. Run the consolidator:
+#### File naming convention
+
+| Trading TF | Source file in `data/raw/` | Master produced |
+|------------|---------------------------|-----------------|
+| H1  | `USDCHF_H1.csv` | `data/processed/USDCHF_master.csv` |
+| M15 | `USDCHF_M15_<dates>.csv` | `data/processed/USDCHF_master_M15.csv` |
+| M5  | `USDCHF_M5_<dates>.csv`  | `data/processed/USDCHF_master_M5.csv` |
+
+The date range in the filename is optional — anything matching `USDCHF_M15_*.csv` or `USDCHF_M5_*.csv` is picked up automatically.
+
+#### How to get USDCHF data free from MT5
+
+Follow the same deep-history export process described in [Getting deep history from MT5](#getting-deep-history-from-mt5-any-symbol-any-timeframe) above — just search for **USDCHF** instead of XAUUSD and select the matching timeframe (M5, M15, or H1). Save each file to `data/raw/` using the naming convention in the table above.
+
+#### Build the master files
+
 ```bash
 python main.py --mode consolidate
 ```
-This produces `data/processed/USDCHF_master.csv`. The pipeline adds it automatically as a 5th feature. If absent, all timeframes degrade gracefully to the 4-feature model.
+
+This runs all three consolidations in one pass and prints a summary. The pipeline adds USDCHF automatically as a 5th feature per timeframe. If a master is absent for a given TF, that TF degrades gracefully to the 4-feature model.
 
 ---
 
@@ -234,7 +261,15 @@ LIVE_BALANCE=15
 python main.py --mode consolidate
 ```
 
-Merges all `*USDCHF*.csv` files in `data/raw/` into `data/processed/USDCHF_master.csv`. Run once before processing. Skip if you have no USDCHF data.
+Builds three per-TF master files from the matching source files in `data/raw/`:
+
+| TF | Source | Output |
+|----|--------|--------|
+| H1  | `USDCHF_H1.csv` | `data/processed/USDCHF_master.csv` |
+| M15 | `USDCHF_M15_*.csv` | `data/processed/USDCHF_master_M15.csv` |
+| M5  | `USDCHF_M5_*.csv`  | `data/processed/USDCHF_master_M5.csv` |
+
+Run once before processing. TFs without a source file are skipped with a warning and fall back to the 4-feature model.
 
 ### Step 1 — Process raw data
 

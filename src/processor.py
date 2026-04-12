@@ -10,10 +10,18 @@ logger = setup_logger(__name__)
 # in raw observations). M15 is ~4× noisier than H1; M5 uses a low obs_cov
 # (0.05) to keep the filter very responsive for fast scalping regime detection.
 # n_states_default: M5 uses 4 states to capture micro-noise; M15/H1 use 3.
-# Single shared USDCHF master file — intraday proxy for DXY (correlates ~0.85
-# with USD Index for XAUUSD signals and is always available on Headway).
-# Run  python main.py --mode consolidate  to build this from MT5 exports.
-USDCHF_MASTER_PATH = Path("data/processed/USDCHF_master.csv")
+# Per-TF USDCHF master files — each uses bars matching the trading timeframe
+# so the cross-asset feature is aligned during merge.
+# Run  python main.py --mode consolidate  to build all three from MT5 exports.
+USDCHF_MASTER_PATH     = Path("data/processed/USDCHF_master.csv")      # H1
+USDCHF_MASTER_PATH_M15 = Path("data/processed/USDCHF_master_M15.csv")  # M15
+USDCHF_MASTER_PATH_M5  = Path("data/processed/USDCHF_master_M5.csv")   # M5
+
+_USDCHF_PATH_BY_TF: dict[str, Path] = {
+    "H1":  USDCHF_MASTER_PATH,
+    "M15": USDCHF_MASTER_PATH_M15,
+    "M5":  USDCHF_MASTER_PATH_M5,
+}
 
 # Legacy alias kept for any callers that still reference the old name directly.
 DXY_RAW_PATH = USDCHF_MASTER_PATH
@@ -213,19 +221,22 @@ def process_pipeline(
     df["atr_normalized"] = compute_atr(df)
 
     # ── Optional USDCHF cross-asset feature ─────────────────────────────────
-    # USDCHF is an intraday DXY proxy — correlates ~0.85 with USD Index and
-    # is always available on Headway as a standard Forex pair.
-    # Build the master with:  python main.py --mode consolidate
-    usdchf_df = load_usdchf_data(USDCHF_MASTER_PATH)
+    # Each TF uses its own USDCHF master so bar frequencies stay in sync:
+    #   H1  → data/processed/USDCHF_master.csv
+    #   M15 → data/processed/USDCHF_master_M15.csv
+    #   M5  → data/processed/USDCHF_master_M5.csv
+    # Build all three with:  python main.py --mode consolidate
+    usdchf_path = _USDCHF_PATH_BY_TF.get(tf, USDCHF_MASTER_PATH)
+    usdchf_df = load_usdchf_data(usdchf_path)
     if usdchf_df is not None:
         df["usdchf_log_return"] = map_usdchf_to_bars(df.index, usdchf_df)
         n_usdchf = df["usdchf_log_return"].notna().sum()
-        logger.info("USDCHF merged: %d non-null usdchf_log_return values.", n_usdchf)
+        logger.info("USDCHF [%s] merged: %d non-null usdchf_log_return values.", tf, n_usdchf)
     else:
         logger.info(
             "USDCHF master not found at %s — pipeline running with 4 base features. "
             "Run  python main.py --mode consolidate  to enable the 5th feature.",
-            USDCHF_MASTER_PATH,
+            usdchf_path,
         )
 
     df.dropna(inplace=True)
