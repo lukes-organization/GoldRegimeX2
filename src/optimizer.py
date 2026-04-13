@@ -106,11 +106,11 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         if tf.upper() == "M5":
             obs_cov = trial.suggest_float("obs_cov", 1.0, 5.0, log=True)
         elif tf.upper() in ("H1", "M15"):
-            # H1/M15: floor raised to 0.5 — values below this with n_states=3/4
-            # produce identical Bull/Chop means (49K+ transitions) on sub-hourly
-            # bars.  n_states=4 is more resilient but the floor avoids wasting
-            # trials in the known-degenerate low-obs_cov region.
-            obs_cov = trial.suggest_float("obs_cov", 0.5, 5.0, log=True)
+            # H1/M15: floor raised to 1.0 — values below 1.0 with n_states=4
+            # still produce ~70-75% positive-definite failures even with [4]-only
+            # search space.  M5 uses 1.0 floor for the same reason; M15 sub-hourly
+            # bars have similar noise characteristics.
+            obs_cov = trial.suggest_float("obs_cov", 1.0, 5.0, log=True)
         else:
             obs_cov = trial.suggest_float("obs_cov", 0.1, 5.0, log=True)
         # M5 Kalman is calibrated for 5-min noise; H1/M15 have smoother signals
@@ -213,6 +213,22 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                     "Trial %d: degenerate HMM (min state persistence=%.4f < 0.80) "
                     "— penalising.",
                     trial.number, _min_persist,
+                )
+                return -100.0
+
+            # Spike-catcher Bull guard: one state with vol >> all others passes
+            # the persistence check (self-transition=0.9500 > 0.80) but captures
+            # only extreme outlier bars, leaving the other states mislabelled.
+            # Pattern: max_vol/median_vol > 10 (e.g. 0.030731 / 0.000480 = 64).
+            _vols = sorted(
+                _hmm.covars_[i][0, 0] ** 0.5 for i in range(n_states)
+            )
+            _vol_ratio = _vols[-1] / _vols[len(_vols) // 2]  # max / median
+            if _vol_ratio > 10:
+                logger.warning(
+                    "Trial %d: degenerate HMM (max/median vol ratio=%.1f > 10) "
+                    "— spike-catcher state detected, penalising.",
+                    trial.number, _vol_ratio,
                 )
                 return -100.0
 
