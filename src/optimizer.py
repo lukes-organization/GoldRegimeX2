@@ -121,19 +121,17 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             trans_cov = trial.suggest_float("trans_cov", 0.001, 0.1,  log=True)
         else:
             trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
-        # M5: n_states=3 is always degenerate for 5-min bars — Bull and Chop
-        # collapse to identical means (0.000016 return, 0.000340 vol) producing
-        # 500K+ HMM transitions and a non-positive-definite covariance matrix.
-        # Restrict M5 to {2, 4} which are both stable.
-        #
-        # H1/M15: n_states=2 has no Chop state.  With the regime-aligned filter
-        # (BUY only in Bull, SELL only in Bear) every bar is forced into one
-        # direction — in a strong trending market the HMM mislabels many bars as
-        # the wrong regime and the model fires signals counter to the trend.
-        # Require at least 3 states so ambiguous bars enter Chop (no signal) and
-        # only clean Bull/Bear periods generate trades.
+        # n_states=3 is always degenerate for M5 — Bull and Chop collapse to
+        # identical means (0.000016 return, 0.000340 vol) producing 500K+ HMM
+        # transitions and a non-positive-definite covariance matrix.
+        # n_states=2 is HMM-stable (~6K transitions) but has no Chop state:
+        # every bar is forced Bull or Bear, the strategy is always in the
+        # market, OOS DD balloons to 50-74%, and the score formula makes
+        # convergence mathematically impossible.  n_states=4 is the only
+        # option that is both stable and has a Chop state to absorb ambiguous
+        # bars.  Same reasoning applies to H1/M15.
         if tf.upper() == "M5":
-            n_states = trial.suggest_categorical("n_states", [2, 4])
+            n_states = trial.suggest_categorical("n_states", [4])
         elif tf.upper() == "H1":
             # H1: require [3,4].  n_states=3 with obs_cov < ~1.0 collapses Bull
             # and Chop to identical means (49K+ transitions) — the same degenerate
