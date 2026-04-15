@@ -1,10 +1,52 @@
+import pickle
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler
 from src.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+MODELS_DIR = Path("models")
+
+
+def get_gmm_paths(tf: str, broker: str = "headway_cent") -> tuple[Path, Path]:
+    """Return (gmm_path, scaler_path) for the given TF/broker pair."""
+    return (
+        MODELS_DIR / f"gmm_{tf.upper()}_{broker}.pkl",
+        MODELS_DIR / f"scaler_{tf.upper()}_{broker}.pkl",
+    )
+
+
+def save_gmm_model(gmm, scaler, tf: str, broker: str = "headway_cent") -> None:
+    """Persist the fitted GaussianMixture and StandardScaler to models/."""
+    gmm_path, scaler_path = get_gmm_paths(tf, broker)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(gmm_path, "wb") as f:
+        pickle.dump(gmm, f)
+    with open(scaler_path, "wb") as f:
+        pickle.dump(scaler, f)
+    logger.info("GMM saved: %s | Scaler: %s", gmm_path.name, scaler_path.name)
+
+
+def load_gmm_model(tf: str, broker: str = "headway_cent"):
+    """Load the fitted GaussianMixture + StandardScaler.
+
+    Raises FileNotFoundError if files are missing — run --mode train first.
+    """
+    gmm_path, scaler_path = get_gmm_paths(tf, broker)
+    if not gmm_path.exists() or not scaler_path.exists():
+        raise FileNotFoundError(
+            f"GMM/Scaler models not found for [{tf.upper()}/{broker}]. "
+            f"Run  python main.py --mode train --tf {tf.upper()} --broker {broker}  first."
+        )
+    with open(gmm_path, "rb") as f:
+        gmm = pickle.load(f)
+    with open(scaler_path, "rb") as f:
+        scaler = pickle.load(f)
+    logger.info("GMM + Scaler loaded [%s/%s]", tf.upper(), broker)
+    return gmm, scaler
 
 # Per-timeframe configuration ─────────────────────────────────────────────────
 # Kalman obs_cov controls smoothing: higher value = more smoothing (less trust
@@ -199,51 +241,66 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return (atr / df["Close"]).rename("atr_normalized")
 
 
-def compute_gmm_vol_cluster(volatility: np.ndarray, n_components: int = 3) -> np.ndarray:
+def compute_gmm_vol_cluster(
+    volatility: np.ndarray,
+    n_components: int = 3,
+    fitted_gmm=None,
+    fitted_scaler=None,
+    return_models: bool = False,
+):
     """Cluster bars into Volatility Buckets (Low=0, Med=1, High=2) via GMM.
 
-    Fits a Gaussian Mixture Model on the rolling-volatility series and returns
-    integer bucket labels sorted by component mean.  This provides XGBoost a
-    second 'opinion' on market state — e.g. a breakout bar (High Vol, label 2)
-    versus genuine Chop (Low Vol, label 0) can look identical to the HMM but
-    the GMM cluster separates them reliably.
+    Training mode  (fitted_gmm=None):
+        Fit a StandardScaler then a GaussianMixture on non-NaN values.
+        Remap component labels so 0=lowest-volatility, n-1=highest.
+        Pass return_models=True to get (labels, gmm, scaler) back.
 
-    Falls back to quantile-based labelling if GMM collapses to fewer than
-    ``n_components`` unique labels (degenerate convergence on uniform data).
+    Inference mode (fitted_gmm + fitted_scaler provided):
+        Apply saved scaler.transform() then gmm.predict() — strictly no
+        re-fitting.  This prevents cluster drift between training and live data.
 
-    Args:
-        volatility: 1-D array of rolling-volatility values (from compute_volatility).
-        n_components: Number of GMM components (default 3 = Low/Med/High).
-
-    Returns:
-        Integer array of shape (N,) with values in {0, 1, …, n_components-1}.
+    Falls back to quantile buckets (training mode only) when GMM collapses.
     """
     valid_mask = ~np.isnan(volatility)
-    labels_out = np.zeros(len(volatility), dtype=np.int8)  # NaN rows → 0; dropped later by dropna
+    labels_out = np.zeros(len(volatility), dtype=np.int8)
+    vol_valid  = volatility[valid_mask].reshape(-1, 1)
 
-    vol_valid = volatility[valid_mask]
-    X = vol_valid.reshape(-1, 1)
-    gmm = GaussianMixture(n_components=n_components, random_state=42, n_init=5)
+    if fitted_gmm is not None and fitted_scaler is not None:
+        # ── Inference: use saved scaler + GMM, no fitting ──────────────────
+        X = fitted_scaler.transform(vol_valid)
+        raw_labels = fitted_gmm.predict(X)
+        order = np.argsort(fitted_gmm.means_.ravel())
+        remap = np.empty(fitted_gmm.n_components, dtype=int)
+        for rank, orig in enumerate(order):
+            remap[orig] = rank
+        labels_valid = remap[raw_labels].astype(np.int8)
+        labels_out[valid_mask] = labels_valid
+        return labels_out
+
+    # ── Training: fit scaler + GMM ──────────────────────────────────────────
+    scaler = StandardScaler()
+    X      = scaler.fit_transform(vol_valid)
+    gmm    = GaussianMixture(n_components=n_components, random_state=42, n_init=5)
     raw_labels = gmm.fit_predict(X)
 
-    # Remap: 0 = lowest-volatility component, n_components-1 = highest
     order = np.argsort(gmm.means_.ravel())
     remap = np.empty(n_components, dtype=int)
-    for rank, original_idx in enumerate(order):
-        remap[original_idx] = rank
+    for rank, orig in enumerate(order):
+        remap[orig] = rank
     labels_valid = remap[raw_labels].astype(np.int8)
 
-    # Fallback: if GMM collapsed to fewer unique labels, use quantile buckets
     if len(np.unique(labels_valid)) < n_components:
         logger.warning(
             "GMM collapsed to %d clusters (expected %d) — using quantile fallback.",
             len(np.unique(labels_valid)), n_components,
         )
-        boundaries = np.percentile(vol_valid, [100 / n_components * i
-                                               for i in range(1, n_components)])
-        labels_valid = np.digitize(vol_valid, boundaries).astype(np.int8)
+        boundaries = np.percentile(vol_valid.ravel(),
+                                   [100 / n_components * i for i in range(1, n_components)])
+        labels_valid = np.digitize(vol_valid.ravel(), boundaries).astype(np.int8)
 
     labels_out[valid_mask] = labels_valid
+    if return_models:
+        return labels_out, gmm, scaler
     return labels_out
 
 
@@ -252,6 +309,8 @@ def process_pipeline(
     trans_cov: float = None,
     save: bool = True,
     tf: str = "H1",
+    save_models: bool = False,
+    broker: str = "headway_cent",
 ) -> pd.DataFrame:
     """Run the full feature-engineering pipeline for the given timeframe.
 
@@ -279,7 +338,14 @@ def process_pipeline(
     df["rsi"] = compute_rsi(df["Close"])
     df["rsi_slope"] = df["rsi"].diff()
     df["atr_normalized"] = compute_atr(df)
-    df["gmm_vol_cluster"] = compute_gmm_vol_cluster(df["volatility"].values)
+    if save_models:
+        labels, _gmm, _scaler = compute_gmm_vol_cluster(
+            df["volatility"].values, return_models=True
+        )
+        df["gmm_vol_cluster"] = labels
+        save_gmm_model(_gmm, _scaler, tf=tf, broker=broker)
+    else:
+        df["gmm_vol_cluster"] = compute_gmm_vol_cluster(df["volatility"].values)
 
     # ── Optional USDCHF cross-asset feature ─────────────────────────────────
     # Each TF uses its own USDCHF master so bar frequencies stay in sync:

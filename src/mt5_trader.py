@@ -30,13 +30,15 @@ from src.processor import (
     compute_volatility,
     compute_rsi,
     compute_atr,
+    compute_gmm_vol_cluster,
+    load_gmm_model,
 )
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
 from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
     get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
 )
-from src.risk_manager import AdaptiveRiskManager, CENT_MULTIPLIER, DailyEquityGate
+from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
 
 logger = setup_logger(__name__)
 
@@ -576,6 +578,8 @@ def compute_live_features(
     trans_cov: float,
     feature_cols: list | None = None,
     mt5=None,
+    tf: str = "H1",
+    broker: str = "headway_cent",
 ):
     """Build the current-bar feature vector for XGBoost ensemble inference.
 
@@ -624,6 +628,17 @@ def compute_live_features(
         else:
             logger.debug("USDCHF live return: %.6f (source: MT5 bar)", usdchf_ret)
         feature_dict["usdchf_log_return"] = usdchf_ret
+
+    if "gmm_vol_cluster" in feature_cols:
+        try:
+            _gmm, _scaler = load_gmm_model(tf, broker)
+            _cluster = compute_gmm_vol_cluster(
+                df["volatility"].values, fitted_gmm=_gmm, fitted_scaler=_scaler
+            )
+            feature_dict["gmm_vol_cluster"] = float(_cluster[-1])
+        except FileNotFoundError:
+            logger.warning("GMM model missing for [%s/%s] — using cluster=0", tf, broker)
+            feature_dict["gmm_vol_cluster"] = 0.0
 
     features_df = pd.DataFrame([feature_dict])[feature_cols]
     atr_price   = atr_normalized * float(df["Close"].iloc[-1])
@@ -922,10 +937,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                                                 comment="GRX_Daily_Loss_Limit")
                         try:
                             send_telegram_msg(
-                                f"⚠️ <b>Daily Loss Limit Reached</b>\n"
-                                f"Loss: <b>${_loss_usd:.2f}</b> "
-                                f"({equity_gate.loss_pct*100:.0f}% of ${account_size:.2f})\n"
-                                "🔒 Trading suspended until next UTC day."
+                                f"🚨 UNIVERSAL SAFETY TRIGGERED [{tf}]: "
+                                f"Daily loss limit hit (${_loss_usd:.2f}). "
+                                "Bot locked for recovery."
                             )
                         except Exception:
                             pass
@@ -1004,11 +1018,24 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             # ── 4. Compute live features + probability ────────────────────
             features_df, hmm_state, atr_price = compute_live_features(
                 DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
-                feature_cols=feature_cols, mt5=mt5,
+                feature_cols=feature_cols, mt5=mt5, tf=tf, broker=broker,
             )
             signal_tracker["atr_price"] = atr_price   # cache for between-bar ATR trail
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
             prob = float(_probs[0])
+
+            # ── Spread efficiency filter ──────────────────────────────────────
+            # Skip signals where ATR / spread < 3.0 (market noise exceeds edge).
+            _spread_frac = BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0.0004)
+            _atr_norm    = float(features_df["atr_normalized"].iloc[0])
+            _er          = _atr_norm / _spread_frac if _spread_frac > 0 else 999.0
+            if _er < 3.0:
+                logger.info(
+                    "Efficiency ratio %.2f < 3.0 (ATR=%.5f / spread=%.5f) — no signal.",
+                    _er, _atr_norm, _spread_frac,
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
 
             # ── 5. Log bar info on every new bar (always visible) ─────────
             bar_str          = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")

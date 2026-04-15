@@ -142,20 +142,22 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # so a more conservative range (0.55–0.60) ensures spread is covered.
         # H1/M15: wide range (0.50–0.85). Signal locking in the backtester ensures
         # trades are counted per entry (not per active bar), so the Recovery Factor
-        # naturally penalises low-conviction overtrading without artificial caps.
-        # short_threshold must stay below prob_threshold (no-trade zone must exist).
+        # Threshold ranges are TF-specific to match each timeframe's edge profile.
+        # The efficiency ratio filter (ATR/spread ≥ 3) now handles low-conviction
+        # bars at the backtest level, so these ranges can be set by market style.
+        # short_threshold must always stay below prob_threshold (no-trade zone).
         if tf.upper() == "M5":
-            if broker == "standard":
-                prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.60)
-                short_threshold = trial.suggest_float("short_threshold", 0.40, 0.45)
-            else:
-                prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.53)
-                short_threshold = trial.suggest_float("short_threshold", 0.44, 0.50)
+            # Scalp selectivity: wider range, efficiency filter gates low-ATR bars
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.80)
+            short_threshold = trial.suggest_float("short_threshold", 0.20, 0.45)
+        elif tf.upper() == "H1":
+            # Institutional selectivity: high-conviction entries only
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.68, 0.88)
+            short_threshold = trial.suggest_float("short_threshold", 0.12, 0.32)
         else:
-            # H1/M15: wide range — Recovery Factor scoring penalises low-conviction
-            # overtrading naturally now that trade counting uses entries (not active bars).
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.85)
-            short_threshold = trial.suggest_float("short_threshold", 0.15, 0.50)
+            # M15 — swing selectivity
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.62, 0.85)
+            short_threshold = trial.suggest_float("short_threshold", 0.15, 0.38)
 
         # Guard: thresholds must not overlap — a crossover means every bar gets
         # both a BUY and SELL signal simultaneously, which is nonsensical.
@@ -255,6 +257,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 oos_n = result.get("oos_n_trades", 0)
                 if oos_n < min_oos_trades:
                     return -10.0
+                # Equity kill switch: if OOS drawdown would bring $15 below $1, disqualify.
+                _kill_dd = (balance - 1.0) / balance   # e.g., 14/15 ≈ 0.933
+                if result.get("oos_max_drawdown", 0.0) > _kill_dd:
+                    logger.warning(
+                        "Trial %d: equity kill switch (OOS DD=%.3f > kill threshold=%.3f)",
+                        trial.number, result["oos_max_drawdown"], _kill_dd,
+                    )
+                    return -100.0
                 oos_result = {
                     "recovery_factor": result.get("oos_recovery_factor", 0.0),
                     "max_drawdown":    result["oos_max_drawdown"],

@@ -95,6 +95,8 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         trans_cov=params.get("trans_cov"),
         save=True,
         tf=tf,
+        save_models=True,
+        broker=broker,
     )
     model_hmm, states, state_map = fit_hmm(
         df, n_states=params.get("n_states", TF_CONFIG[tf].get("n_states_default", 3))
@@ -295,7 +297,7 @@ def cmd_process(args):
             logger.error("Unknown timeframe '%s'. Valid: %s", tf, list(TF_CONFIG))
             continue
         try:
-            df = process_pipeline(save=True, tf=tf)
+            df = process_pipeline(save=True, tf=tf, save_models=True, broker=args.broker)
             logger.info(
                 "[%s] Done: %d bars | Range: %s to %s",
                 tf, len(df), df.index.min(), df.index.max(),

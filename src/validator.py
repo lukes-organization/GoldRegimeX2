@@ -33,6 +33,7 @@ from src.processor import (
     compute_rsi,
     compute_atr,
     compute_gmm_vol_cluster,
+    load_gmm_model,
 )
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
 from src.engine_xgb import load_xgb_ensemble, prepare_features, get_predictions_ensemble, get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH
@@ -56,6 +57,7 @@ def _apply_features(
     tf: str,
     obs_cov: float,
     trans_cov: float,
+    broker: str = "headway_cent",
 ) -> pd.DataFrame:
     """Apply the same feature steps as process_pipeline() to an arbitrary frame.
 
@@ -75,7 +77,12 @@ def _apply_features(
     df["rsi"]            = compute_rsi(df["Close"])
     df["rsi_slope"]       = df["rsi"].diff()
     df["atr_normalized"]  = compute_atr(df)
-    df["gmm_vol_cluster"] = compute_gmm_vol_cluster(df["volatility"].values)
+
+    # Load the training GMM + scaler — strictly no re-fitting on live/validation data.
+    _gmm, _scaler = load_gmm_model(tf, broker)
+    df["gmm_vol_cluster"] = compute_gmm_vol_cluster(
+        df["volatility"].values, fitted_gmm=_gmm, fitted_scaler=_scaler
+    )
 
     # Mirror process_pipeline: add USDCHF if the matching TF master file exists
     usdchf_path = _USDCHF_PATH_BY_TF.get(tf.upper(), USDCHF_MASTER_PATH)
@@ -145,7 +152,7 @@ def run_validation(
     # Load and featurise data
     df = pd.read_csv(sync_data_path, index_col="Date", parse_dates=True)
     logger.info("Loaded %d bars from %s for validation", len(df), sync_data_path)
-    df = _apply_features(df, tf, obs_cov, trans_cov)
+    df = _apply_features(df, tf, obs_cov, trans_cov, broker=broker)
 
     # Load models — prefer broker+TF specific file; fall back to generic
     hmm_path = hmm_model_path(tf, broker)

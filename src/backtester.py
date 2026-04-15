@@ -223,7 +223,13 @@ def vectorized_backtest(
         threshold=buy_th,
         short_threshold=short_threshold,   # None → symmetric default inside
     )
-    signals = raw_signals  # daily trade-count cap removed; DailyEquityGate governs live risk
+
+    # Spread efficiency filter: suppress signals where ATR / spread < 3.0.
+    # Both atr_norm and spread_frac are expressed as fractions of price so
+    # the ratio is scale-free and consistent across all timeframes.
+    _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
+    _er_mask     = (atr_norm / _spread_frac) >= 3.0
+    signals = np.where(_er_mask, raw_signals, 0)
 
     # Determine pos_per_trade from the adaptive risk manager
     arm           = AdaptiveRiskManager(account_size, broker=broker)
