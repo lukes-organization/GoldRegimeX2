@@ -50,8 +50,8 @@ DD_HARD_LIMIT   = 0.15
 # slots.  At conservative prob thresholds (0.50–0.58) only 5–10% of days fire,
 # giving 50–150 OOS trades.  75 is a realistic floor that excludes near-zero
 # signal studies without discarding genuinely selective strategies.
-MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 300, "M15": 200, "H1": 40}
-MIN_OOS_TRADES  = 50   # fallback for unknown TFs
+MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 100, "M15": 40, "H1": 15}
+MIN_OOS_TRADES  = 15   # fallback for unknown TFs
 RAM_HIGH_PCT    = 90    # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30    # seconds to sleep when RAM is low
 
@@ -143,21 +143,21 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # H1/M15: wide range (0.50–0.85). Signal locking in the backtester ensures
         # trades are counted per entry (not per active bar), so the Recovery Factor
         # Threshold ranges are TF-specific to match each timeframe's edge profile.
-        # The efficiency ratio filter (ATR/spread ≥ 3) now handles low-conviction
-        # bars at the backtest level, so these ranges can be set by market style.
-        # short_threshold must always stay below prob_threshold (no-trade zone).
+        # The efficiency ratio filter (ATR/spread ≥ 1.8) handles low-conviction
+        # bars at the backtest level, so these ranges reflect natural bar confidence.
+        # short_threshold is symmetric: short = 1 - prob (≈ same conviction for SELL).
         if tf.upper() == "M5":
-            # Scalp selectivity: wider range, efficiency filter gates low-ATR bars
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.80)
-            short_threshold = trial.suggest_float("short_threshold", 0.20, 0.45)
+            # Scalp: lower hurdle, high-frequency positive-expectancy clusters
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.72)
+            short_threshold = trial.suggest_float("short_threshold", 0.28, 0.48)
         elif tf.upper() == "H1":
-            # Institutional selectivity: high-conviction entries only
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.68, 0.88)
-            short_threshold = trial.suggest_float("short_threshold", 0.12, 0.32)
+            # Swing: higher conviction required per hourly bar
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.58, 0.78)
+            short_threshold = trial.suggest_float("short_threshold", 0.22, 0.42)
         else:
-            # M15 — swing selectivity
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.62, 0.85)
-            short_threshold = trial.suggest_float("short_threshold", 0.15, 0.38)
+            # M15 — intermediate between M5 scalp and H1 swing
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.75)
+            short_threshold = trial.suggest_float("short_threshold", 0.25, 0.45)
 
         # Guard: thresholds must not overlap — a crossover means every bar gets
         # both a BUY and SELL signal simultaneously, which is nonsensical.

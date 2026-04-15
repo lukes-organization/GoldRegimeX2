@@ -1025,13 +1025,13 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             prob = float(_probs[0])
 
             # ── Spread efficiency filter ──────────────────────────────────────
-            # Skip signals where ATR / spread < 3.0 (market noise exceeds edge).
+            # Skip signals where ATR / spread < 1.8 (candle move < 2× spread).
             _spread_frac = BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0.0004)
             _atr_norm    = float(features_df["atr_normalized"].iloc[0])
             _er          = _atr_norm / _spread_frac if _spread_frac > 0 else 999.0
-            if _er < 3.0:
+            if _er < 1.8:
                 logger.info(
-                    "Efficiency ratio %.2f < 3.0 (ATR=%.5f / spread=%.5f) — no signal.",
+                    "Efficiency ratio %.2f < 1.8 (ATR=%.5f / spread=%.5f) — no signal.",
                     _er, _atr_norm, _spread_frac,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
