@@ -39,6 +39,7 @@ from src.processor import (
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
 from src.engine_xgb import load_xgb_ensemble, prepare_features, get_predictions_ensemble, get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH
 from src.backtester import vectorized_backtest
+from src.risk_manager import BROKER_CONFIGS
 
 logger = setup_logger(__name__)
 
@@ -235,6 +236,19 @@ def run_validation(
             "unreliable.  Consider using a longer --period (e.g. '6m').",
             n_trades,
         )
+
+    # Spread-Payoff Ratio check — warn if broker costs eat >50% of the model's edge
+    _bcfg         = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"])
+    _spread_cost  = _bcfg["spread_frac"] + _bcfg.get("commission_frac", 0.0)
+    _payoff_usd   = payoff * account_size          # log-return units → approximate USD
+    _spread_usd   = _spread_cost * account_size    # cost per round-trip
+    if _payoff_usd > 0 and _spread_usd > 0.5 * _payoff_usd:
+        logger.warning(
+            "High Spread Erosion: spread=$%.4f vs payoff=$%.4f (%.0f%% consumed). "
+            "Edge is too thin to survive broker costs.",
+            _spread_usd, _payoff_usd, (_spread_usd / _payoff_usd) * 100,
+        )
+        print("  ⚠️  WARNING: High Spread Erosion. Spread is consuming > 50% of your edge.")
 
     # Gate decision
     if sharpe >= SHARPE_PASS_THRESHOLD:

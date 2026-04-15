@@ -43,6 +43,7 @@ def _study_db(broker: str) -> str:
 # Hard floors applied before scoring — prevent degenerate or blow-up trials.
 MIN_OOS_TRADES  = 5      # absolute hard floor — prevents 0-trade degenerate scores
 MAX_FLOAT_DD    = 0.20   # 20% floating drawdown hard cap — terminal for $15 account
+PAYOFF_FLOOR_USD = 0.035 # $0.035 minimum average edge per trade — covers spread + gives real alpha
 RAM_HIGH_PCT    = 90     # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30     # seconds to sleep when RAM is low
 # TF-specific progressive penalty thresholds — trades below these earn score × 0.1
@@ -157,20 +158,20 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
         # M5 uses shallower trees (2-3) to prevent IS memorisation across the
         # large bar count; heavier L1 reg (1-20) to sparsify feature weights.
-        # H1: max_depth capped at 4 (vs M15's 5) — hourly bars carry more signal
-        # per bar but overfit faster on small datasets; min_child_weight raised
-        # to 15-30 to require statistically significant split nodes.
+        # H1/M15: max_depth 3-6 allows the model to map complex HMM-state ×
+        # dollar-correlation interactions; reg_alpha capped at 1.2 (was 10.0)
+        # so the model can express real alpha without being choked by L1 sparsity.
         if tf.upper() == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 3)
             reg_alpha        = trial.suggest_float("reg_alpha", 1.0, 20.0, log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
         elif tf.upper() == "H1":
-            max_depth        = trial.suggest_int("max_depth", 2, 4)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 10.0, log=True)
+            max_depth        = trial.suggest_int("max_depth", 3, 6)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 15, 30)
         else:
-            max_depth        = trial.suggest_int("max_depth", 3, 5)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 10.0, log=True)
+            max_depth        = trial.suggest_int("max_depth", 3, 6)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
         learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
         # H1: cap n_estimators at 150 — more trees memorise per-bar noise on hourly data.
@@ -179,7 +180,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                             else trial.suggest_int("n_estimators", 100, 500, step=50))
         subsample        = trial.suggest_float("subsample", 0.6, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
-        gamma            = trial.suggest_float("gamma",     0.01, 5.0,  log=True)
+        gamma            = trial.suggest_float("gamma",     0.01, 0.5,  log=True)
 
         try:
             df = process_pipeline(
@@ -266,6 +267,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                     "floating_max_drawdown": oos_fdd,
                     "sharpe_ratio":          result.get("oos_sharpe_ratio", 0.0),
                     "profit_factor":         result.get("oos_profit_factor", 1.0),
+                    "expected_payoff":       result.get("oos_expected_payoff", 0.0),
                 }
                 score = _score_result(oos_result, tier, broker, tf)
 
@@ -275,17 +277,24 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 tf_floor = TF_MIN_OOS_TRADES.get(tf.upper(), 60)
                 if oos_n < tf_floor:
                     score *= 0.1
+
+                # Payoff floor — any trial whose average dollar edge < $0.035 per
+                # trade (3.5c on a $15 cent account) gets a 90% penalty.  Trades
+                # that don't move enough to cover spread are noise, not alpha.
+                oos_payoff_usd = oos_result["expected_payoff"] * balance
+                if oos_payoff_usd < PAYOFF_FLOOR_USD:
+                    score *= 0.1
             else:
                 score = _score_result(result, tier, broker, tf)
 
             logger.info(
                 "Trial %d [%s/%s tier=%s $%.0f]: score=%.3f  "
-                "IS_RF=%.3f  OOS_RF=%.3f  OOS_PF=%.3f  OOS_FloatDD=%.1f%%  trades=%d",
+                "OOS_RF=%.3f  OOS_PF=%.3f  OOS_Payoff=$%.4f  OOS_FloatDD=%.1f%%  trades=%d",
                 trial.number, tf, broker, tier, balance,
                 score,
-                result.get("is_recovery_factor",  result.get("recovery_factor", 0)),
                 result.get("oos_recovery_factor", result.get("recovery_factor", 0)),
                 result.get("oos_profit_factor",   result.get("profit_factor", 1.0)),
+                result.get("oos_expected_payoff", result.get("expected_payoff", 0.0)) * balance,
                 result.get("oos_floating_max_drawdown",
                            result.get("oos_max_drawdown", result["max_drawdown"])) * 100,
                 result.get("oos_n_trades", result["n_trades"]),
