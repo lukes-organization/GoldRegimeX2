@@ -14,7 +14,7 @@ except ImportError:
     pass
 
 from src.logger import setup_logger
-from src.processor import process_pipeline, TF_CONFIG, PROCESSED_PATH
+from src.processor import process_pipeline, TF_CONFIG, PROCESSED_PATH, save_feature_scaler, load_feature_scaler
 from src.engine_hmm import fit_hmm, save_model as save_hmm, load_model as load_hmm, get_model_path as hmm_model_path
 from src.engine_xgb import (
     prepare_features, train_xgb, get_predictions,
@@ -101,7 +101,8 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
     model_hmm, states, state_map = fit_hmm(
         df, n_states=params.get("n_states", TF_CONFIG[tf].get("n_states_default", 3))
     )
-    X, y, df_aligned = prepare_features(df, states)
+    X, y, df_aligned, feature_scaler = prepare_features(df, states)
+    save_feature_scaler(feature_scaler, tf=tf, broker=broker)
     models_ensemble, thresholds, metrics = train_xgb_ensemble(
         X, y,
         max_depth=params.get("max_depth", 4),
@@ -226,7 +227,7 @@ def cmd_wfa(args):
         )
         sys.exit(1)
 
-    X, y, df_aligned = prepare_features(df, states)
+    X, y, df_aligned, _scaler = prepare_features(df, states)
     models_e, thresholds_e, metrics_e = train_xgb_ensemble(
         X, y,
         max_depth        = params.get("max_depth", 4),
@@ -258,15 +259,19 @@ def cmd_wfa(args):
         short_threshold = params.get("short_threshold"),
     )
 
-    n_win    = wfa["n_windows"]
-    wfe      = wfa["wfe_ratio"]
-    mean_is  = wfa["mean_is_sharpe"]
-    mean_oos = wfa["mean_oos_sharpe"]
-    verdict  = "ROBUST ✅" if wfe >= 0.50 else "FRAGILE ⚠️ — consider re-optimising"
+    n_win       = wfa["n_windows"]
+    n_valid     = wfa.get("n_valid_windows", n_win)
+    wfe         = wfa["wfe_ratio"]
+    mean_is     = wfa["mean_is_sharpe"]
+    mean_oos    = wfa["mean_oos_sharpe"]
+    verdict     = "ROBUST ✅" if wfe >= 0.50 else "FRAGILE ⚠️ — consider re-optimising"
+    n_silent    = sum(1 for w in wfa["windows"] if w.get("oos_n_trades", 0) == 0)
 
-    print(f"\n  Windows evaluated : {n_win}")
-    print(f"  Mean IS  Sharpe   : {mean_is:+.3f}")
-    print(f"  Mean OOS Sharpe   : {mean_oos:+.3f}")
+    print(f"\n  Total windows     : {n_win}")
+    print(f"  Valid windows     : {n_valid}  (≥5 IS trades, ≥1 OOS trade — used for WFE)")
+    print(f"  Silent windows    : {n_silent}  (0 OOS trades — model held back by efficiency filter)")
+    print(f"  Mean IS  Sharpe   : {mean_is:+.3f}  [valid only]")
+    print(f"  Mean OOS Sharpe   : {mean_oos:+.3f}  [valid only]")
     print(f"  Walk-Forward Eff  : {wfe * 100:.1f}%  [{verdict}]")
 
     if n_win > 0:
@@ -278,12 +283,21 @@ def cmd_wfa(args):
                 f"{w['oos_start'].strftime('%Y-%m')} → "
                 f"{w['oos_end'].strftime('%Y-%m')}"
             )
-            flag = "✅" if oos_s >= 0.5 else ("⚠️" if oos_s >= 0 else "❌")
+            if oos_t == 0:
+                flag = "—"          # model was silent; not a warning
+            elif oos_t < 3:
+                flag = "⚠️ (thin)"  # signal fired but sample too small to trust
+            elif oos_s >= 0.5:
+                flag = "✅"
+            elif oos_s >= 0:
+                flag = "⚠️"
+            else:
+                flag = "❌"
             print(f"    {period}  OOS={oos_s:+.3f}  trades={oos_t}  {flag}")
 
     send_telegram_msg(
         f"📊 <b>Walk-Forward Analysis [{tf}]</b>\n"
-        f"Windows: <b>{n_win}</b>  |  "
+        f"Valid windows: <b>{n_valid}/{n_win}</b>  |  "
         f"IS: <b>{mean_is:+.3f}</b>  |  OOS: <b>{mean_oos:+.3f}</b>\n"
         f"WFE: <b>{wfe * 100:.1f}%</b>  "
         + ("✅ Robust" if wfe >= 0.50 else "⚠️ Fragile — re-optimise recommended")
@@ -599,7 +613,13 @@ def cmd_report(args):
     except Exception:
         model_hmm, states, state_names = fit_hmm(df, n_states=params.get("n_states", 3))
 
-    X, y, df_aligned = prepare_features(df, states)
+    # Load the saved feature scaler so the report uses identical scaling to training
+    try:
+        _feat_scaler = load_feature_scaler(tf=tf, broker=broker)
+    except FileNotFoundError:
+        _feat_scaler = None   # old model without scaler — prepare_features fits fresh
+
+    X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler)
 
     _xgb_path = get_ensemble_path(tf, broker)
     if not _xgb_path.exists():

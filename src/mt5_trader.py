@@ -32,6 +32,8 @@ from src.processor import (
     compute_atr,
     compute_gmm_vol_cluster,
     load_gmm_model,
+    load_feature_scaler,
+    CONTINUOUS_FEATURE_COLS,
 )
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
 from src.engine_xgb import (
@@ -641,6 +643,25 @@ def compute_live_features(
             feature_dict["gmm_vol_cluster"] = 0.0
 
     features_df = pd.DataFrame([feature_dict])[feature_cols]
+
+    # Apply the 10-year feature scaler so live values match the training distribution
+    cont_cols = [c for c in CONTINUOUS_FEATURE_COLS if c in features_df.columns]
+    try:
+        _feat_scaler = load_feature_scaler(tf, broker)
+        features_df[cont_cols] = _feat_scaler.transform(features_df[cont_cols])
+    except FileNotFoundError:
+        logger.warning(
+            "Feature scaler not found for [%s/%s] — running without scaling. "
+            "Re-train with --mode train to generate it.",
+            tf, broker,
+        )
+
+    # NaN/Inf guard: abort this bar rather than feed garbage to XGBoost
+    _bad = features_df.isnull().any(axis=1) | (np.isinf(features_df.values).any(axis=1))
+    if _bad.any():
+        bad_cols = features_df.columns[features_df.isnull().any() | np.isinf(features_df.values).any(axis=0)].tolist()
+        raise ValueError(f"Live feature NaN/Inf in columns {bad_cols} — skipping bar.")
+
     atr_price   = atr_normalized * float(df["Close"].iloc[-1])
     return features_df, current_state, atr_price
 

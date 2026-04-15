@@ -48,6 +48,43 @@ def load_gmm_model(tf: str, broker: str = "headway_cent"):
     logger.info("GMM + Scaler loaded [%s/%s]", tf.upper(), broker)
     return gmm, scaler
 
+
+# XGBoost continuous feature columns that require StandardScaler normalization.
+# Discrete columns (hmm_state, gmm_vol_cluster) are intentionally excluded.
+CONTINUOUS_FEATURE_COLS = ["rsi_slope", "atr_normalized", "prev_log_return", "usdchf_log_return"]
+
+
+def get_feature_scaler_path(tf: str, broker: str = "headway_cent") -> Path:
+    """Return the XGBoost feature-scaler path for the given TF/broker pair."""
+    return MODELS_DIR / f"feature_scaler_{tf.upper()}_{broker}.pkl"
+
+
+def save_feature_scaler(scaler, tf: str, broker: str = "headway_cent") -> None:
+    """Persist the fitted XGBoost feature StandardScaler to models/."""
+    path = get_feature_scaler_path(tf, broker)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(scaler, f)
+    logger.info("Feature scaler saved: %s", path.name)
+
+
+def load_feature_scaler(tf: str, broker: str = "headway_cent"):
+    """Load the fitted XGBoost feature StandardScaler.
+
+    Raises FileNotFoundError if the file is missing — run --mode train first.
+    """
+    path = get_feature_scaler_path(tf, broker)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Feature scaler not found for [{tf.upper()}/{broker}]. "
+            f"Run  python main.py --mode train --tf {tf.upper()} --broker {broker}  first."
+        )
+    with open(path, "rb") as f:
+        scaler = pickle.load(f)
+    logger.info("Feature scaler loaded [%s/%s]", tf.upper(), broker)
+    return scaler
+
+
 # Per-timeframe configuration ─────────────────────────────────────────────────
 # Kalman obs_cov controls smoothing: higher value = more smoothing (less trust
 # in raw observations). M15 is ~4× noisier than H1; M5 uses a low obs_cov

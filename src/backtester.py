@@ -400,15 +400,16 @@ def run_walk_forward(
     wfe      = mean_oos / mean_is          if mean_is > 0 else 0.0
 
     logger.info(
-        "Walk-Forward [%s/%s]: %d windows | IS=%.3f | OOS=%.3f | WFE=%.1f%%",
-        tf, broker, len(windows), mean_is, mean_oos, wfe * 100,
+        "Walk-Forward [%s/%s]: %d windows (%d valid) | IS=%.3f | OOS=%.3f | WFE=%.1f%%",
+        tf, broker, len(windows), len(valid), mean_is, mean_oos, wfe * 100,
     )
     return {
-        "wfe_ratio":       wfe,
-        "mean_is_sharpe":  mean_is,
-        "mean_oos_sharpe": mean_oos,
-        "n_windows":       len(windows),
-        "windows":         windows,
+        "wfe_ratio":         wfe,
+        "mean_is_sharpe":    mean_is,
+        "mean_oos_sharpe":   mean_oos,
+        "n_windows":         len(windows),
+        "n_valid_windows":   len(valid),
+        "windows":           windows,
     }
 
 

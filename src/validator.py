@@ -34,6 +34,7 @@ from src.processor import (
     compute_atr,
     compute_gmm_vol_cluster,
     load_gmm_model,
+    load_feature_scaler,
 )
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
 from src.engine_xgb import load_xgb_ensemble, prepare_features, get_predictions_ensemble, get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH
@@ -187,9 +188,18 @@ def run_validation(
             "Run  python main.py --mode train  first."
         )
 
-    # Inference
-    states                = predict_states(model_hmm, df)
-    X, _, df_aligned      = prepare_features(df, states)
+    # Inference — load the same feature scaler used at training time
+    states = predict_states(model_hmm, df)
+    try:
+        _feat_scaler = load_feature_scaler(tf=tf, broker=broker)
+    except FileNotFoundError:
+        logger.warning(
+            "Feature scaler not found for [%s/%s] — validating without scaling. "
+            "Re-run --mode train to generate it.",
+            tf, broker,
+        )
+        _feat_scaler = None
+    X, _, df_aligned      = prepare_features(df, states, feature_scaler=_feat_scaler)
     states_aligned        = states[df.index.isin(df_aligned.index)]
     _, probabilities      = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
 

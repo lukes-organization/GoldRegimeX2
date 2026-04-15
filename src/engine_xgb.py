@@ -5,6 +5,7 @@ import joblib
 import onnx
 from pathlib import Path
 from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
 from src.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -12,6 +13,10 @@ logger = setup_logger(__name__)
 ONNX_PATH        = Path("models/xgb_model.onnx")
 XGB_PKL_PATH     = Path("models/xgb_model.pkl")
 ENSEMBLE_PKL_PATH = Path("models/xgb_ensemble.pkl")
+
+# Continuous features that are StandardScaler-normalized before XGBoost.
+# Discrete/categorical columns (hmm_state, gmm_vol_cluster) are excluded.
+_CONTINUOUS_COLS = ["rsi_slope", "atr_normalized", "prev_log_return", "usdchf_log_return"]
 
 
 def get_ensemble_path(tf: str, broker: str = "headway_cent") -> Path:
@@ -54,7 +59,27 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     return cols
 
 
-def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray):
+def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=None):
+    """Build the XGBoost feature matrix from a featurised DataFrame.
+
+    Continuous features (RSI slope, ATR, returns) are scaled to zero-mean /
+    unit-variance using a StandardScaler fitted on the IS portion (80%) of the
+    data so the model always sees a normalised distribution regardless of
+    absolute price levels.
+
+    Args:
+        df:             Featurised DataFrame from process_pipeline / _apply_features.
+        hmm_states:     HMM state array aligned with df.
+        feature_scaler: Pre-fitted StandardScaler to reuse (inference / validation).
+                        When None a new scaler is fitted on IS data (training mode).
+
+    Returns:
+        X             (pd.DataFrame)     — scaled feature matrix
+        y             (pd.Series)        — binary target (next-bar direction)
+        df_aligned    (pd.DataFrame)     — df rows aligned to X
+        scaler        (StandardScaler)   — fitted scaler (same object as input when
+                                           feature_scaler is provided)
+    """
     df = df.copy()
     df["hmm_state"] = hmm_states
     df["prev_log_return"] = df["log_return"].shift(1)
@@ -63,12 +88,23 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray):
     feature_cols = get_feature_cols(df)
     X = df[feature_cols]
     valid = X.notna().all(axis=1) & y.notna()
-    X = X[valid]
+    X = X[valid].copy()
     y = y[valid]
     df_aligned = df.loc[X.index]
 
+    # Scale continuous features so XGBoost sees the 10-year mean/std distribution
+    cont_cols = [c for c in _CONTINUOUS_COLS if c in X.columns]
+    if feature_scaler is None:
+        # Training: fit only on IS portion to prevent future-data leakage
+        scaler = StandardScaler()
+        split_idx = int(len(X) * 0.8)
+        scaler.fit(X.iloc[:split_idx][cont_cols])
+    else:
+        scaler = feature_scaler
+    X[cont_cols] = scaler.transform(X[cont_cols])
+
     logger.info("Features prepared: %d samples, %d features: %s", len(X), len(feature_cols), feature_cols)
-    return X, y, df_aligned
+    return X, y, df_aligned, scaler
 
 
 def train_xgb(
@@ -354,10 +390,21 @@ def get_predictions_ensemble(
     buckets = assign_vol_bucket(X["atr_normalized"].values, p33, p66)
 
     predictions   = np.zeros(len(X), dtype=int)
-    probabilities = np.zeros(len(X), dtype=float)
+    probabilities = np.full(len(X), 0.5, dtype=float)  # default 0.5 for bad rows
 
+    # NaN/Inf guard: rows with corrupted features default to 0.5 (no signal)
+    bad_mask = np.any(np.isnan(X.values) | np.isinf(X.values), axis=1)
+    if bad_mask.any():
+        logger.warning(
+            "get_predictions_ensemble: %d row(s) contain NaN/Inf — "
+            "defaulting to prob=0.5 for those rows. "
+            "Check feature pipeline for upstream errors.",
+            int(bad_mask.sum()),
+        )
+
+    clean_mask = ~bad_mask
     for bucket in VOL_BUCKETS:
-        mask = (buckets == bucket)
+        mask = (buckets == bucket) & clean_mask
         if not mask.any():
             continue
         model = models[bucket]

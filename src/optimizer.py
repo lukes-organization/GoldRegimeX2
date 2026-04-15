@@ -50,8 +50,8 @@ DD_HARD_LIMIT   = 0.15
 # slots.  At conservative prob thresholds (0.50–0.58) only 5–10% of days fire,
 # giving 50–150 OOS trades.  75 is a realistic floor that excludes near-zero
 # signal studies without discarding genuinely selective strategies.
-MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 300, "M15": 200, "H1": 75}
-MIN_OOS_TRADES  = 75   # fallback for unknown TFs
+MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 450, "M15": 250, "H1": 100}
+MIN_OOS_TRADES  = 100   # fallback for unknown TFs
 RAM_HIGH_PCT    = 90    # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30    # seconds to sleep when RAM is low
 
@@ -148,7 +148,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # short_threshold is symmetric: short = 1 - prob (≈ same conviction for SELL).
         if tf.upper() == "M5":
             # Scalp: lower hurdle, high-frequency positive-expectancy clusters
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.72)
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.70)
             short_threshold = trial.suggest_float("short_threshold", 0.28, 0.48)
         elif tf.upper() == "H1":
             # Swing: higher conviction required per hourly bar
@@ -226,7 +226,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 )
                 return -100.0
 
-            X, y, df_aligned     = prepare_features(df, states)
+            X, y, df_aligned, _    = prepare_features(df, states)
             models, thresholds, metrics = train_xgb_ensemble(
                 X, y,
                 max_depth=max_depth,
