@@ -164,9 +164,15 @@ def _compute_metrics(strategy_returns, signals, tf: str = "H1"):
         per_trade = np.bincount(trade_idx[in_trade],
                                 weights=strategy_returns[in_trade],
                                 minlength=n_trades + 1)[1:]  # drop index-0 bucket
-        win_rate = float(np.sum(per_trade > 0) / n_trades)
+        win_rate   = float(np.sum(per_trade > 0) / n_trades)
+        wins_sum   = float(np.sum(per_trade[per_trade > 0]))
+        losses_sum = float(abs(np.sum(per_trade[per_trade < 0])))
+        profit_factor   = min(wins_sum / losses_sum, 10.0) if losses_sum > 0 else (10.0 if wins_sum > 0 else 1.0)
+        expected_payoff = float(np.sum(per_trade) / n_trades)
     else:
-        win_rate = 0.0
+        win_rate        = 0.0
+        profit_factor   = 1.0
+        expected_payoff = 0.0
 
     total_return = float(np.exp(np.sum(strategy_returns)) - 1)
 
@@ -184,6 +190,8 @@ def _compute_metrics(strategy_returns, signals, tf: str = "H1"):
         "total_return":    total_return,
         "n_trades":        n_trades,
         "recovery_factor": recovery_factor,
+        "profit_factor":   profit_factor,
+        "expected_payoff": expected_payoff,
     }
 
 

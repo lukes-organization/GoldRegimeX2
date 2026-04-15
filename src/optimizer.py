@@ -41,10 +41,12 @@ def _study_db(broker: str) -> str:
     return f"sqlite:///models/study_{broker}.db"
 
 # Hard floors applied before scoring — prevent degenerate or blow-up trials.
-MIN_OOS_TRADES  = 15     # require at least 15 OOS trades (prevents 1-trade "wins")
+MIN_OOS_TRADES  = 5      # absolute hard floor — prevents 0-trade degenerate scores
 MAX_FLOAT_DD    = 0.20   # 20% floating drawdown hard cap — terminal for $15 account
 RAM_HIGH_PCT    = 90     # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30     # seconds to sleep when RAM is low
+# TF-specific progressive penalty thresholds — trades below these earn score × 0.1
+TF_MIN_OOS_TRADES = {"H1": 60, "M15": 150, "M5": 400}
 
 
 def _get_tier(balance: float) -> str:
@@ -52,24 +54,27 @@ def _get_tier(balance: float) -> str:
 
 
 def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = "H1") -> float:
-    """Recovery Factor × (1 + Sharpe) — rewards high return-on-risk with quality multiplier.
+    """Complex Criterion: (RF × 0.4) + (PF × 0.3) + (Sharpe × 0.3).
 
-    RF  = OOS Net Profit / OOS Max Floating Drawdown   (capped at 50 to avoid outlier bias)
-    Score = RF × (1 + Sharpe)
+    RF  = OOS Net Profit / OOS Max Floating Drawdown   (capped at 50)
+    PF  = Gross Profit / |Gross Loss|                  (capped at 10)
 
-    A strategy with large profit AND smooth equity earns a high RF, then Sharpe
-    multiplies it — filtering out "lucky" high-RF but noisy trajectories.
+    Weighting rationale:
+    - RF (40 %): primary capital-preservation metric; rewards profit relative to risk
+    - PF (30 %): trade quality; filters inconsistent winners that inflate Sharpe
+    - Sharpe (30 %): risk-adjusted consistency; prevents high-RF/noisy trajectories
     """
     net_profit  = result.get("total_return", 0.0)
     floating_dd = result.get("floating_max_drawdown", result.get("max_drawdown", 0.0))
     sharpe      = result.get("sharpe_ratio", 0.0)
+    pf          = result.get("profit_factor", 1.0)
 
     if floating_dd <= 0:
         rf = 50.0 if net_profit > 0 else 0.0
     else:
         rf = min(net_profit / floating_dd, 50.0)
 
-    return float(rf * (1.0 + sharpe))
+    return float((rf * 0.4) + (pf * 0.3) + (sharpe * 0.3))
 
 
 def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
@@ -244,7 +249,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 oos_fdd = result.get("oos_floating_max_drawdown",
                                      result.get("oos_max_drawdown", 0.0))
 
-                # Participation floor — at least 15 OOS trades required
+                # Absolute hard floor — truly degenerate trials with no signal
                 if oos_n < MIN_OOS_TRADES:
                     return -10.0
 
@@ -260,18 +265,27 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                     "total_return":          result.get("oos_total_return", 0.0),
                     "floating_max_drawdown": oos_fdd,
                     "sharpe_ratio":          result.get("oos_sharpe_ratio", 0.0),
+                    "profit_factor":         result.get("oos_profit_factor", 1.0),
                 }
                 score = _score_result(oos_result, tier, broker, tf)
+
+                # Progressive trade penalty — low-count solutions score at 10%
+                # so Optuna learns to explore higher-density regions without
+                # the hard cliff of a return -10.0 that poisons the surrogate.
+                tf_floor = TF_MIN_OOS_TRADES.get(tf.upper(), 60)
+                if oos_n < tf_floor:
+                    score *= 0.1
             else:
                 score = _score_result(result, tier, broker, tf)
 
             logger.info(
                 "Trial %d [%s/%s tier=%s $%.0f]: score=%.3f  "
-                "IS_RF=%.3f  OOS_RF=%.3f  OOS_FloatDD=%.1f%%  trades=%d",
+                "IS_RF=%.3f  OOS_RF=%.3f  OOS_PF=%.3f  OOS_FloatDD=%.1f%%  trades=%d",
                 trial.number, tf, broker, tier, balance,
                 score,
                 result.get("is_recovery_factor",  result.get("recovery_factor", 0)),
                 result.get("oos_recovery_factor", result.get("recovery_factor", 0)),
+                result.get("oos_profit_factor",   result.get("profit_factor", 1.0)),
                 result.get("oos_floating_max_drawdown",
                            result.get("oos_max_drawdown", result["max_drawdown"])) * 100,
                 result.get("oos_n_trades", result["n_trades"]),

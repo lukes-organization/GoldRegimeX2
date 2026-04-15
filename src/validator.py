@@ -199,7 +199,7 @@ def run_validation(
             tf, broker,
         )
         _feat_scaler = None
-    X, _, df_aligned      = prepare_features(df, states, feature_scaler=_feat_scaler)
+    X, _, df_aligned, _   = prepare_features(df, states, feature_scaler=_feat_scaler)
     states_aligned        = states[df.index.isin(df_aligned.index)]
     _, probabilities      = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
 
@@ -217,7 +217,16 @@ def run_validation(
     sharpe   = result["sharpe_ratio"]
     n_trades = result["n_trades"]
     win_rate = result["win_rate"]
-    max_dd   = result["max_drawdown"]
+    max_dd   = result.get("floating_max_drawdown", result["max_drawdown"])
+    pf       = result.get("profit_factor", 1.0)
+    payoff   = result.get("expected_payoff", 0.0)
+    rf       = result.get("recovery_factor", 0.0)
+
+    # Complex Criterion score — same formula as optimizer._score_result
+    _fdd = max_dd if max_dd > 0 else 0.0
+    _net = result.get("total_return", 0.0)
+    _rf_capped = min(_net / _fdd, 50.0) if _fdd > 0 else (50.0 if _net > 0 else 0.0)
+    score = float((_rf_capped * 0.4) + (pf * 0.3) + (sharpe * 0.3))
 
     min_trades_warn = MIN_TRADES_WARNING_BY_TF.get(tf.upper(), 15)
     if n_trades < min_trades_warn:
@@ -250,19 +259,23 @@ def run_validation(
         )
 
     logger.info(
-        "Validation [%s]: status=%s  sharpe=%.3f  trades=%d  wr=%.1f%%  dd=%.1f%%",
-        tf, status, sharpe, n_trades, win_rate * 100, max_dd * 100,
+        "Validation [%s]: status=%s  score=%.2f  sharpe=%.3f  pf=%.2f  trades=%d  wr=%.1f%%  dd=%.1f%%",
+        tf, status, score, sharpe, pf, n_trades, win_rate * 100, max_dd * 100,
     )
     if status in ("warn", "fail"):
         logger.warning("VALIDATION %s: %s", status.upper(), message)
 
     return {
-        "sharpe":   sharpe,
-        "n_trades": n_trades,
-        "win_rate": win_rate,
-        "max_dd":   max_dd,
-        "status":   status,
-        "message":  message,
+        "sharpe":           sharpe,
+        "n_trades":         n_trades,
+        "win_rate":         win_rate,
+        "max_dd":           max_dd,
+        "profit_factor":    pf,
+        "expected_payoff":  payoff,
+        "recovery_factor":  rf,
+        "score":            score,
+        "status":           status,
+        "message":          message,
     }
 
 

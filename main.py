@@ -23,7 +23,7 @@ from src.engine_xgb import (
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
     get_ensemble_path,
 )
-from src.optimizer import run_optimization, get_best_params
+from src.optimizer import run_optimization, get_best_params, _score_result as _calc_score
 from src.backtester import vectorized_backtest
 from src.visualizer import generate_full_report
 from src.risk_manager import AdaptiveRiskManager
@@ -276,6 +276,7 @@ def cmd_wfa(args):
 
     if n_win > 0:
         print("\n  Per-window OOS breakdown:")
+        WFA_FOLD_PASS_SCORE = 1.0
         for w in wfa["windows"]:
             oos_s  = w.get("oos_sharpe_ratio", 0.0)
             oos_t  = w.get("oos_n_trades",    0)
@@ -287,13 +288,23 @@ def cmd_wfa(args):
                 flag = "—"          # model was silent; not a warning
             elif oos_t < 3:
                 flag = "⚠️ (thin)"  # signal fired but sample too small to trust
-            elif oos_s >= 0.5:
-                flag = "✅"
-            elif oos_s >= 0:
-                flag = "⚠️"
             else:
-                flag = "❌"
-            print(f"    {period}  OOS={oos_s:+.3f}  trades={oos_t}  {flag}")
+                oos_fdd = w.get("oos_floating_max_drawdown", w.get("oos_max_drawdown", 0.0))
+                fold_r  = {
+                    "total_return":          w.get("oos_total_return", 0.0),
+                    "floating_max_drawdown": oos_fdd,
+                    "sharpe_ratio":          oos_s,
+                    "profit_factor":         w.get("oos_profit_factor", 1.0),
+                }
+                fold_score = _calc_score(fold_r)
+                if fold_score >= WFA_FOLD_PASS_SCORE:
+                    flag = f"✅ ({fold_score:.2f})"
+                elif fold_score >= 0:
+                    flag = f"⚠️ ({fold_score:.2f})"
+                else:
+                    flag = f"❌ ({fold_score:.2f})"
+            oos_pf = w.get("oos_profit_factor", 1.0)
+            print(f"    {period}  OOS={oos_s:+.3f}  PF={oos_pf:.2f}  trades={oos_t}  {flag}")
 
     send_telegram_msg(
         f"📊 <b>Walk-Forward Analysis [{tf}]</b>\n"
@@ -389,12 +400,27 @@ def cmd_train(args):
     print(f"Sharpe: {result['sharpe_ratio']:.3f} | MaxDD: {result['max_drawdown']*100:.1f}% "
           f"| WR: {result['win_rate']*100:.1f}% | Trades: {result['n_trades']}")
     if "oos_sharpe_ratio" in result:
+        def _fmt_block(label, r, prefix):
+            fdd    = r.get(f"{prefix}floating_max_drawdown", r.get(f"{prefix}max_drawdown", 0.0))
+            r_dict = {
+                "total_return":          r.get(f"{prefix}total_return", 0.0),
+                "floating_max_drawdown": fdd,
+                "sharpe_ratio":          r.get(f"{prefix}sharpe_ratio", 0.0),
+                "profit_factor":         r.get(f"{prefix}profit_factor", 1.0),
+            }
+            score  = _calc_score(r_dict)
+            rf     = r.get(f"{prefix}recovery_factor", 0.0)
+            pf     = r.get(f"{prefix}profit_factor", 1.0)
+            payoff = r.get(f"{prefix}expected_payoff", 0.0) * balance
+            print(
+                f"  [{tf} {label}] Score: {score:.2f} | RF: {rf:.2f} | PF: {pf:.2f}"
+                f" | Payoff: ${payoff:.4f} | MaxDD: {fdd*100:.1f}% (Floating)"
+                f" | WR: {r.get(f'{prefix}win_rate', 0.0)*100:.1f}% | Trades: {r.get(f'{prefix}n_trades', 0)}"
+            )
         print(f"\n--- In-Sample ---")
-        print(f"  Sharpe: {result['is_sharpe_ratio']:.3f} | FloatDD: {result.get('is_floating_max_drawdown', result['is_max_drawdown'])*100:.1f}% "
-              f"| WR: {result['is_win_rate']*100:.1f}% | Trades: {result['is_n_trades']}")
+        _fmt_block("IS",  result, "is_")
         print(f"--- Out-of-Sample ---")
-        print(f"  Sharpe: {result['oos_sharpe_ratio']:.3f} | FloatDD: {result.get('oos_floating_max_drawdown', result['oos_max_drawdown'])*100:.1f}% "
-              f"| WR: {result['oos_win_rate']*100:.1f}% | Trades: {result['oos_n_trades']}")
+        _fmt_block("OOS", result, "oos_")
     print(f"\nModels saved. Run --mode export to generate ONNX.")
 
 
@@ -413,6 +439,14 @@ def cmd_compare(args):
 
         try:
             result, *_ = _train_for_tf(tf, balance, broker, params)
+            if "oos_sharpe_ratio" in result:
+                _oos_fdd = result.get("oos_floating_max_drawdown", result.get("oos_max_drawdown", 0.0))
+                result["oos_score"] = _calc_score({
+                    "total_return":          result.get("oos_total_return", 0.0),
+                    "floating_max_drawdown": _oos_fdd,
+                    "sharpe_ratio":          result.get("oos_sharpe_ratio", 0.0),
+                    "profit_factor":         result.get("oos_profit_factor", 1.0),
+                })
             results[tf] = result
         except FileNotFoundError as e:
             logger.error("Skipping %s: %s", tf, e)
@@ -427,10 +461,10 @@ def cmd_compare(args):
                   f"| DD={r['max_drawdown']*100:.1f}% | Trades={r['n_trades']}")
         return
 
-    def _oos_sharpe(r):
-        return r.get("oos_sharpe_ratio", r.get("sharpe_ratio", 0.0))
+    def _oos_score(r):
+        return r.get("oos_score", r.get("oos_sharpe_ratio", r.get("sharpe_ratio", 0.0)))
 
-    winner   = max(results, key=lambda k: _oos_sharpe(results[k]))
+    winner   = max(results, key=lambda k: _oos_score(results[k]))
     col_w    = 12
     tf_list  = list(results.keys())
     header   = f"{'Metric':<20}" + "".join(f" {tf:>{col_w}}" for tf in tf_list)
@@ -441,12 +475,15 @@ def cmd_compare(args):
     print(header)
     print("-" * len(header))
     metrics_to_show = [
-        ("OOS Sharpe",   "oos_sharpe_ratio",          ".3f"),
-        ("IS Sharpe",    "is_sharpe_ratio",            ".3f"),
-        ("OOS Float DD", "oos_floating_max_drawdown",  ".1%"),
-        ("OOS Win Rate", "oos_win_rate",               ".1%"),
-        ("OOS Trades",   "oos_n_trades",               "d"),
-        ("Full Sharpe",  "sharpe_ratio",               ".3f"),
+        ("OOS Score",    "oos_score",                  ".2f"),
+        ("OOS Sharpe",   "oos_sharpe_ratio",            ".3f"),
+        ("OOS RF",       "oos_recovery_factor",         ".2f"),
+        ("OOS PF",       "oos_profit_factor",           ".2f"),
+        ("IS Sharpe",    "is_sharpe_ratio",             ".3f"),
+        ("OOS Float DD", "oos_floating_max_drawdown",   ".1%"),
+        ("OOS Win Rate", "oos_win_rate",                ".1%"),
+        ("OOS Trades",   "oos_n_trades",                "d"),
+        ("Full Sharpe",  "sharpe_ratio",                ".3f"),
     ]
     for label, key, fmt in metrics_to_show:
         row = f"{label:<20}"
@@ -464,7 +501,7 @@ def cmd_compare(args):
             r["max_drawdown"] * 100, r["win_rate"] * 100, r["n_trades"],
         )
 
-    print(f"\n-> Recommended timeframe: {winner} (higher OOS Sharpe)")
+    print(f"\n-> Recommended timeframe: {winner} (higher OOS Score)")
     print(f"  Run: python main.py --mode train --tf {winner} --broker {broker} --balance {balance:.0f}")
 
 
@@ -515,11 +552,16 @@ def cmd_sync_validate(args):
         sys.exit(1)
 
     print(f"\n=== Validation Result [{tf}] ===")
-    print(f"  Recent Sharpe: {result['sharpe']:.3f}")
-    print(f"  Trades:        {result['n_trades']}")
-    print(f"  Win Rate:      {result['win_rate']*100:.1f}%")
-    print(f"  Max Drawdown:  {result['max_dd']*100:.1f}%")
-    print(f"  Status:        {result['status'].upper()}")
+    _fdd = result.get("max_dd", 0.0)
+    print(
+        f"  [{tf} LIVE] Score: {result.get('score', 0.0):.2f}"
+        f" | RF: {result.get('recovery_factor', 0.0):.2f}"
+        f" | PF: {result.get('profit_factor', 1.0):.2f}"
+        f" | Payoff: ${result.get('expected_payoff', 0.0)*balance:.4f}"
+        f" | MaxDD: {_fdd*100:.1f}% (Floating)"
+    )
+    print(f"  Sharpe: {result['sharpe']:.3f} | Trades: {result['n_trades']} | WR: {result['win_rate']*100:.1f}%")
+    print(f"  Status: {result['status'].upper()}")
     print(f"  {result['message']}")
 
     if result["status"] == "fail":
