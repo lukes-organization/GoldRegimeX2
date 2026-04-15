@@ -36,7 +36,7 @@ from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
     get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
 )
-from src.risk_manager import AdaptiveRiskManager, CENT_MULTIPLIER
+from src.risk_manager import AdaptiveRiskManager, CENT_MULTIPLIER, DailyEquityGate
 
 logger = setup_logger(__name__)
 
@@ -58,17 +58,19 @@ MIN_SPREAD_RATIO = {"headway_cent": 1.5, "standard": 3.0}  # TP1 vs spread floor
 # SL = ATR × multiplier (per TF — M5 tighter to avoid noise-outs on scalps)
 TF_ATR_MULTIPLIER  = {"M5": 1.5, "M15": 2.0, "H1": 2.0}
 
-# Quick-profit target for M5 scalping: close early when floating P&L reaches
-# this USD amount rather than waiting for the full TP.  Re-entry is allowed on
-# the next bar if signal conditions are still met.  Set to None to disable.
-QUICK_PROFIT_TARGET_M5 = 4.0
+# ── ATR-linked Hybrid Trailing Stop ──────────────────────────────────────────
+# PROFIT_ACTIVATION_USD: floating P&L threshold that triggers Phase 1 (move SL
+# to breakeven + 2× spread) and optional partial close.  Applies to all TFs.
+PROFIT_ACTIVATION_USD = 2.50
 
-# Trailing P&L stop ("Chop Buffer"): once a position's peak floating P&L has
-# reached TRAILING_ACTIVATION_USD, close it if P&L drops back below
-# peak × TRAILING_DRAWDOWN_PCT.  Catches stalling/reversing scalps that never
-# reach the fixed target, bypassing the 1-bar HMM state detection delay.
-TRAILING_ACTIVATION_USD  = 2.0   # start protecting once P&L first exceeds this
-TRAILING_DRAWDOWN_PCT    = 0.50  # close if P&L falls below 50 % of observed peak
+# ATR trail multiplier per TF.  Phase 2 trails SL at current_price ∓ (mult × ATR).
+# Larger multiplier for H1 gives hourly swings room before the SL is touched.
+ATR_TRAIL_MULTIPLIER = {"M5": 1.5, "M15": 1.5, "H1": 2.5}
+
+# Minimum lot for partial close.  MT5 rejects close volumes below 0.01.
+# When a position is already at 0.01 lots the partial close is skipped and the
+# ATR trail runs on the full position instead.
+MIN_LOT_GUARD = 0.01
 
 # ── Per-timeframe signal thresholds and order parameters ──────────────────────
 TF_PROB_THRESHOLD  = {"M5": 0.52, "M15": 0.54, "H1": 0.54}   # fallback — Optuna value used when available
@@ -335,6 +337,89 @@ def _apply_profit_guard(signal_tracker: dict, mt5) -> None:
             "Profit guard triggered: entry=%.2f  new_sl=%.2f  (70%% of TP1 at %.2f)",
             entry, new_sl, tp1_level,
         )
+
+
+def _set_trailing_sl(
+    ticket: int, new_sl: float, current_sl: float, direction: str, mt5
+) -> bool:
+    """Update an open position's SL only if it improves on the current SL.
+
+    For BUY positions: new_sl must be > current_sl (ratchet upward).
+    For SELL positions: new_sl must be < current_sl (ratchet downward).
+    Returns True if the SL was actually updated.
+    """
+    if direction == "BUY"  and new_sl <= current_sl:
+        return False
+    if direction == "SELL" and new_sl >= current_sl:
+        return False
+    positions = mt5.positions_get(ticket=ticket)
+    if not positions:
+        return False
+    pos = positions[0]
+    request = {
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "position": ticket,
+        "sl":       round(new_sl, 2),
+        "tp":       pos.tp,
+    }
+    res = mt5.order_send(request)
+    if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+        logger.info(
+            "ATR trail SL updated: ticket=%d  sl=%.2f  (was %.2f)",
+            ticket, new_sl, current_sl,
+        )
+        return True
+    logger.warning(
+        "ATR trail SL failed: ticket=%d  retcode=%s",
+        ticket, res.retcode if res else "None",
+    )
+    return False
+
+
+def _execute_partial_close(ticket: int, symbol: str, mt5) -> bool:
+    """Close 50 % of a position's volume to bank partial profit.
+
+    Skips and returns False if volume <= MIN_LOT_GUARD (0.01) since MT5
+    rejects close volumes below the broker minimum lot.
+    """
+    positions = mt5.positions_get(ticket=ticket)
+    if not positions:
+        return False
+    pos = positions[0]
+    close_vol = round(pos.volume / 2.0, 2)
+    if close_vol < MIN_LOT_GUARD:
+        logger.info(
+            "Partial close skipped: ticket=%d  vol=%.2f  half=%.2f < MIN_LOT_GUARD %.2f",
+            ticket, pos.volume, close_vol, MIN_LOT_GUARD,
+        )
+        return False
+    close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    tick  = mt5.symbol_info_tick(symbol)
+    price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+    request = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "position":     ticket,
+        "symbol":       symbol,
+        "volume":       close_vol,
+        "type":         close_type,
+        "price":        price,
+        "magic":        MAGIC_NUMBER,
+        "comment":      "GRX_Partial_Profit",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    res = mt5.order_send(request)
+    if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+        logger.info(
+            "Partial close: ticket=%d  vol_closed=%.2f  price=%.2f",
+            ticket, close_vol, price,
+        )
+        return True
+    logger.warning(
+        "Partial close failed: ticket=%d  retcode=%s  vol=%.2f",
+        ticket, res.retcode if res else "None", close_vol,
+    )
+    return False
+
 
 
 def _close_position(ticket: int, mt5, comment: str = "GRX_close_chop") -> None:
@@ -640,7 +725,7 @@ def run_live_loop(
         account_size:  USD balance used for lot-sizing.  If None, reads from MT5
                        and normalises for cent accounts automatically.
         profit_target: Close early when floating P&L reaches this USD amount.
-                       Defaults to QUICK_PROFIT_TARGET_M5 for M5, disabled for
+                       Defaults to PROFIT_ACTIVATION_USD for all TFs (legacy param,
                        other TFs.  Pass 0 to disable on M5 explicitly.
     """
     import MetaTrader5 as mt5
@@ -734,9 +819,15 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     # so the break-even SL logic can fire when TP1 closes position 1.
     signal_tracker = {"tickets": [], "entry_price": 0.0,
                       "direction": None, "tp1_hit": False,
-                      "tp1_level": None, "guard_hit": False}
-    # Per-ticket high-water-mark for trailing P&L stop  {ticket: peak_usd}
+                      "tp1_level": None, "guard_hit": False,
+                      "atr_price": 0.0}   # cached price-denom ATR for between-bar trail
+    # Per-ticket ATR trail state: {ticket: {"activated": bool, "partial_done": bool, "current_sl": float}}
+    atr_state_tracker: dict = {}
+    # Deprecated peak-pnl tracker kept for cleanup compat (atr_state_tracker supersedes it)
     peak_pnl_tracker: dict = {}
+    # Daily floating-equity safety switch: suspends trading if account drops 5%
+    equity_gate = DailyEquityGate()
+    equity_gate.reset_day(account_size)
 
     arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
     logger.info(
@@ -750,17 +841,15 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         else ("optuna" if prob_threshold_opt is not None else "hardcoded"),
     )
 
-    # Resolve quick-profit target: CLI override > M5 default > disabled
-    if profit_target is None:
-        profit_target = QUICK_PROFIT_TARGET_M5 if tf.upper() == "M5" else None
-    elif profit_target <= 0:
-        profit_target = None   # explicit CLI disable (--profit_target 0)
-    if profit_target is not None:
-        logger.info(
-            "Hybrid Scalp Protection — Fixed target: $%.2f | "
-            "Trailing guard: activation $%.2f / drawdown %.0f%%.",
-            profit_target, TRAILING_ACTIVATION_USD, TRAILING_DRAWDOWN_PCT * 100,
-        )
+    # ATR-linked trailing stop applies to all TFs unconditionally.
+    # The legacy profit_target CLI param is kept for backward compat but is no
+    # longer used — the ATR trail supersedes the old fixed-exit logic.
+    _atr_mult_log = ATR_TRAIL_MULTIPLIER.get(tf.upper(), 1.5)
+    logger.info(
+        "ATR Trailing Stop — activation $%.2f | "
+        "multiplier %.1fx ATR [%s] | partial close (lot>%.2f).",
+        PROFIT_ACTIVATION_USD, _atr_mult_log, tf.upper(), MIN_LOT_GUARD,
+    )
 
     # Warn if the MQL5 EA (same MAGIC_NUMBER) already has open positions.
     # Running both simultaneously causes Python to see EA positions as its own
@@ -783,7 +872,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             if today != current_day:
                 daily_trades = 0
                 current_day  = today
-                logger.info("New UTC day %s — session counter reset.", today)
+                equity_gate.reset_day(account_size)
+                logger.info("New UTC day %s — session counter and equity gate reset.", today)
 
             # ── 2. Bar-change detection ───────────────────────────────────
             bars = mt5.copy_rates_from_pos(DEFAULT_SYMBOL, tf_mt5, 1, 1)
@@ -804,53 +894,98 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                         _log_closed_pnl(closed, mt5)
                         for _t in closed:
                             peak_pnl_tracker.pop(_t, None)
+                            atr_state_tracker.pop(_t, None)
                         signal_tracker["tickets"] = [
                             t for t in signal_tracker["tickets"] if t in open_set
                         ]
                         if not signal_tracker["tickets"]:
                             signal_tracker["tp1_hit"] = False
 
-                # ── Hybrid Scalp Protection (per-position) ────────────────
-                # Runs every poll cycle (5 s) — bypasses the 5-min bar delay.
-                # Condition A — Fixed target  : close when P&L >= profit_target
-                # Condition B — Trailing guard: once P&L peaked >= $2, close if
-                #               it pulls back to ≤ 50 % of that peak (chop buffer)
-                if profit_target is not None and signal_tracker["tickets"]:
-                    _pnl_divisor = 100 if broker == "headway_cent" else 1
-                    _open_pos = [
+                # ── Daily equity protection gate ──────────────────────────
+                _pnl_divisor = 100 if broker == "headway_cent" else 1
+                _open_pnl = sum(
+                    p.profit for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
+                    if p.magic == MAGIC_NUMBER
+                ) / _pnl_divisor
+                if equity_gate.check(account_size + _open_pnl):
+                    if equity_gate.needs_notification:
+                        _loss_usd = -_open_pnl
+                        logger.warning(
+                            "Daily loss limit hit: equity=%.2f  loss=%.2f  "
+                            "(%.0f%% of $%.2f) — closing all & locking until UTC midnight.",
+                            account_size + _open_pnl, _loss_usd,
+                            equity_gate.loss_pct * 100, account_size,
+                        )
+                        for _gp in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or []):
+                            if _gp.magic == MAGIC_NUMBER:
+                                _close_position(_gp.ticket, mt5,
+                                                comment="GRX_Daily_Loss_Limit")
+                        try:
+                            send_telegram_msg(
+                                f"⚠️ <b>Daily Loss Limit Reached</b>\n"
+                                f"Loss: <b>${_loss_usd:.2f}</b> "
+                                f"({equity_gate.loss_pct*100:.0f}% of ${account_size:.2f})\n"
+                                "🔒 Trading suspended until next UTC day."
+                            )
+                        except Exception:
+                            pass
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                # ── ATR-linked Hybrid Trailing Stop ───────────────────────
+                # Phase 1 (one-time per ticket): when P&L >= PROFIT_ACTIVATION_USD,
+                #   move SL to breakeven+2×spread; optionally close 50% volume.
+                # Phase 2 (every poll): trail SL at price ∓ (ATR_mult × cached ATR).
+                if signal_tracker["tickets"]:
+                    _atr_mult  = ATR_TRAIL_MULTIPLIER.get(tf.upper(), 1.5)
+                    _atr_cache = signal_tracker.get("atr_price", 0.0)
+                    _open_pos  = [
                         p for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
                         if p.magic == MAGIC_NUMBER
                         and p.ticket in set(signal_tracker["tickets"])
                     ]
                     for _pos in _open_pos:
-                        _cur  = _pos.profit / _pnl_divisor
-                        _peak = peak_pnl_tracker.get(_pos.ticket, _cur)
+                        _cur    = _pos.profit / _pnl_divisor
+                        _ticket = _pos.ticket
+                        _atr_st = atr_state_tracker.setdefault(
+                            _ticket,
+                            {"activated": False, "partial_done": False,
+                             "current_sl": _pos.sl},
+                        )
 
-                        # Update high-water mark
-                        if _cur > _peak:
-                            _peak = _cur
-                            peak_pnl_tracker[_pos.ticket] = _peak
-
-                        # Condition A: fixed scalp target (per position)
-                        if _cur >= profit_target:
+                        if not _atr_st["activated"] and _cur >= PROFIT_ACTIVATION_USD:
+                            # Phase 1: lock in break-even + 2× spread (one time)
+                            _tick   = mt5.symbol_info_tick(DEFAULT_SYMBOL)
+                            _spread = _tick.ask - _tick.bid
+                            _dir    = signal_tracker["direction"]
+                            if _dir == "BUY":
+                                _be_sl = round(signal_tracker["entry_price"] + _spread * 2, 2)
+                            else:
+                                _be_sl = round(signal_tracker["entry_price"] - _spread * 2, 2)
+                            _move_sl_to_breakeven(_ticket, _be_sl, mt5)
+                            _atr_st["activated"]  = True
+                            _atr_st["current_sl"] = _be_sl
                             logger.info(
-                                "Fixed scalp target #%d: P&L=+$%.2f >= $%.2f — closing.",
-                                _pos.ticket, _cur, profit_target,
+                                "ATR trail activated: ticket=%d  P&L=+$%.2f  BE_SL=%.2f",
+                                _ticket, _cur, _be_sl,
                             )
-                            _close_position(_pos.ticket, mt5,
-                                            comment="GRX_Fixed_Scalp_Target")
-                            continue
+                            # Partial close — skipped automatically if lot <= MIN_LOT_GUARD
+                            if not _atr_st["partial_done"]:
+                                if _execute_partial_close(_ticket, DEFAULT_SYMBOL, mt5):
+                                    _atr_st["partial_done"] = True
 
-                        # Condition B: trailing guard — activation $2, drawdown 50 %
-                        if (_peak >= TRAILING_ACTIVATION_USD
-                                and _cur <= _peak * TRAILING_DRAWDOWN_PCT):
-                            logger.info(
-                                "Trailing guard #%d: P&L=$%.2f <= 50%% of peak $%.2f "
-                                "(activation $%.2f) — closing.",
-                                _pos.ticket, _cur, _peak, TRAILING_ACTIVATION_USD,
-                            )
-                            _close_position(_pos.ticket, mt5,
-                                            comment="GRX_Trailing_Profit_Guard")
+                        elif _atr_st["activated"] and _atr_cache > 0:
+                            # Phase 2: ratchet SL toward price at ATR distance
+                            _tick = mt5.symbol_info_tick(DEFAULT_SYMBOL)
+                            _dir  = signal_tracker["direction"]
+                            if _dir == "BUY":
+                                _trail_sl = round(_tick.bid - _atr_mult * _atr_cache, 2)
+                            else:
+                                _trail_sl = round(_tick.ask + _atr_mult * _atr_cache, 2)
+                            if _set_trailing_sl(_ticket, _trail_sl,
+                                                _atr_st["current_sl"], _dir, mt5):
+                                _atr_st["current_sl"] = _trail_sl
+
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
             last_bar_time = bar_time
@@ -871,6 +1006,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
                 feature_cols=feature_cols, mt5=mt5,
             )
+            signal_tracker["atr_price"] = atr_price   # cache for between-bar ATR trail
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
             prob = float(_probs[0])
 

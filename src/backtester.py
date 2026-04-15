@@ -144,12 +144,25 @@ def _compute_metrics(strategy_returns, signals, tf: str = "H1"):
                       if len(active_returns) > 0 else 0.0)
     total_return   = float(np.exp(np.sum(strategy_returns)) - 1)
 
+    # Recovery Factor = Net Profit / Max Drawdown.
+    # Rewards strategies that achieve high return relative to worst trough —
+    # safer than raw Sharpe for small accounts where a single DD event is fatal.
+    # Capped at 20 to prevent extreme low-DD outliers from distorting Optuna's
+    # surrogate model.
+    if max_dd > 0:
+        recovery_factor = float(min(total_return / max_dd, 20.0))
+    elif total_return > 0:
+        recovery_factor = 20.0   # no drawdown, positive return → best possible
+    else:
+        recovery_factor = 0.0
+
     return {
-        "sharpe_ratio": float(sharpe),
-        "max_drawdown": max_dd,
-        "win_rate":     win_rate,
-        "total_return": total_return,
-        "n_trades":     n_trades,
+        "sharpe_ratio":    float(sharpe),
+        "max_drawdown":    max_dd,
+        "win_rate":        win_rate,
+        "total_return":    total_return,
+        "n_trades":        n_trades,
+        "recovery_factor": recovery_factor,
     }
 
 
@@ -189,7 +202,7 @@ def vectorized_backtest(
         threshold=buy_th,
         short_threshold=short_threshold,   # None → symmetric default inside
     )
-    signals = apply_session_limits(raw_signals, df.index, account_size, hmm_states, tf=tf, broker=broker)
+    signals = raw_signals  # daily trade-count cap removed; DailyEquityGate governs live risk
 
     # Determine pos_per_trade from the adaptive risk manager
     arm           = AdaptiveRiskManager(account_size, broker=broker)
@@ -206,11 +219,10 @@ def vectorized_backtest(
 
     result = _compute_metrics(strategy_returns, signals, tf=tf)
     result.update({
-        "account_size":      account_size,
-        "broker":            broker,
-        "tf":                tf,
-        "session_max_trades": arm.get_trade_limits(tf=tf)["max_daily_trades"],
-        "pos_per_trade":     pos_per_trade,
+        "account_size":  account_size,
+        "broker":        broker,
+        "tf":            tf,
+        "pos_per_trade": pos_per_trade,
     })
 
     if split_idx is not None and 0 < split_idx < len(strategy_returns):
@@ -237,11 +249,10 @@ def vectorized_backtest(
         )
 
     logger.info(
-        "%s: account=$%.2f | tier=%s | session_limit=%d/day | pos_per_trade=%d | costs=%.4f/trade",
+        "%s: account=$%.2f | tier=%s | pos_per_trade=%d | costs=%.4f/trade",
         broker,
         account_size,
         "small" if arm.is_small_account else "growth",
-        arm.get_trade_limits(tf=tf)["max_daily_trades"],
         pos_per_trade,
         BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0)
         + BROKER_CONFIGS.get(broker, {}).get("commission_frac", 0),

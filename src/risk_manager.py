@@ -188,3 +188,75 @@ class AdaptiveRiskManager:
             f"AdaptiveRiskManager(balance=${self.balance:.0f}, tier={tier}, "
             f"broker={self.broker}, daily_trades={self.daily_trades})"
         )
+
+
+class DailyEquityGate:
+    """Floating-equity safety switch for live trading.
+
+    Monitors the sum of realised balance and open floating P&L.  If that
+    running equity drops >= ``loss_pct`` below the start-of-day baseline, the
+    gate locks and remains locked until ``reset_day`` is called (UTC midnight).
+
+    Usage in the live loop::
+
+        gate = DailyEquityGate()
+        gate.reset_day(account_size)   # call once at start of day
+
+        # each poll cycle:
+        current_eq = account_size + open_pnl
+        if gate.check(current_eq):
+            if gate.needs_notification:
+                <close all positions + send Telegram alert>
+            continue   # skip new signals until tomorrow
+    """
+
+    DAILY_LOSS_PCT = 0.05   # 5 % default loss limit
+
+    def __init__(self, loss_pct: float = DAILY_LOSS_PCT):
+        self.loss_pct      = loss_pct
+        self._start_equity: float | None = None
+        self._locked       = False
+        self._notified     = False
+
+    def reset_day(self, equity: float) -> None:
+        """Initialise or reset for a new UTC trading day."""
+        self._start_equity = float(equity)
+        self._locked       = False
+        self._notified     = False
+        logger.debug("DailyEquityGate reset: start_equity=%.2f  limit=%.0f%%",
+                     equity, self.loss_pct * 100)
+
+    def check(self, current_equity: float) -> bool:
+        """Return True if the daily loss limit has been breached.
+
+        Calling this repeatedly after lock is safe — it stays True and does
+        NOT re-trigger ``needs_notification``.
+        """
+        if self._start_equity is None or self._start_equity <= 0:
+            return False
+        dd_pct = (self._start_equity - current_equity) / self._start_equity
+        if dd_pct >= self.loss_pct:
+            self._locked = True
+        return self._locked
+
+    @property
+    def needs_notification(self) -> bool:
+        """True exactly once — the first poll cycle after the lock engages.
+
+        Designed so the caller sends a single Telegram alert without repeated
+        messages on subsequent polls.
+        """
+        if self._locked and not self._notified:
+            self._notified = True
+            return True
+        return False
+
+    @property
+    def locked(self) -> bool:
+        return self._locked
+
+    def __repr__(self) -> str:
+        return (
+            f"DailyEquityGate(loss_pct={self.loss_pct*100:.0f}%, "
+            f"locked={self._locked}, start=${self._start_equity or 0:.2f})"
+        )

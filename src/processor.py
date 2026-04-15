@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from sklearn.mixture import GaussianMixture
 from src.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -198,6 +199,54 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return (atr / df["Close"]).rename("atr_normalized")
 
 
+def compute_gmm_vol_cluster(volatility: np.ndarray, n_components: int = 3) -> np.ndarray:
+    """Cluster bars into Volatility Buckets (Low=0, Med=1, High=2) via GMM.
+
+    Fits a Gaussian Mixture Model on the rolling-volatility series and returns
+    integer bucket labels sorted by component mean.  This provides XGBoost a
+    second 'opinion' on market state — e.g. a breakout bar (High Vol, label 2)
+    versus genuine Chop (Low Vol, label 0) can look identical to the HMM but
+    the GMM cluster separates them reliably.
+
+    Falls back to quantile-based labelling if GMM collapses to fewer than
+    ``n_components`` unique labels (degenerate convergence on uniform data).
+
+    Args:
+        volatility: 1-D array of rolling-volatility values (from compute_volatility).
+        n_components: Number of GMM components (default 3 = Low/Med/High).
+
+    Returns:
+        Integer array of shape (N,) with values in {0, 1, …, n_components-1}.
+    """
+    valid_mask = ~np.isnan(volatility)
+    labels_out = np.zeros(len(volatility), dtype=np.int8)  # NaN rows → 0; dropped later by dropna
+
+    vol_valid = volatility[valid_mask]
+    X = vol_valid.reshape(-1, 1)
+    gmm = GaussianMixture(n_components=n_components, random_state=42, n_init=5)
+    raw_labels = gmm.fit_predict(X)
+
+    # Remap: 0 = lowest-volatility component, n_components-1 = highest
+    order = np.argsort(gmm.means_.ravel())
+    remap = np.empty(n_components, dtype=int)
+    for rank, original_idx in enumerate(order):
+        remap[original_idx] = rank
+    labels_valid = remap[raw_labels].astype(np.int8)
+
+    # Fallback: if GMM collapsed to fewer unique labels, use quantile buckets
+    if len(np.unique(labels_valid)) < n_components:
+        logger.warning(
+            "GMM collapsed to %d clusters (expected %d) — using quantile fallback.",
+            len(np.unique(labels_valid)), n_components,
+        )
+        boundaries = np.percentile(vol_valid, [100 / n_components * i
+                                               for i in range(1, n_components)])
+        labels_valid = np.digitize(vol_valid, boundaries).astype(np.int8)
+
+    labels_out[valid_mask] = labels_valid
+    return labels_out
+
+
 def process_pipeline(
     obs_cov: float = None,
     trans_cov: float = None,
@@ -230,6 +279,7 @@ def process_pipeline(
     df["rsi"] = compute_rsi(df["Close"])
     df["rsi_slope"] = df["rsi"].diff()
     df["atr_normalized"] = compute_atr(df)
+    df["gmm_vol_cluster"] = compute_gmm_vol_cluster(df["volatility"].values)
 
     # ── Optional USDCHF cross-asset feature ─────────────────────────────────
     # Each TF uses its own USDCHF master so bar frequencies stay in sync:

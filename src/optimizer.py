@@ -71,25 +71,18 @@ def _get_tier(balance: float) -> str:
 
 
 def _score_result(result: dict, tier: str, broker: str, tf: str = "H1") -> float:
-    cfg  = TIER_CONFIGS[tier]
-    dd   = result["max_drawdown"]
-    # H1 on a small account is more vulnerable to drawdown: a single "normal"
-    # H1 swing can consume 10-15 % of a $15 balance.  Double the penalty to
-    # force the optimizer towards lower-drawdown, safer entries over raw Sharpe.
-    if tf.upper() == "H1" and tier == "small":
-        dd_penalty = cfg["dd_penalty"] * 2.0
-    else:
-        dd_penalty = cfg["dd_penalty"]
-    base = (result["sharpe_ratio"] - dd * dd_penalty
-            if broker == "headway_cent"
-            else result["sharpe_ratio"])
+    cfg = TIER_CONFIGS[tier]
+    dd  = result["max_drawdown"]
+    # Recovery Factor = Net Profit / Max Drawdown.
+    # Rewards the optimizer for finding the safest path to profit on a $15
+    # account rather than just the highest Sharpe.  Capped at 20 to prevent
+    # extreme low-DD outliers from distorting Optuna's TPE surrogate.
+    rf = float(min(result.get("recovery_factor", 0.0), 20.0))
     if dd > cfg["dd_limit"]:
         # Sliding penalty: -2.0 per 1% of DD over the limit.
-        # Replaces the hard -10.0 so trials with, e.g., 16% DD on a 15% limit
-        # can still score positively instead of being discarded outright.
-        overshoot = (dd - cfg["dd_limit"]) * 200   # 0.01 excess → -2.0
-        return base - overshoot
-    return base
+        overshoot = (dd - cfg["dd_limit"]) * 200
+        return rf - overshoot
+    return rf
 
 
 def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
@@ -103,16 +96,10 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # M5: floor=1.0 (5-min noise needs high obs_cov to separate states).
         # H1/M15: floor=0.5 (sub-hourly bars still degenerate below this threshold).
         # Other TFs: 0.1 (full range).
-        if tf.upper() == "M5":
-            obs_cov = trial.suggest_float("obs_cov", 1.0, 5.0, log=True)
-        elif tf.upper() in ("H1", "M15"):
-            # H1/M15: floor raised to 1.0 — values below 1.0 with n_states=4
-            # still produce ~70-75% positive-definite failures even with [4]-only
-            # search space.  M5 uses 1.0 floor for the same reason; M15 sub-hourly
-            # bars have similar noise characteristics.
-            obs_cov = trial.suggest_float("obs_cov", 1.0, 5.0, log=True)
-        else:
-            obs_cov = trial.suggest_float("obs_cov", 0.1, 5.0, log=True)
+        # obs_cov range: 0.5–5.0 for all TFs.  Values < 0.5 cause non-positive-
+        # definite covariance errors in ~70-75 % of trials; the persistence and
+        # vol-ratio guards catch the remaining bad trials in the 0.5–1.0 region.
+        obs_cov = trial.suggest_float("obs_cov", 0.5, 5.0, log=True)
         # M5 Kalman is calibrated for 5-min noise; H1/M15 have smoother signals
         # so trans_cov above 0.03 tends to produce chaotic Bull/Chop oscillation
         # (49K+ transitions, identical state means) that the persistence guard
@@ -200,7 +187,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             df = process_pipeline(
                 obs_cov=obs_cov, trans_cov=trans_cov, save=False, tf=tf
             )
-            _hmm, states, _ = fit_hmm(df, n_states=n_states)
+            _hmm, states, _ = fit_hmm(df, n_states=n_states, tf=tf)
 
             # ── HMM quality gate ─────────────────────────────────────────────
             # Reject trials where any state has low self-transition probability.
@@ -263,8 +250,8 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 if result.get("oos_n_trades", 0) < min_oos_trades:
                     return -10.0
                 oos_result = {
-                    "sharpe_ratio": result["oos_sharpe_ratio"],
-                    "max_drawdown": result["oos_max_drawdown"],
+                    "recovery_factor": result.get("oos_recovery_factor", 0.0),
+                    "max_drawdown":    result["oos_max_drawdown"],
                 }
                 score = _score_result(oos_result, tier, broker, tf)
             else:
@@ -272,11 +259,11 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
             logger.info(
                 "Trial %d [%s/%s tier=%s $%.0f]: score=%.3f  "
-                "IS=%.3f  OOS=%.3f  OOS_DD=%.1f%%  trades=%d",
+                "IS_RF=%.3f  OOS_RF=%.3f  OOS_DD=%.1f%%  trades=%d",
                 trial.number, tf, broker, tier, balance,
                 score,
-                result.get("is_sharpe_ratio",  result["sharpe_ratio"]),
-                result.get("oos_sharpe_ratio", result["sharpe_ratio"]),
+                result.get("is_recovery_factor",  result.get("recovery_factor", 0)),
+                result.get("oos_recovery_factor", result.get("recovery_factor", 0)),
                 result.get("oos_max_drawdown", result["max_drawdown"]) * 100,
                 result.get("oos_n_trades",     result["n_trades"]),
             )
@@ -346,7 +333,7 @@ def _make_callbacks(total_target: int, study_name: str, already_done: int = 0) -
             )
             print(
                 f"  [{total_done:>4}/{total_target}]  "
-                f"Best Sharpe: {best:+.3f}  |  "
+                f"Best RF: {best:+.3f}  |  "
                 f"ETA: {eta_str}{ram_str}"
             )
 

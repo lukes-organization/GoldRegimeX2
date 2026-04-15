@@ -311,13 +311,10 @@ def cmd_optimize(args):
     for tf in tfs:
         logger.info("Optimizing [%s] broker=%s balance=$%.0f trials=%d", tf, broker, balance, args.trials)
         study = run_optimization(n_trials=args.trials, balance=balance, broker=broker, tf=tf, n_jobs=args.n_jobs)
-        arm = AdaptiveRiskManager(balance, broker=broker)
-        limits = arm.get_trade_limits()
         print(f"\n=== Best Result [{tf}] ===")
         print(f"Score:         {study.best_value:.3f}")
         print(f"Broker:        {broker}")
-        print(f"Balance:       ${balance:.0f} USD  ({arm}")
-        print(f"Session Limit: {limits['max_daily_trades']} trade(s)/day | {limits['pos_per_trade']} pos/trade")
+        print(f"Balance:       ${balance:.0f} USD")
         print("Best Params:")
         for k, v in study.best_params.items():
             print(f"  {k}: {v}")
@@ -371,10 +368,8 @@ def cmd_train(args):
     save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf, broker))
 
     arm = AdaptiveRiskManager(balance, broker=broker)
-    limits = arm.get_trade_limits()
     print(f"\n=== Training Results [{tf}] ===")
     print(f"Broker: {broker} | Balance: ${balance:.0f} | Tier: {'small' if arm.is_small_account else 'growth'}")
-    print(f"Session: {limits['max_daily_trades']}/day | Positions: {limits['pos_per_trade']}/trade")
     print(f"Sharpe: {result['sharpe_ratio']:.3f} | MaxDD: {result['max_drawdown']*100:.1f}% "
           f"| WR: {result['win_rate']*100:.1f}% | Trades: {result['n_trades']}")
     if "oos_sharpe_ratio" in result:
@@ -650,7 +645,6 @@ def cmd_report(args):
         "broker": broker,
         "balance_usd": balance,
         "tier": "small" if arm.is_small_account else "growth",
-        "session_limit": limits["max_daily_trades"],
         "pos_per_trade": limits["pos_per_trade"],
         "tf": tf,
     })

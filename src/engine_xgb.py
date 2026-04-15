@@ -22,9 +22,12 @@ def get_ensemble_path(tf: str, broker: str = "headway_cent") -> Path:
     """
     return Path(f"models/xgb_ensemble_{tf.upper()}_{broker}.pkl")
 
-# Base features always present; usdchf_log_return is added when the USDCHF
-# master CSV is available (run  python main.py --mode consolidate  first).
-FEATURE_COLS    = ["hmm_state", "rsi_slope", "atr_normalized", "prev_log_return"]
+# Base features always present; gmm_vol_cluster and usdchf_log_return are
+# added conditionally when the columns are present in the processed DataFrame.
+# Feature order (canonical): hmm_state | gmm_vol_cluster | rsi_slope |
+#                             atr_normalized | prev_log_return | usdchf_log_return
+FEATURE_COLS    = ["hmm_state", "gmm_vol_cluster", "rsi_slope", "atr_normalized", "prev_log_return"]
+GMM_FEATURE     = "gmm_vol_cluster"
 USDCHF_FEATURE  = "usdchf_log_return"
 DXY_FEATURE     = USDCHF_FEATURE   # legacy alias — kept so old imports don't crash
 
@@ -35,10 +38,17 @@ VOL_BUCKETS = ["low", "med", "high"]
 def get_feature_cols(df: pd.DataFrame) -> list[str]:
     """Return the feature column list for this DataFrame.
 
-    Includes ``usdchf_log_return`` only when the column is present and has
-    enough non-null values to be useful (>50% coverage).
+    Starts from FEATURE_COLS (which includes gmm_vol_cluster), then:
+    - Drops gmm_vol_cluster if not present (old parquet without GMM).
+    - Appends usdchf_log_return when present and >50% non-null.
     """
-    cols = list(FEATURE_COLS)
+    cols = []
+    for c in FEATURE_COLS:
+        if c == GMM_FEATURE:
+            if c in df.columns and df[c].notna().mean() > 0.5:
+                cols.append(c)
+        else:
+            cols.append(c)
     if USDCHF_FEATURE in df.columns and df[USDCHF_FEATURE].notna().mean() > 0.5:
         cols.append(USDCHF_FEATURE)
     return cols

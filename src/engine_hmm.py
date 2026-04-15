@@ -9,6 +9,14 @@ logger = setup_logger(__name__)
 
 MODEL_PATH = Path("models/hmm_model.pkl")
 
+# TF-specific diagonal boost applied to the HMM transition matrix after fitting.
+# Adds this value to each self-transition probability then renormalises rows.
+# Higher boost = stickier regime (fewer flips per bar).
+# H1: 0.25 — hourly bars have genuine multi-hour trends; bias hard toward persistence.
+# M15: 0.15 — moderate; 15-min noise warrants some smoothing but less than H1.
+# M5: 0.10 — flexible; scalping benefits from faster regime detection.
+TF_TRANS_BOOST = {"H1": 0.25, "M15": 0.15, "M5": 0.10}
+
 
 def get_model_path(tf: str, broker: str = "headway_cent") -> Path:
     """Return the TF+broker-specific HMM model path.
@@ -86,6 +94,7 @@ def fit_hmm(
     n_states: int = 3,
     n_iter: int = 200,
     random_state: int = 42,
+    tf: str = "H1",
 ):
     X = df[["kalman_return", "volatility"]].values
     model = GaussianHMM(
@@ -96,6 +105,16 @@ def fit_hmm(
         verbose=False,
     )
     model.fit(X)
+
+    # ── HMM Persistence Boost ─────────────────────────────────────────────────
+    # Add a TF-specific value to each diagonal of the transition matrix, then
+    # renormalise rows to sum to 1.  This biases the model toward staying in the
+    # current regime, reducing bar-to-bar jitter ("regime flip every 2 bars").
+    boost = TF_TRANS_BOOST.get(tf.upper(), 0.10)
+    mat = model.transmat_.copy()
+    np.fill_diagonal(mat, mat.diagonal() + boost)
+    model.transmat_ = mat / mat.sum(axis=1, keepdims=True)
+
     raw_states = model.predict(X)
 
     states, state_names = _sort_states(model, raw_states, n_states)

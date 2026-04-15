@@ -32,6 +32,7 @@ from src.processor import (
     compute_volatility,
     compute_rsi,
     compute_atr,
+    compute_gmm_vol_cluster,
 )
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
 from src.engine_xgb import load_xgb_ensemble, prepare_features, get_predictions_ensemble, get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH
@@ -72,8 +73,9 @@ def _apply_features(
     df["kalman_return"]  = kalman_smooth(df["log_return"].values, obs_cov, trans_cov)
     df["volatility"]     = compute_volatility(df["log_return"])
     df["rsi"]            = compute_rsi(df["Close"])
-    df["rsi_slope"]      = df["rsi"].diff()
-    df["atr_normalized"] = compute_atr(df)
+    df["rsi_slope"]       = df["rsi"].diff()
+    df["atr_normalized"]  = compute_atr(df)
+    df["gmm_vol_cluster"] = compute_gmm_vol_cluster(df["volatility"].values)
 
     # Mirror process_pipeline: add USDCHF if the matching TF master file exists
     usdchf_path = _USDCHF_PATH_BY_TF.get(tf.upper(), USDCHF_MASTER_PATH)
