@@ -390,10 +390,10 @@ def cmd_train(args):
           f"| WR: {result['win_rate']*100:.1f}% | Trades: {result['n_trades']}")
     if "oos_sharpe_ratio" in result:
         print(f"\n--- In-Sample ---")
-        print(f"  Sharpe: {result['is_sharpe_ratio']:.3f} | DD: {result['is_max_drawdown']*100:.1f}% "
+        print(f"  Sharpe: {result['is_sharpe_ratio']:.3f} | FloatDD: {result.get('is_floating_max_drawdown', result['is_max_drawdown'])*100:.1f}% "
               f"| WR: {result['is_win_rate']*100:.1f}% | Trades: {result['is_n_trades']}")
         print(f"--- Out-of-Sample ---")
-        print(f"  Sharpe: {result['oos_sharpe_ratio']:.3f} | DD: {result['oos_max_drawdown']*100:.1f}% "
+        print(f"  Sharpe: {result['oos_sharpe_ratio']:.3f} | FloatDD: {result.get('oos_floating_max_drawdown', result['oos_max_drawdown'])*100:.1f}% "
               f"| WR: {result['oos_win_rate']*100:.1f}% | Trades: {result['oos_n_trades']}")
     print(f"\nModels saved. Run --mode export to generate ONNX.")
 
@@ -441,12 +441,12 @@ def cmd_compare(args):
     print(header)
     print("-" * len(header))
     metrics_to_show = [
-        ("OOS Sharpe",   "oos_sharpe_ratio", ".3f"),
-        ("IS Sharpe",    "is_sharpe_ratio",  ".3f"),
-        ("OOS Max DD",   "oos_max_drawdown", ".1%"),
-        ("OOS Win Rate", "oos_win_rate",     ".1%"),
-        ("OOS Trades",   "oos_n_trades",     "d"),
-        ("Full Sharpe",  "sharpe_ratio",     ".3f"),
+        ("OOS Sharpe",   "oos_sharpe_ratio",          ".3f"),
+        ("IS Sharpe",    "is_sharpe_ratio",            ".3f"),
+        ("OOS Float DD", "oos_floating_max_drawdown",  ".1%"),
+        ("OOS Win Rate", "oos_win_rate",               ".1%"),
+        ("OOS Trades",   "oos_n_trades",               "d"),
+        ("Full Sharpe",  "sharpe_ratio",               ".3f"),
     ]
     for label, key, fmt in metrics_to_show:
         row = f"{label:<20}"

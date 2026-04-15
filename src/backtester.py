@@ -187,6 +187,78 @@ def _compute_metrics(strategy_returns, signals, tf: str = "H1"):
     }
 
 
+def _compute_floating_drawdown(
+    df: pd.DataFrame,
+    signals: np.ndarray,
+    sizes: np.ndarray,
+    strategy_returns: np.ndarray,
+) -> float:
+    """Peak-to-trough drawdown on the intra-bar floating equity curve.
+
+    For each bar with an open position the worst-case adverse price move from
+    the trade entry is computed:
+
+        BUY  bar: adverse_frac = max(0, (entry_price - Low[i])  / entry_price)
+        SELL bar: adverse_frac = max(0, (High[i] - entry_price) / entry_price)
+
+    The floating equity at bar i is:
+        closed_equity[i]  -  |sizes[i]| × adverse_frac[i]
+
+    The reported drawdown is the largest peak (closed equity) to trough
+    (floating equity) drop, capturing trades that dip deep before recovering.
+
+    Falls back to closed-bar drawdown when High/Low columns are absent.
+    """
+    if not {"High", "Low", "Close"}.issubset(df.columns) or len(signals) == 0:
+        cumulative  = np.cumsum(strategy_returns)
+        running_max = np.maximum.accumulate(cumulative)
+        return float(np.max(running_max - cumulative)) if len(cumulative) > 0 else 0.0
+
+    close = df["Close"].values
+    high  = df["High"].values
+    low   = df["Low"].values
+    n     = len(signals)
+
+    # ── Track entry price for each in-trade bar ───────────────────────────────
+    # When a trade opens (signal becomes non-zero or reverses), record Close[i]
+    # as the entry price and carry it forward until the position closes.
+    entry_prices  = np.zeros(n)
+    current_entry = 0.0
+    prev_sig      = 0
+    for i in range(n):
+        sig = signals[i]
+        if sig != 0 and (prev_sig == 0 or sig != prev_sig):
+            current_entry = close[i]   # entry at this bar's close
+        elif sig == 0:
+            current_entry = 0.0
+        entry_prices[i] = current_entry if sig != 0 else 0.0
+        prev_sig = sig
+
+    # ── Adverse excursion fraction ─────────────────────────────────────────────
+    adverse_frac = np.zeros(n)
+    buy_on       = (signals ==  1) & (entry_prices > 0)
+    sell_on      = (signals == -1) & (entry_prices > 0)
+    if buy_on.any():
+        ep = entry_prices[buy_on]
+        adverse_frac[buy_on]  = np.maximum(0.0, (ep - low[buy_on])  / ep)
+    if sell_on.any():
+        ep = entry_prices[sell_on]
+        adverse_frac[sell_on] = np.maximum(0.0, (high[sell_on] - ep) / ep)
+
+    # ── Floating equity series ─────────────────────────────────────────────────
+    # Closed equity: cumulative realised P&L at each bar close.
+    # Floating equity: worst-case equity during each bar (can dip below closed).
+    closed_equity   = np.cumsum(strategy_returns)
+    adverse_equity  = np.abs(sizes) * adverse_frac
+    floating_equity = closed_equity - adverse_equity
+
+    # Running max anchored to bar closes; trough is min of floating vs closed.
+    running_max = np.maximum.accumulate(closed_equity)
+    trough      = np.minimum(floating_equity, closed_equity)
+    drawdowns   = running_max - trough
+    return float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
+
+
 def vectorized_backtest(
     df,
     probabilities,
@@ -245,6 +317,9 @@ def vectorized_backtest(
     strategy_returns = gross_returns - costs
 
     result = _compute_metrics(strategy_returns, signals, tf=tf)
+    result["floating_max_drawdown"] = _compute_floating_drawdown(
+        df, signals, sizes, strategy_returns
+    )
     result.update({
         "account_size":  account_size,
         "broker":        broker,
@@ -255,18 +330,25 @@ def vectorized_backtest(
     if split_idx is not None and 0 < split_idx < len(strategy_returns):
         is_m  = _compute_metrics(strategy_returns[:split_idx], signals[:split_idx], tf)
         oos_m = _compute_metrics(strategy_returns[split_idx:], signals[split_idx:], tf)
+        # Floating drawdown per IS/OOS slice — df index must be sliced to match
+        is_m["floating_max_drawdown"]  = _compute_floating_drawdown(
+            df.iloc[:split_idx], signals[:split_idx], sizes[:split_idx], strategy_returns[:split_idx],
+        )
+        oos_m["floating_max_drawdown"] = _compute_floating_drawdown(
+            df.iloc[split_idx:], signals[split_idx:], sizes[split_idx:], strategy_returns[split_idx:],
+        )
         result["split_idx"] = split_idx
         for k, v in is_m.items():
             result[f"is_{k}"] = v
         for k, v in oos_m.items():
             result[f"oos_{k}"] = v
         logger.info(
-            "Backtest IS  [%s]: Sharpe=%.3f | MaxDD=%.3f | WinRate=%.3f | Trades=%d",
-            tf, is_m["sharpe_ratio"], is_m["max_drawdown"], is_m["win_rate"], is_m["n_trades"],
+            "Backtest IS  [%s]: Sharpe=%.3f | FloatDD=%.4f | WinRate=%.3f | Trades=%d",
+            tf, is_m["sharpe_ratio"], is_m["floating_max_drawdown"], is_m["win_rate"], is_m["n_trades"],
         )
         logger.info(
-            "Backtest OOS [%s]: Sharpe=%.3f | MaxDD=%.3f | WinRate=%.3f | Trades=%d",
-            tf, oos_m["sharpe_ratio"], oos_m["max_drawdown"], oos_m["win_rate"], oos_m["n_trades"],
+            "Backtest OOS [%s]: Sharpe=%.3f | FloatDD=%.4f | WinRate=%.3f | Trades=%d",
+            tf, oos_m["sharpe_ratio"], oos_m["floating_max_drawdown"], oos_m["win_rate"], oos_m["n_trades"],
         )
     else:
         logger.info(

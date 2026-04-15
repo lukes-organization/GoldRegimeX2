@@ -39,56 +39,42 @@ except ImportError:
 def _study_db(broker: str) -> str:
     """Return the SQLite storage URL for a given broker, e.g. sqlite:///models/study_headway_cent.db."""
     return f"sqlite:///models/study_{broker}.db"
-DD_HARD_LIMIT   = 0.15
-# Minimum OOS trades before a trial is considered scoreable.
-# M5 has 288 bars/day — the OOS window (~2yr) allows up to ~870 trades at
-# 2/day cap.  Setting 300 forces at least 0.69 trades/day on average,
-# preventing the optimizer from rewarding ultra-infrequent cherry-picked wins.
-# M15: ~4.1yr OOS → 200 trades = ~49/year = ~12/quarter — active enough to
-# validate on 3m live data.
-# H1: capped at 2 trades/day (small account) × 4.1yr OOS ≈ 2066 potential
-# slots.  At conservative prob thresholds (0.50–0.58) only 5–10% of days fire,
-# giving 50–150 OOS trades.  75 is a realistic floor that excludes near-zero
-# signal studies without discarding genuinely selective strategies.
-MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 450, "M15": 250, "H1": 100}
-MIN_OOS_TRADES  = 100   # fallback for unknown TFs
-RAM_HIGH_PCT    = 90    # pause new trials when used RAM exceeds this %
-RAM_PAUSE_SEC   = 30    # seconds to sleep when RAM is low
 
-# Study tier objectives --------------------------------------------------------
-# Small accounts ($15–$50): extreme drawdown protection — Sharpe - DD×5.0
-# Growth accounts (>$50):   balanced with higher frequency — Sharpe - DD×3.0
-# Both tiers now use 15% DD cap — BUY+SELL doubles trade frequency so the
-# previous 10% cap rejected every trial even when OOS Sharpe was acceptable.
-TIER_CONFIGS = {
-    "small":  {"dd_penalty": 5.0, "dd_limit": 0.15},
-    "growth": {"dd_penalty": 3.0, "dd_limit": 0.15},
-}
+# Hard floors applied before scoring — prevent degenerate or blow-up trials.
+MIN_OOS_TRADES  = 15     # require at least 15 OOS trades (prevents 1-trade "wins")
+MAX_FLOAT_DD    = 0.20   # 20% floating drawdown hard cap — terminal for $15 account
+RAM_HIGH_PCT    = 90     # pause new trials when used RAM exceeds this %
+RAM_PAUSE_SEC   = 30     # seconds to sleep when RAM is low
 
 
 def _get_tier(balance: float) -> str:
     return "small" if balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
 
 
-def _score_result(result: dict, tier: str, broker: str, tf: str = "H1") -> float:
-    cfg = TIER_CONFIGS[tier]
-    dd  = result["max_drawdown"]
-    # Recovery Factor = Net Profit / Max Drawdown.
-    # Rewards the optimizer for finding the safest path to profit on a $15
-    # account rather than just the highest Sharpe.  Capped at 20 to prevent
-    # extreme low-DD outliers from distorting Optuna's TPE surrogate.
-    rf = float(min(result.get("recovery_factor", 0.0), 20.0))
-    if dd > cfg["dd_limit"]:
-        # Sliding penalty: -2.0 per 1% of DD over the limit.
-        overshoot = (dd - cfg["dd_limit"]) * 200
-        return rf - overshoot
-    return rf
+def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = "H1") -> float:
+    """Recovery Factor × (1 + Sharpe) — rewards high return-on-risk with quality multiplier.
+
+    RF  = OOS Net Profit / OOS Max Floating Drawdown   (capped at 50 to avoid outlier bias)
+    Score = RF × (1 + Sharpe)
+
+    A strategy with large profit AND smooth equity earns a high RF, then Sharpe
+    multiplies it — filtering out "lucky" high-RF but noisy trajectories.
+    """
+    net_profit  = result.get("total_return", 0.0)
+    floating_dd = result.get("floating_max_drawdown", result.get("max_drawdown", 0.0))
+    sharpe      = result.get("sharpe_ratio", 0.0)
+
+    if floating_dd <= 0:
+        rf = 50.0 if net_profit > 0 else 0.0
+    else:
+        rf = min(net_profit / floating_dd, 50.0)
+
+    return float(rf * (1.0 + sharpe))
 
 
 def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
     """Return an Optuna objective function for the given account / TF context."""
     tier = _get_tier(balance)
-    min_oos_trades = MIN_OOS_TRADES_BY_TF.get(tf.upper(), MIN_OOS_TRADES)
 
     def objective(trial: optuna.Trial) -> float:
         # obs_cov floor per TF — prevents degenerate Kalman configs where
@@ -254,20 +240,26 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
             # Score on OOS only to prevent IS data leakage
             if split_idx and "oos_sharpe_ratio" in result:
-                oos_n = result.get("oos_n_trades", 0)
-                if oos_n < min_oos_trades:
+                oos_n   = result.get("oos_n_trades", 0)
+                oos_fdd = result.get("oos_floating_max_drawdown",
+                                     result.get("oos_max_drawdown", 0.0))
+
+                # Participation floor — at least 15 OOS trades required
+                if oos_n < MIN_OOS_TRADES:
                     return -10.0
-                # Equity kill switch: if OOS drawdown would bring $15 below $1, disqualify.
-                _kill_dd = (balance - 1.0) / balance   # e.g., 14/15 ≈ 0.933
-                if result.get("oos_max_drawdown", 0.0) > _kill_dd:
+
+                # Safety floor — 20% floating DD is terminal for a $15 account
+                if oos_fdd > MAX_FLOAT_DD:
                     logger.warning(
-                        "Trial %d: equity kill switch (OOS DD=%.3f > kill threshold=%.3f)",
-                        trial.number, result["oos_max_drawdown"], _kill_dd,
+                        "Trial %d: safety floor (OOS floating DD=%.3f > %.0f%%)",
+                        trial.number, oos_fdd, MAX_FLOAT_DD * 100,
                     )
-                    return -100.0
+                    return -50.0
+
                 oos_result = {
-                    "recovery_factor": result.get("oos_recovery_factor", 0.0),
-                    "max_drawdown":    result["oos_max_drawdown"],
+                    "total_return":          result.get("oos_total_return", 0.0),
+                    "floating_max_drawdown": oos_fdd,
+                    "sharpe_ratio":          result.get("oos_sharpe_ratio", 0.0),
                 }
                 score = _score_result(oos_result, tier, broker, tf)
             else:
@@ -275,13 +267,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
             logger.info(
                 "Trial %d [%s/%s tier=%s $%.0f]: score=%.3f  "
-                "IS_RF=%.3f  OOS_RF=%.3f  OOS_DD=%.1f%%  trades=%d",
+                "IS_RF=%.3f  OOS_RF=%.3f  OOS_FloatDD=%.1f%%  trades=%d",
                 trial.number, tf, broker, tier, balance,
                 score,
                 result.get("is_recovery_factor",  result.get("recovery_factor", 0)),
                 result.get("oos_recovery_factor", result.get("recovery_factor", 0)),
-                result.get("oos_max_drawdown", result["max_drawdown"]) * 100,
-                result.get("oos_n_trades",     result["n_trades"]),
+                result.get("oos_floating_max_drawdown",
+                           result.get("oos_max_drawdown", result["max_drawdown"])) * 100,
+                result.get("oos_n_trades", result["n_trades"]),
             )
             return score
 
@@ -349,7 +342,7 @@ def _make_callbacks(total_target: int, study_name: str, already_done: int = 0) -
             )
             print(
                 f"  [{total_done:>4}/{total_target}]  "
-                f"Best RF: {best:+.3f}  |  "
+                f"Best Score: {best:+.3f}  |  "
                 f"ETA: {eta_str}{ram_str}"
             )
 
@@ -362,7 +355,7 @@ def _make_callbacks(total_target: int, study_name: str, already_done: int = 0) -
                 send_telegram_msg(
                     f"Optimization <b>{milestone}%</b> complete\n"
                     f"Study: <code>{study_name}</code>\n"
-                    f"Best Sharpe: <b>{best:.3f}</b>  |  "
+                    f"Best Score: <b>{best:.3f}</b>  |  "
                     f"Trials: {total_done}/{total_target}"
                 )
 
@@ -488,7 +481,7 @@ def run_optimization(
         f"<b>Optimization 100% Complete!</b>\n"
         f"Study: <code>{name}</code>\n"
         f"Trials: <b>{total_done}</b>\n"
-        f"Best OOS Sharpe: <b>{best:.3f}</b>\n"
+        f"Best Score (RF×Sharpe): <b>{best:.3f}</b>\n"
         + "\n".join(
             f"  <code>{k}</code>: {v}"
             for k, v in study.best_params.items()
