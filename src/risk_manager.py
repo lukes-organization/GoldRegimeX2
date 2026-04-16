@@ -47,57 +47,21 @@ class CentConverter:
         )
 
 
-class SessionManager:
-    """Legacy per-session limiter (kept for backwards compat).
-
-    Prefer ``AdaptiveRiskManager`` for new code.
-    """
-
-    def __init__(self, account_size: float):
-        self.account_size = float(account_size)
-        # Delegate to AdaptiveRiskManager for consistent limits
-        arm = AdaptiveRiskManager(account_size)
-        base = arm.get_trade_limits()
-        self.max_trades = base["max_daily_trades"]
-        self.trades_this_session = 0
-
-    def can_trade(self) -> bool:
-        return self.trades_this_session < self.max_trades
-
-    def log_trade(self):
-        self.trades_this_session += 1
-
-    def reset_session(self):
-        self.trades_this_session = 0
-
-    def __repr__(self) -> str:
-        return (
-            f"SessionManager(account=${self.account_size:.0f}, "
-            f"max={self.max_trades}, used={self.trades_this_session})"
-        )
-
-
 class AdaptiveRiskManager:
-    """Dynamic trade limits and lot sizing for Headway Cent and Standard accounts.
+    """Dynamic lot sizing for Headway Cent and Standard accounts.
+
+    Returns ``pos_per_trade`` — the number of positions to open per signal —
+    based on account balance tier.  Trade-frequency limits are removed; the
+    Daily Equity Gate (loss side) and Trailing Daily Equity Lock (profit side)
+    inside ``DailyEquityGate`` now handle all stop-trading decisions.
 
     Account tiers
     ─────────────
     ≤ $50 USD  — small account:
-        • max_daily_trades : 2  (4 for M5/M15; 2 for H1 on headway_cent)
-        • pos_per_trade    : 1  (single position per signal; 2 for M5/M15)
-        • total daily pos  : same as max_daily_trades
+        • pos_per_trade : 2  (standard accounts get 1 — margin safety on $15)
 
     > $50 USD  — growth account:
-        • max_daily_trades : 3 in Bull/Bear, 2 in Chop  (market-dependent)
-        • pos_per_trade    : 2  (dual positions per signal)
-        • total daily pos  : 4 or 6
-
-    Standard account guard
-    ──────────────────────
-    When ``broker == "standard"`` and balance < $50, ``pos_per_trade`` is
-    forced to 1 regardless of tier.  A 0.01 standard lot on XAUUSD has a
-    notional of ~$48 and a margin requirement that makes dual positions
-    unsafe on a $15 account.
+        • pos_per_trade : 3  (staged TPs across three independent positions)
     """
 
     CHOP_STATE = 2
@@ -106,7 +70,6 @@ class AdaptiveRiskManager:
         self.balance = max(float(balance), MIN_CAPITAL_USD)
         self.tf      = tf.upper()
         self.broker  = broker
-        self.daily_trades = 0
         tier = "small" if self.balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
         logger.debug(
             "AdaptiveRiskManager: balance=$%.2f tier=%s tf=%s broker=%s",
@@ -118,42 +81,21 @@ class AdaptiveRiskManager:
         return self.balance <= SMALL_ACCOUNT_THRESHOLD
 
     def get_trade_limits(self, market_state: int = None, tf: str = None) -> dict:
-        """Return trade limits for the current balance and optional HMM state.
+        """Return ``pos_per_trade`` for the current balance tier.
 
         Args:
-            market_state: Current HMM state index. If None, uses the most
-                          permissive limit for the account tier.
-            tf: Timeframe string (e.g. ``"M5"``). Defaults to ``self.tf``
-                set at construction. M5 small accounts get a higher daily
-                cap (4) to match the higher bar frequency.
+            market_state: Unused — kept for call-site compatibility.
+            tf: Timeframe string (e.g. ``"M5"``). Defaults to ``self.tf``.
 
-        Lot sizing note: pos_per_trade controls how many orders are placed per
-        signal.  Each order is individually floored to 0.01 lots in the trader
-        (``max(0.01, lot_per_pos)``), so even on a $15 account every position
-        uses minimum notional sizing — 2 positions simply gives two independent
-        entries with separate TPs for performance monitoring.
+        Returns:
+            dict with key ``pos_per_trade``.
         """
-        _tf = (tf or self.tf).upper()
         if self.is_small_account:
-            # H1 on a small cent account: cap at 2 trades per day.
-            # Allows recovery if the first setup is a minor stop-out while still
-            # preventing over-trading the slow hourly timeframe on a $15 account.
-            if _tf == "H1" and self.broker == "headway_cent":
-                return {"max_daily_trades": 2, "pos_per_trade": 1, "total_daily_pos": 2}
-            # M5/M15 small accounts: 4 daily position slots (2 signals × 2 positions).
-            # Both standard and cent use pos_per_trade=2; lot floor (0.01) in mt5_trader
-            # ensures notional stays minimal per position.
-            max_daily = 4 if _tf in ("M5", "M15") else 2
-            return {"max_daily_trades": max_daily, "pos_per_trade": 2, "total_daily_pos": max_daily}
-
-        # Growth account (>$50): 3 positions per signal for staged TPs.
-        in_chop = (market_state == self.CHOP_STATE) if market_state is not None else False
-        max_daily = 2 if in_chop else 3
-        return {
-            "max_daily_trades": max_daily,
-            "pos_per_trade": 3,
-            "total_daily_pos": max_daily * 3,
-        }
+            # Standard accounts: single position on micro-balance for margin safety
+            if self.broker == "standard":
+                return {"pos_per_trade": 1}
+            return {"pos_per_trade": 2}
+        return {"pos_per_trade": 3}
 
     def calculate_lot_size(self, stop_loss_pips: float) -> float:
         """1% risk rule for Headway cent XAUUSD.
@@ -164,7 +106,6 @@ class AdaptiveRiskManager:
             lot = (balance × 1%) / sl_price_distance
 
         Example: $15 balance, 14.27-pt SL → $0.15 / 14.27 = 0.0105 → 0.01 lot.
-        This mirrors CentConverter.calculate_lot() which is already correct.
         """
         risk_per_trade = self.balance * 0.01
         if stop_loss_pips <= 0:
@@ -172,91 +113,135 @@ class AdaptiveRiskManager:
         lot_size = risk_per_trade / stop_loss_pips
         return max(0.01, round(lot_size, 2))
 
-    def can_trade(self, market_state: int = None) -> bool:
-        limits = self.get_trade_limits(market_state, tf=self.tf)
-        return self.daily_trades < limits["max_daily_trades"]
-
-    def log_trade(self):
-        self.daily_trades += 1
-
-    def reset_daily(self):
-        self.daily_trades = 0
-
     def __repr__(self) -> str:
         tier = "small" if self.is_small_account else "growth"
         return (
             f"AdaptiveRiskManager(balance=${self.balance:.0f}, tier={tier}, "
-            f"broker={self.broker}, daily_trades={self.daily_trades})"
+            f"broker={self.broker})"
         )
 
 
 class DailyEquityGate:
     """Floating-equity safety switch for live trading.
 
-    Monitors the sum of realised balance and open floating P&L.  If that
-    running equity drops >= ``loss_pct`` below the start-of-day baseline, the
-    gate locks and remains locked until ``reset_day`` is called (UTC midnight).
+    Two-sided gate that blocks new signals when either limit is breached:
+
+    Loss side (universal):
+        If running equity (balance + open floating P&L) drops ≥ ``loss_pct``
+        below the start-of-day baseline, the loss gate locks and all open
+        positions are closed.
+
+    Profit side (Trailing Daily Equity Lock):
+        If running equity rises ≥ ``PROFIT_LOCK_PCT[tf]`` above the
+        start-of-day baseline, the profit gate locks — banking the day's gains
+        before a late-session regime shift can give them back.
+
+        Thresholds by TF:
+            M5:     20% day gain  (scalp sessions can spike fast)
+            M15:    10% day gain  (intraday sessions)
+            H1:     10% day gain  (swing sessions)
+
+    Both gates reset at UTC midnight via ``reset_day``.
 
     Usage in the live loop::
 
-        gate = DailyEquityGate()
-        gate.reset_day(account_size)   # call once at start of day
+        gate = DailyEquityGate(tf="M5")
+        gate.reset_day(live_account_balance_usd)   # call once at start of day
 
         # each poll cycle:
         current_eq = account_size + open_pnl
         if gate.check(current_eq):
-            if gate.needs_notification:
-                <close all positions + send Telegram alert>
+            if gate.needs_loss_notification:
+                <close all positions + send Telegram loss alert>
+            elif gate.needs_profit_notification:
+                <send Telegram equity-locked alert>
             continue   # skip new signals until tomorrow
     """
 
-    DAILY_LOSS_PCT = 0.05   # 5 % default loss limit
+    DAILY_LOSS_PCT = 0.05   # 5% default loss limit
 
-    def __init__(self, loss_pct: float = DAILY_LOSS_PCT):
-        self.loss_pct      = loss_pct
+    # Trailing Daily Equity Lock thresholds per timeframe
+    PROFIT_LOCK_PCT = {
+        "M5":  0.20,   # 20% — fast-moving scalp sessions
+        "M15": 0.10,   # 10% — intraday sessions
+        "H1":  0.10,   # 10% — swing sessions
+    }
+
+    def __init__(self, loss_pct: float = DAILY_LOSS_PCT, tf: str = "H1"):
+        self.loss_pct         = loss_pct
+        self.profit_lock_pct  = self.PROFIT_LOCK_PCT.get(tf.upper(), 0.10)
+        self._tf              = tf.upper()
         self._start_equity: float | None = None
-        self._locked       = False
-        self._notified     = False
+        self._loss_locked     = False
+        self._profit_locked   = False
+        self._loss_notified   = False
+        self._profit_notified = False
 
     def reset_day(self, equity: float) -> None:
         """Initialise or reset for a new UTC trading day."""
-        self._start_equity = float(equity)
-        self._locked       = False
-        self._notified     = False
-        logger.debug("DailyEquityGate reset: start_equity=%.2f  limit=%.0f%%",
-                     equity, self.loss_pct * 100)
+        self._start_equity    = float(equity)
+        self._loss_locked     = False
+        self._profit_locked   = False
+        self._loss_notified   = False
+        self._profit_notified = False
+        logger.debug(
+            "DailyEquityGate [%s] reset: start_equity=%.2f  loss=%.0f%%  profit_lock=%.0f%%",
+            self._tf, equity, self.loss_pct * 100, self.profit_lock_pct * 100,
+        )
 
     def check(self, current_equity: float) -> bool:
-        """Return True if the daily loss limit has been breached.
+        """Return True if either the loss or profit gate has been triggered.
 
         Calling this repeatedly after lock is safe — it stays True and does
-        NOT re-trigger ``needs_notification``.
+        NOT re-trigger notifications.
         """
         if self._start_equity is None or self._start_equity <= 0:
             return False
-        dd_pct = (self._start_equity - current_equity) / self._start_equity
-        if dd_pct >= self.loss_pct:
-            self._locked = True
-        return self._locked
+        change_pct = (current_equity - self._start_equity) / self._start_equity
+        if -change_pct >= self.loss_pct:
+            self._loss_locked = True
+        if change_pct >= self.profit_lock_pct:
+            self._profit_locked = True
+        return self._loss_locked or self._profit_locked
+
+    @property
+    def locked(self) -> bool:
+        """True if either gate is active."""
+        return self._loss_locked or self._profit_locked
+
+    @property
+    def loss_locked(self) -> bool:
+        return self._loss_locked
+
+    @property
+    def profit_locked(self) -> bool:
+        return self._profit_locked
 
     @property
     def needs_notification(self) -> bool:
-        """True exactly once — the first poll cycle after the lock engages.
+        """Backwards-compat alias → ``needs_loss_notification``."""
+        return self.needs_loss_notification
 
-        Designed so the caller sends a single Telegram alert without repeated
-        messages on subsequent polls.
-        """
-        if self._locked and not self._notified:
-            self._notified = True
+    @property
+    def needs_loss_notification(self) -> bool:
+        """True exactly once — the first poll cycle after the loss gate engages."""
+        if self._loss_locked and not self._loss_notified:
+            self._loss_notified = True
             return True
         return False
 
     @property
-    def locked(self) -> bool:
-        return self._locked
+    def needs_profit_notification(self) -> bool:
+        """True exactly once — the first poll cycle after the profit gate engages."""
+        if self._profit_locked and not self._profit_notified:
+            self._profit_notified = True
+            return True
+        return False
 
     def __repr__(self) -> str:
         return (
-            f"DailyEquityGate(loss_pct={self.loss_pct*100:.0f}%, "
-            f"locked={self._locked}, start=${self._start_equity or 0:.2f})"
+            f"DailyEquityGate(tf={self._tf}, loss={self.loss_pct*100:.0f}%, "
+            f"profit_lock={self.profit_lock_pct*100:.0f}%, "
+            f"loss_locked={self._loss_locked}, profit_locked={self._profit_locked}, "
+            f"start=${self._start_equity or 0:.2f})"
         )

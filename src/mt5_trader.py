@@ -848,13 +848,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         short_threshold = short_threshold_override
 
     # Session state (persists across bars within a day)
-    daily_trades  = 0
     last_bar_time = None
     current_day   = None
-    # M5 Trailing Daily Equity Lock — bank gains when day profit ≥ 20%.
-    # Ignored for H1/M15; only M5 scalps can realistically hit this threshold.
-    m5_day_open_balance = account_size   # normalised USD balance at day open
-    m5_equity_locked    = False          # True once day gain ≥ 20%
     # Tracks the tickets and entry context of the most recently placed signal
     # so the break-even SL logic can fire when TP1 closes position 1.
     signal_tracker = {"tickets": [], "entry_price": 0.0,
@@ -865,8 +860,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     atr_state_tracker: dict = {}
     # Deprecated peak-pnl tracker kept for cleanup compat (atr_state_tracker supersedes it)
     peak_pnl_tracker: dict = {}
-    # Daily floating-equity safety switch: suspends trading if account drops 5%
-    equity_gate = DailyEquityGate()
+    # Two-sided equity gate: loss side (5%) + Trailing Daily Equity Lock (profit side)
+    equity_gate = DailyEquityGate(tf=tf)
     equity_gate.reset_day(account_size)
 
     arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
@@ -910,23 +905,15 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             # ── 1. Daily reset at UTC midnight ────────────────────────────
             today = datetime.now(timezone.utc).date()
             if today != current_day:
-                daily_trades = 0
                 current_day  = today
-                equity_gate.reset_day(account_size)
-                # M5 equity lock resets at day-open; snapshot live balance
-                # so the 20% threshold is anchored to today's starting equity.
-                if tf.upper() == "M5":
-                    try:
-                        _raw_open = mt5.account_info().balance
-                        m5_day_open_balance = _normalise_balance(_raw_open, broker)
-                    except Exception:
-                        m5_day_open_balance = account_size
-                    m5_equity_locked = False
-                    logger.info(
-                        "M5 equity lock reset — day-open balance: $%.4f USD.",
-                        m5_day_open_balance,
-                    )
-                logger.info("New UTC day %s — session counter and equity gate reset.", today)
+                # Snapshot live balance as the day-open anchor for both the loss
+                # gate (5%) and the Trailing Daily Equity Lock (profit side).
+                try:
+                    _day_open_bal = _normalise_balance(mt5.account_info().balance, broker)
+                except Exception:
+                    _day_open_bal = account_size
+                equity_gate.reset_day(_day_open_bal)
+                logger.info("New UTC day %s — equity gate reset (day-open $%.4f USD).", today, _day_open_bal)
 
             # ── 2. Bar-change detection ───────────────────────────────────
             bars = mt5.copy_rates_from_pos(DEFAULT_SYMBOL, tf_mt5, 1, 1)
@@ -961,7 +948,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     if p.magic == MAGIC_NUMBER
                 ) / _pnl_divisor
                 if equity_gate.check(account_size + _open_pnl):
-                    if equity_gate.needs_notification:
+                    if equity_gate.needs_loss_notification:
                         _loss_usd = -_open_pnl
                         logger.warning(
                             "Daily loss limit hit: equity=%.2f  loss=%.2f  "
@@ -978,6 +965,20 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                                 f"🚨 UNIVERSAL SAFETY TRIGGERED [{tf}]: "
                                 f"Daily loss limit hit (${_loss_usd:.2f}). "
                                 "Bot locked for recovery."
+                            )
+                        except Exception:
+                            pass
+                    elif equity_gate.needs_profit_notification:
+                        logger.info(
+                            "Trailing Daily Equity Lock engaged [%s]: day gain ≥%.0f%% — "
+                            "profits banked, no new signals until UTC midnight.",
+                            tf, equity_gate.profit_lock_pct * 100,
+                        )
+                        try:
+                            send_telegram_msg(
+                                f"🔒 <b>Equity Lock [{tf} / {broker}]</b>\n"
+                                f"Day gain ≥ <b>{equity_gate.profit_lock_pct*100:.0f}%</b> — profits banked.\n"
+                                f"No new signals until midnight UTC."
                             )
                         except Exception:
                             pass
@@ -1050,35 +1051,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             except Exception:
                 telemetry = {}
 
-            arm              = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
-            arm.daily_trades = daily_trades   # restore session count
-
-            # ── M5 Trailing Daily Equity Lock check ───────────────────────
-            # Activate once and stay locked until midnight reset.
-            # Uses the live MT5 balance so realised + floating profits count.
-            if tf.upper() == "M5" and not m5_equity_locked:
-                try:
-                    _raw_live     = telemetry.get(
-                        "balance",
-                        m5_day_open_balance * (CENT_MULTIPLIER if broker == "headway_cent" else 1.0),
-                    )
-                    _live_bal     = _normalise_balance(_raw_live, broker)
-                    _day_gain_pct = (_live_bal - m5_day_open_balance) / m5_day_open_balance \
-                                    if m5_day_open_balance > 0 else 0.0
-                    if _day_gain_pct >= 0.20:
-                        m5_equity_locked = True
-                        logger.info(
-                            "M5 Equity Lock activated: day gain +%.1f%% ($%.4f → $%.4f USD). "
-                            "No new signals until UTC midnight.",
-                            _day_gain_pct * 100, m5_day_open_balance, _live_bal,
-                        )
-                        send_telegram_msg(
-                            f"🔒 <b>M5 Equity Lock [{broker}]</b>\n"
-                            f"Day gain: <b>+{_day_gain_pct*100:.1f}%</b> — profits banked.\n"
-                            f"No new signals until midnight UTC."
-                        )
-                except Exception as _exc:
-                    logger.debug("M5 equity lock check failed: %s", _exc)
+            arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
 
             # ── 4. Compute live features + probability ────────────────────
             features_df, hmm_state, atr_price = compute_live_features(
@@ -1103,19 +1076,17 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 continue
 
             # ── 5. Log bar info on every new bar (always visible) ─────────
-            bar_str          = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            state_lbl        = {0: "Bull", 1: "Bear", 2: "Chop"}.get(hmm_state, str(hmm_state))
-            max_trades_today = arm.get_trade_limits(hmm_state)["max_daily_trades"]
+            bar_str   = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")
+            state_lbl = {0: "Bull", 1: "Bear", 2: "Chop"}.get(hmm_state, str(hmm_state))
             logger.info(
-                "Bar %s | state=%s | prob=%.3f | trades=%d/%d",
-                bar_str, hmm_state, prob,
-                arm.daily_trades, max_trades_today,
+                "Bar %s | state=%s | prob=%.3f | Efficiency=%.1fx",
+                bar_str, hmm_state, prob, _er,
             )
             send_telegram_msg(
                 f"📊 <b>Bar</b> {bar_str} [{tf}]\n"
                 f"Regime: <b>{state_lbl}</b> ({hmm_state})  |  "
-                f"Prob: <b>{prob:.3f}</b>\n"
-                f"Trades today: <b>{arm.daily_trades}/{max_trades_today}</b>"
+                f"Prob: <b>{prob:.3f}</b>  |  "
+                f"Efficiency: <b>{_er:.1f}x</b>"
             )
 
             # ── 6. Position management (always runs — P&L, break-even, chop-exit)
@@ -1146,25 +1117,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     active = []
                 signal_tracker["tickets"] = active
 
-            # ── 7. Session limit check ────────────────────────────────────
-            if not arm.can_trade(hmm_state):
-                logger.info(
-                    "Session limit reached (state=%d  daily=%d/%d). Skipping bar.",
-                    hmm_state, arm.daily_trades,
-                    arm.get_trade_limits(hmm_state)["max_daily_trades"],
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 7b. M5 Trailing Daily Equity Lock ────────────────────────
-            if m5_equity_locked:
-                logger.info(
-                    "M5 equity lock active (day gain ≥20%%) — no new signals until midnight."
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 8. Skip new signals if a position is still open ──────────
+            # ── 7. Skip new signals if a position is still open ──────────
             if has_open_position(DEFAULT_SYMBOL, MAGIC_NUMBER):
                 logger.info(
                     "Open position — holding (prob=%.3f  state=%s).",
@@ -1285,8 +1238,6 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 )
                 if result["success"]:
                     signal_tracker["tickets"].append(result["order"])
-                    daily_trades += 1
-                    arm.log_trade()
                 else:
                     logger.error(
                         "Order %d/%d failed — retcode=%d  %s",

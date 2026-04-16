@@ -105,61 +105,6 @@ def compute_position_sizes(
     return sizes
 
 
-def apply_session_limits(
-    signals: np.ndarray,
-    dates,
-    account_size: float = 15.0,
-    hmm_states: np.ndarray = None,
-    tf: str = "H1",
-    broker: str = "standard",
-) -> np.ndarray:
-    """Cap signals to the adaptive daily limit based on account size, HMM state and TF.
-
-    Counts both BUY (+1) and SELL (-1) signals toward the daily cap.
-
-    For growth accounts (> $50), the limit is market-state-dependent:
-    - Bull / Bear: 3 signals/day
-    - Chop: 2 signals/day
-
-    M5 small accounts get a higher cap (4/day) to match the 288-bar/day
-    frequency and allow the optimizer to generate enough OOS trades.
-
-    Uses the majority HMM state within each calendar day to decide the cap.
-    """
-    arm = AdaptiveRiskManager(account_size, broker=broker)
-    result = signals.copy()
-    day_labels = pd.DatetimeIndex(dates).normalize().values
-
-    unique_days, day_starts = np.unique(day_labels, return_index=True)
-    day_ends = np.append(day_starts[1:], len(signals))
-
-    for start, end in zip(day_starts, day_ends):
-        # Market-state-aware limit for growth accounts
-        if hmm_states is not None and not arm.is_small_account:
-            day_states = hmm_states[start:end].astype(int)
-            day_mode = int(np.bincount(day_states).argmax())
-            limits = arm.get_trade_limits(day_mode, tf=tf)
-        else:
-            limits = arm.get_trade_limits(tf=tf)
-
-        max_daily = limits["max_daily_trades"]
-        seg = result[start:end]
-        # Count BUY (+1) and SELL (-1) trades together toward the daily cap
-        trade_indices = np.where(np.abs(seg) == 1)[0]
-        if len(trade_indices) > max_daily:
-            seg[trade_indices[max_daily:]] = 0
-        result[start:end] = seg
-
-    original = int(np.sum(np.abs(signals)))
-    limited  = int(np.sum(np.abs(result)))
-    if original != limited:
-        logger.debug(
-            "Session limit (acct=$%.0f): %d -> %d trades",
-            account_size, original, limited,
-        )
-    return result
-
-
 def compute_trade_costs(signals: np.ndarray, broker: str = "standard") -> np.ndarray:
     """Apply spread + commission only at position transitions (entry / exit / reversal).
 
