@@ -21,7 +21,7 @@ from src.engine_xgb import (
     export_onnx, save_xgb, load_xgb, ONNX_PATH, FEATURE_COLS,
     train_xgb_ensemble, get_predictions_ensemble,
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
-    get_ensemble_path,
+    get_ensemble_path, TF_TRAIN_RATIO,
 )
 from src.optimizer import run_optimization, get_best_params, _score_result as _calc_score
 from src.backtester import vectorized_backtest
@@ -101,10 +101,12 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
     model_hmm, states, state_map = fit_hmm(
         df, n_states=params.get("n_states", TF_CONFIG[tf].get("n_states_default", 3))
     )
-    X, y, df_aligned, feature_scaler = prepare_features(df, states)
+    X, y, df_aligned, feature_scaler = prepare_features(df, states, tf=tf)
     save_feature_scaler(feature_scaler, tf=tf, broker=broker)
+    _train_ratio = TF_TRAIN_RATIO.get(tf.upper(), 0.70)
     models_ensemble, thresholds, metrics = train_xgb_ensemble(
         X, y,
+        train_ratio=_train_ratio,
         max_depth=params.get("max_depth", 4),
         learning_rate=params.get("learning_rate", 0.1),
         n_estimators=params.get("n_estimators", 200),
@@ -227,9 +229,11 @@ def cmd_wfa(args):
         )
         sys.exit(1)
 
-    X, y, df_aligned, _scaler = prepare_features(df, states)
+    X, y, df_aligned, _scaler = prepare_features(df, states, tf=tf)
+    _train_ratio = TF_TRAIN_RATIO.get(tf.upper(), 0.70)
     models_e, thresholds_e, metrics_e = train_xgb_ensemble(
         X, y,
+        train_ratio      = _train_ratio,
         max_depth        = params.get("max_depth", 4),
         learning_rate    = params.get("learning_rate", 0.1),
         n_estimators     = params.get("n_estimators", 200),
@@ -661,7 +665,7 @@ def cmd_report(args):
     except FileNotFoundError:
         _feat_scaler = None   # old model without scaler — prepare_features fits fresh
 
-    X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler)
+    X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
 
     _xgb_path = get_ensemble_path(tf, broker)
     if not _xgb_path.exists():

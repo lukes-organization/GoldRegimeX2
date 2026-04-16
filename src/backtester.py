@@ -304,11 +304,11 @@ def vectorized_backtest(
         short_threshold=short_threshold,   # None → symmetric default inside
     )
 
-    # Spread efficiency filter: suppress signals where ATR / spread < 1.8.
-    # Both atr_norm and spread_frac are expressed as fractions of price so
-    # the ratio is scale-free and consistent across all timeframes.
+    # Spread-Aware Adaptive Filter: suppress signals where ATR / spread < 1.25.
+    # Threshold lowered from 1.8 → 1.25 to allow standard market conditions
+    # while still blocking dead sessions where spread consumes >80% of the move.
     _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
-    _er_mask     = (atr_norm / _spread_frac) >= 1.8
+    _er_mask     = (atr_norm / _spread_frac) >= 1.25
     signals = np.where(_er_mask, raw_signals, 0)
 
     # Determine pos_per_trade from the adaptive risk manager

@@ -200,7 +200,7 @@ def run_validation(
             tf, broker,
         )
         _feat_scaler = None
-    X, _, df_aligned, _   = prepare_features(df, states, feature_scaler=_feat_scaler)
+    X, _, df_aligned, _   = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
     states_aligned        = states[df.index.isin(df_aligned.index)]
     _, probabilities      = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
 

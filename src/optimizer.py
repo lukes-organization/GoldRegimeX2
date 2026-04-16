@@ -135,7 +135,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # H1/M15: wide range (0.50–0.85). Signal locking in the backtester ensures
         # trades are counted per entry (not per active bar), so the Recovery Factor
         # Threshold ranges are TF-specific to match each timeframe's edge profile.
-        # The efficiency ratio filter (ATR/spread ≥ 1.8) handles low-conviction
+        # The spread-aware adaptive filter (ATR/spread ≥ 1.25) handles low-conviction
         # bars at the backtest level, so these ranges reflect natural bar confidence.
         # short_threshold is symmetric: short = 1 - prob (≈ same conviction for SELL).
         if tf.upper() == "M5":
@@ -143,9 +143,9 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.70)
             short_threshold = trial.suggest_float("short_threshold", 0.28, 0.48)
         elif tf.upper() == "H1":
-            # Swing: higher conviction required per hourly bar
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.58, 0.78)
-            short_threshold = trial.suggest_float("short_threshold", 0.22, 0.42)
+            # Swing: wider range gives Optuna room to find active-participation solutions
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.72)
+            short_threshold = trial.suggest_float("short_threshold", 0.28, 0.45)
         else:
             # M15 — intermediate between M5 scalp and H1 swing
             prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.75)
@@ -190,13 +190,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
             # ── HMM quality gate ─────────────────────────────────────────────
             # Reject trials where any state has low self-transition probability.
-            # Persistence < 0.80 means the state flips nearly every bar (e.g.
+            # Persistence < 0.72 means the state flips very frequently (e.g.
             # Bull↔Chop oscillating with identical means, 49K+ transitions).
-            # Those labels are noise and will corrupt backtester P&L.
+            # Threshold relaxed from 0.80 → 0.72 to allow more active regime
+            # detection while still blocking the most degenerate configurations.
             _min_persist = min(_hmm.transmat_[i, i] for i in range(n_states))
-            if _min_persist < 0.80:
+            if _min_persist < 0.72:
                 logger.warning(
-                    "Trial %d: degenerate HMM (min state persistence=%.4f < 0.80) "
+                    "Trial %d: degenerate HMM (min state persistence=%.4f < 0.72) "
                     "— penalising.",
                     trial.number, _min_persist,
                 )
@@ -218,9 +219,11 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 )
                 return -100.0
 
-            X, y, df_aligned, _    = prepare_features(df, states)
+            X, y, df_aligned, _    = prepare_features(df, states, tf=tf)
+            _train_ratio = {"H1": 0.70, "M15": 0.65, "M5": 0.65}.get(tf.upper(), 0.70)
             models, thresholds, metrics = train_xgb_ensemble(
                 X, y,
+                train_ratio=_train_ratio,
                 max_depth=max_depth,
                 learning_rate=learning_rate,
                 n_estimators=n_estimators,

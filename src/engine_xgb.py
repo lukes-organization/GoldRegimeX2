@@ -39,6 +39,12 @@ DXY_FEATURE     = USDCHF_FEATURE   # legacy alias — kept so old imports don't 
 # Volatility bucket labels (ATR tertiles: low / med / high)
 VOL_BUCKETS = ["low", "med", "high"]
 
+# Timeframe-specific IS/OOS split ratios.
+# H1 has a smaller dataset (~125K bars but 21 years of hourly data) — 70/30 gives
+# a more realistic OOS window without starving the scaler fit.
+# M15/M5 have larger bar counts per year so a wider OOS window (35%) is feasible.
+TF_TRAIN_RATIO = {"H1": 0.70, "M15": 0.65, "M5": 0.65}
+
 
 def get_feature_cols(df: pd.DataFrame) -> list[str]:
     """Return the feature column list for this DataFrame.
@@ -59,18 +65,19 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     return cols
 
 
-def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=None):
+def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=None, tf: str = "H1"):
     """Build the XGBoost feature matrix from a featurised DataFrame.
 
     Continuous features (RSI slope, ATR, returns) are scaled to zero-mean /
-    unit-variance using a StandardScaler fitted on the IS portion (80%) of the
-    data so the model always sees a normalised distribution regardless of
-    absolute price levels.
+    unit-variance using a StandardScaler fitted on the IS portion of the data
+    so the model always sees a normalised distribution regardless of absolute
+    price levels.  The IS fraction is TF-specific (see TF_TRAIN_RATIO).
 
     Args:
         df:             Featurised DataFrame from process_pipeline / _apply_features.
         hmm_states:     HMM state array aligned with df.
         feature_scaler: Pre-fitted StandardScaler to reuse (inference / validation).
+        tf:             Timeframe string — drives the IS split ratio for scaler fitting.
                         When None a new scaler is fitted on IS data (training mode).
 
     Returns:
@@ -95,9 +102,11 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
     # Scale continuous features so XGBoost sees the 10-year mean/std distribution
     cont_cols = [c for c in _CONTINUOUS_COLS if c in X.columns]
     if feature_scaler is None:
-        # Training: fit only on IS portion to prevent future-data leakage
+        # Training: fit only on IS portion to prevent future-data leakage.
+        # Split ratio is TF-specific — H1: 70%, M15/M5: 65%.
         scaler = StandardScaler()
-        split_idx = int(len(X) * 0.8)
+        split_ratio = TF_TRAIN_RATIO.get(tf.upper(), 0.70)
+        split_idx = int(len(X) * split_ratio)
         scaler.fit(X.iloc[:split_idx][cont_cols])
     else:
         scaler = feature_scaler
