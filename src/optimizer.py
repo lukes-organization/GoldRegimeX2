@@ -22,7 +22,7 @@ import optuna
 from src.processor import process_pipeline
 from src.engine_hmm import fit_hmm
 from src.engine_xgb import prepare_features, train_xgb_ensemble, get_predictions_ensemble
-from src.backtester import vectorized_backtest
+from src.backtester import vectorized_backtest, format_payout
 from src.risk_manager import SMALL_ACCOUNT_THRESHOLD
 from src.logger import setup_logger
 
@@ -290,17 +290,26 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             else:
                 score = _score_result(result, tier, broker, tf)
 
+            _oos_payoff  = result.get("oos_expected_payoff", result.get("expected_payoff", 0.0))
+            _oos_payout  = format_payout(
+                result.get("oos_total_return", result.get("total_return", 0.0)),
+                balance, broker,
+            )
+            _oos_eff     = result.get("oos_avg_efficiency", result.get("avg_efficiency", 0.0))
             logger.info(
-                "Trial %d [%s/%s tier=%s $%.0f]: score=%.3f  "
-                "OOS_RF=%.3f  OOS_PF=%.3f  OOS_Payoff=$%.4f  OOS_FloatDD=%.1f%%  trades=%d",
-                trial.number, tf, broker, tier, balance,
+                "Trial %d [%s/%s $%.0f]: score=%.3f  "
+                "RF=%.2f  PF=%.2f  Payoff=$%.4f  Eff=%.2fx  FloatDD=%.1f%%  "
+                "trades=%d  payout=%s",
+                trial.number, tf, broker, balance,
                 score,
                 result.get("oos_recovery_factor", result.get("recovery_factor", 0)),
                 result.get("oos_profit_factor",   result.get("profit_factor", 1.0)),
-                result.get("oos_expected_payoff", result.get("expected_payoff", 0.0)) * balance,
+                _oos_payoff * balance,
+                _oos_eff,
                 result.get("oos_floating_max_drawdown",
                            result.get("oos_max_drawdown", result["max_drawdown"])) * 100,
                 result.get("oos_n_trades", result["n_trades"]),
+                _oos_payout,
             )
             return score
 

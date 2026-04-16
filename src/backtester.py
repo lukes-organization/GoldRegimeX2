@@ -19,6 +19,48 @@ BEAR_STATE     = 1     # HMM Bear regime
 CHOP_STATE     = 2     # HMM Chop regime (no signals)
 
 
+def format_payout(total_return: float, account_size: float, broker: str) -> str:
+    """Format net payout in broker-appropriate currency units.
+
+    Headway cent accounts show Cents (×100) alongside the USD equivalent so
+    the $15 account balance is legible as 1,500 Cents.
+    Standard accounts show USD only.
+    """
+    net_usd = total_return * account_size
+    if broker == "headway_cent":
+        return f"{net_usd * 100:.2f} Cents ({net_usd:.4f} USD)"
+    return f"${net_usd:.4f} USD"
+
+
+def _compute_audit_metrics(
+    signals: np.ndarray,
+    atr_norm: np.ndarray,
+    spread_frac: float,
+    gross_returns: np.ndarray,
+    costs: np.ndarray,
+    total_return: float,
+    account_size: float,
+) -> dict:
+    """Broker-cost and efficiency audit metrics for a given array slice.
+
+    avg_efficiency  — mean ATR/spread on active-trade bars; >1.25 means the
+                      model is trading when moves cover the bid/ask.
+    cost_efficiency — fraction of gross profit retained after broker costs;
+                      <0.50 signals the broker is taking >50% of the edge.
+    total_net_payout — absolute dollar profit (total_return × account_size).
+    """
+    active      = signals != 0
+    avg_eff     = float(np.mean(atr_norm[active] / spread_frac)) if active.any() else 0.0
+    gross_pos   = float(np.sum(gross_returns[gross_returns > 0]))
+    total_costs = float(np.sum(np.abs(costs)))
+    cost_eff    = 1.0 - (total_costs / gross_pos) if gross_pos > 0 else 0.0
+    return {
+        "avg_efficiency":   avg_eff,
+        "cost_efficiency":  cost_eff,
+        "total_net_payout": total_return * account_size,
+    }
+
+
 def compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD,
                     short_threshold=None):
     """Generate directional signals: 1=BUY, -1=SELL, 0=no trade.
@@ -328,6 +370,10 @@ def vectorized_backtest(
     result["floating_max_drawdown"] = _compute_floating_drawdown(
         df, signals, sizes, strategy_returns
     )
+    result.update(_compute_audit_metrics(
+        signals, atr_norm, _spread_frac, gross_returns, costs,
+        result["total_return"], account_size,
+    ))
     result.update({
         "account_size":  account_size,
         "broker":        broker,
@@ -345,18 +391,31 @@ def vectorized_backtest(
         oos_m["floating_max_drawdown"] = _compute_floating_drawdown(
             df.iloc[split_idx:], signals[split_idx:], sizes[split_idx:], strategy_returns[split_idx:],
         )
+        # Audit metrics per slice
+        is_m.update(_compute_audit_metrics(
+            signals[:split_idx], atr_norm[:split_idx], _spread_frac,
+            gross_returns[:split_idx], costs[:split_idx],
+            is_m["total_return"], account_size,
+        ))
+        oos_m.update(_compute_audit_metrics(
+            signals[split_idx:], atr_norm[split_idx:], _spread_frac,
+            gross_returns[split_idx:], costs[split_idx:],
+            oos_m["total_return"], account_size,
+        ))
         result["split_idx"] = split_idx
         for k, v in is_m.items():
             result[f"is_{k}"] = v
         for k, v in oos_m.items():
             result[f"oos_{k}"] = v
         logger.info(
-            "Backtest IS  [%s]: Sharpe=%.3f | FloatDD=%.4f | WinRate=%.3f | Trades=%d",
-            tf, is_m["sharpe_ratio"], is_m["floating_max_drawdown"], is_m["win_rate"], is_m["n_trades"],
+            "Backtest IS  [%s]: Sharpe=%.3f | FloatDD=%.4f | WR=%.3f | Trades=%d | Eff=%.2fx | CostEff=%.1f%%",
+            tf, is_m["sharpe_ratio"], is_m["floating_max_drawdown"], is_m["win_rate"],
+            is_m["n_trades"], is_m["avg_efficiency"], is_m["cost_efficiency"] * 100,
         )
         logger.info(
-            "Backtest OOS [%s]: Sharpe=%.3f | FloatDD=%.4f | WinRate=%.3f | Trades=%d",
-            tf, oos_m["sharpe_ratio"], oos_m["floating_max_drawdown"], oos_m["win_rate"], oos_m["n_trades"],
+            "Backtest OOS [%s]: Sharpe=%.3f | FloatDD=%.4f | WR=%.3f | Trades=%d | Eff=%.2fx | CostEff=%.1f%%",
+            tf, oos_m["sharpe_ratio"], oos_m["floating_max_drawdown"], oos_m["win_rate"],
+            oos_m["n_trades"], oos_m["avg_efficiency"], oos_m["cost_efficiency"] * 100,
         )
     else:
         logger.info(

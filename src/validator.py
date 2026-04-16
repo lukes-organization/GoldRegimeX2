@@ -222,6 +222,9 @@ def run_validation(
     pf       = result.get("profit_factor", 1.0)
     payoff   = result.get("expected_payoff", 0.0)
     rf       = result.get("recovery_factor", 0.0)
+    avg_eff  = result.get("avg_efficiency", 0.0)
+    cost_eff = result.get("cost_efficiency", 0.0)
+    total_return = result.get("total_return", 0.0)
 
     # Complex Criterion score — same formula as optimizer._score_result
     _fdd = max_dd if max_dd > 0 else 0.0
@@ -273,8 +276,8 @@ def run_validation(
         )
 
     logger.info(
-        "Validation [%s]: status=%s  score=%.2f  sharpe=%.3f  pf=%.2f  trades=%d  wr=%.1f%%  dd=%.1f%%",
-        tf, status, score, sharpe, pf, n_trades, win_rate * 100, max_dd * 100,
+        "Validation [%s]: status=%s  score=%.2f  sharpe=%.3f  pf=%.2f  eff=%.2fx  trades=%d  wr=%.1f%%  dd=%.1f%%",
+        tf, status, score, sharpe, pf, avg_eff, n_trades, win_rate * 100, max_dd * 100,
     )
     if status in ("warn", "fail"):
         logger.warning("VALIDATION %s: %s", status.upper(), message)
@@ -287,6 +290,9 @@ def run_validation(
         "profit_factor":    pf,
         "expected_payoff":  payoff,
         "recovery_factor":  rf,
+        "avg_efficiency":   avg_eff,
+        "cost_efficiency":  cost_eff,
+        "total_return":     total_return,
         "score":            score,
         "status":           status,
         "message":          message,

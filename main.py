@@ -24,7 +24,7 @@ from src.engine_xgb import (
     get_ensemble_path, TF_TRAIN_RATIO,
 )
 from src.optimizer import run_optimization, get_best_params, _score_result as _calc_score
-from src.backtester import vectorized_backtest
+from src.backtester import vectorized_backtest, format_payout
 from src.visualizer import generate_full_report
 from src.risk_manager import AdaptiveRiskManager
 
@@ -307,8 +307,10 @@ def cmd_wfa(args):
                     flag = f"⚠️ ({fold_score:.2f})"
                 else:
                     flag = f"❌ ({fold_score:.2f})"
-            oos_pf = w.get("oos_profit_factor", 1.0)
-            print(f"    {period}  OOS={oos_s:+.3f}  PF={oos_pf:.2f}  trades={oos_t}  {flag}")
+            oos_pf  = w.get("oos_profit_factor", 1.0)
+            oos_eff = w.get("oos_avg_efficiency", 0.0)
+            eff_str = f"{oos_eff:.2f}x" if oos_t >= 3 else "  —  "
+            print(f"    {period}  OOS={oos_s:+.3f}  PF={oos_pf:.2f}  Eff={eff_str}  trades={oos_t}  {flag}")
 
     send_telegram_msg(
         f"📊 <b>Walk-Forward Analysis [{tf}]</b>\n"
@@ -412,15 +414,25 @@ def cmd_train(args):
                 "sharpe_ratio":          r.get(f"{prefix}sharpe_ratio", 0.0),
                 "profit_factor":         r.get(f"{prefix}profit_factor", 1.0),
             }
-            score  = _calc_score(r_dict)
-            rf     = r.get(f"{prefix}recovery_factor", 0.0)
-            pf     = r.get(f"{prefix}profit_factor", 1.0)
-            payoff = r.get(f"{prefix}expected_payoff", 0.0) * balance
+            score   = _calc_score(r_dict)
+            rf      = r.get(f"{prefix}recovery_factor", 0.0)
+            pf      = r.get(f"{prefix}profit_factor", 1.0)
+            payoff  = r.get(f"{prefix}expected_payoff", 0.0) * balance
+            eff     = r.get(f"{prefix}avg_efficiency", 0.0)
+            cost_e  = r.get(f"{prefix}cost_efficiency", 0.0)
+            payout_str = format_payout(r.get(f"{prefix}total_return", 0.0), balance, broker)
             print(
                 f"  [{tf} {label}] Score: {score:.2f} | RF: {rf:.2f} | PF: {pf:.2f}"
                 f" | Payoff: ${payoff:.4f} | MaxDD: {fdd*100:.1f}% (Floating)"
                 f" | WR: {r.get(f'{prefix}win_rate', 0.0)*100:.1f}% | Trades: {r.get(f'{prefix}n_trades', 0)}"
             )
+            print(
+                f"  [{tf} {label}] Efficiency: {eff:.2f}x ATR/Spread"
+                f" | CostEff: {cost_e*100:.1f}%"
+                f" | Total Payout: {payout_str}"
+            )
+            if cost_e < 0.50:
+                print(f"  ⚠️  WARNING: Broker is consuming >{(1-cost_e)*100:.0f}% of gross profit via spread/commission.")
         print(f"\n--- In-Sample ---")
         _fmt_block("IS",  result, "is_")
         print(f"--- Out-of-Sample ---")
@@ -556,7 +568,10 @@ def cmd_sync_validate(args):
         sys.exit(1)
 
     print(f"\n=== Validation Result [{tf}] ===")
-    _fdd = result.get("max_dd", 0.0)
+    _fdd     = result.get("max_dd", 0.0)
+    _eff     = result.get("avg_efficiency", 0.0)
+    _cost_e  = result.get("cost_efficiency", 0.0)
+    _payout  = format_payout(result.get("total_return", 0.0), balance, args.broker)
     print(
         f"  [{tf} LIVE] Score: {result.get('score', 0.0):.2f}"
         f" | RF: {result.get('recovery_factor', 0.0):.2f}"
@@ -564,6 +579,15 @@ def cmd_sync_validate(args):
         f" | Payoff: ${result.get('expected_payoff', 0.0)*balance:.4f}"
         f" | MaxDD: {_fdd*100:.1f}% (Floating)"
     )
+    print(
+        f"  Efficiency: {_eff:.2f}x ATR/Spread"
+        f" | CostEff: {_cost_e*100:.1f}%"
+        f" | Total Payout: {_payout}"
+    )
+    if _eff < 1.2:
+        print("  ⚠️  WARNING: Low Market Efficiency — Spread is eating your edge.")
+    if _cost_e < 0.50:
+        print(f"  ⚠️  WARNING: Broker is consuming >{(1-_cost_e)*100:.0f}% of gross profit.")
     print(f"  Sharpe: {result['sharpe']:.3f} | Trades: {result['n_trades']} | WR: {result['win_rate']*100:.1f}%")
     print(f"  Status: {result['status'].upper()}")
     print(f"  {result['message']}")
