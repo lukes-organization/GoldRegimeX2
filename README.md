@@ -293,8 +293,16 @@ Applies Kalman filter, computes log returns, RSI, ATR, GMM volatility cluster, a
 ### Step 2 — Optimize hyperparameters
 
 ```bash
-python main.py --mode optimize --trials 300 --broker headway_cent --balance 15 --tf H1
+python main.py --mode optimize --trials 400 --broker headway_cent --balance 15 --tf H1
 ```
+
+**Recommended trial counts** (higher-frequency TFs require more trials to find stable configs):
+
+| TF | Recommended `--trials` | Reason |
+|----|----------------------|--------|
+| H1 | **400** | Fewer bars/day — search space converges faster |
+| M15 | **600** | More signal opportunities; wider threshold search space |
+| M5 | **1000** | Largest search space; regime noise requires more exploration |
 
 Runs an Optuna study that searches across:
 - Kalman filter parameters (`obs_cov`, `trans_cov`)
@@ -476,7 +484,7 @@ python main.py --mode <MODE> [OPTIONS]
 | `--tf` | `H1` | Timeframe: `H1`, `M15`, `M5` (or comma-separated for compare/guardian) |
 | `--broker` | `standard` | Broker profile: `headway_cent` or `standard` |
 | `--balance` | `15` | Account size in **real USD** — used for lot sizing and risk tier |
-| `--trials` | `250` | Total target Optuna trials (optimize mode) |
+| `--trials` | — | Total target Optuna trials. Recommended: **M5=1000**, **M15=600**, **H1=400** |
 | `--period` | `3m` | Lookback period for sync/validate: `3m`, `6m`, `12m` |
 | `--interval` | `3600` | Guardian check interval in seconds |
 | `--prob_threshold` | (from Optuna) | Override BUY probability threshold for live |
@@ -690,7 +698,7 @@ Each signal opens `pos_per_trade` independent positions with separate TPs. The d
 **H1 — Headway Cent:**
 ```bash
 python main.py --mode process       --tf H1
-python main.py --mode optimize      --tf H1 --broker headway_cent --balance 15 --trials 300
+python main.py --mode optimize      --tf H1 --broker headway_cent --balance 15 --trials 400
 python main.py --mode train         --tf H1 --broker headway_cent --balance 15
 python main.py --mode report        --tf H1 --broker headway_cent --balance 15
 python main.py --mode export        --tf H1 --broker headway_cent
@@ -702,7 +710,7 @@ python main.py --mode live          --tf H1 --broker headway_cent --balance 15
 **M15 — Headway Cent:**
 ```bash
 python main.py --mode process       --tf M15
-python main.py --mode optimize      --tf M15 --broker headway_cent --balance 15 --trials 300
+python main.py --mode optimize      --tf M15 --broker headway_cent --balance 15 --trials 600
 python main.py --mode train         --tf M15 --broker headway_cent --balance 15
 python main.py --mode report        --tf M15 --broker headway_cent --balance 15
 python main.py --mode sync_validate --tf M15 --broker headway_cent --balance 15 --period 3m
@@ -713,7 +721,7 @@ python main.py --mode live          --tf M15 --broker headway_cent --balance 15
 **M5 — Headway Cent:**
 ```bash
 python main.py --mode process       --tf M5
-python main.py --mode optimize      --tf M5 --broker headway_cent --balance 15 --trials 300
+python main.py --mode optimize      --tf M5 --broker headway_cent --balance 15 --trials 1000
 python main.py --mode train         --tf M5 --broker headway_cent --balance 15
 python main.py --mode report        --tf M5 --broker headway_cent --balance 15
 python main.py --mode sync_validate --tf M5 --broker headway_cent --balance 15 --period 3m
@@ -724,7 +732,7 @@ python main.py --mode live          --tf M5 --broker headway_cent --balance 15
 **M5 — Standard account:**
 ```bash
 python main.py --mode process       --tf M5
-python main.py --mode optimize      --tf M5 --broker standard --balance 15 --trials 300
+python main.py --mode optimize      --tf M5 --broker standard --balance 15 --trials 1000
 python main.py --mode train         --tf M5 --broker standard --balance 15
 python main.py --mode sync_validate --tf M5 --broker standard --balance 15 --period 3m
 python main.py --mode demo          --tf M5 --broker standard --balance 15
@@ -861,9 +869,9 @@ Open multiple terminals and run the same optimize command in each — they share
 
 ```bash
 # Terminal 1
-python main.py --mode optimize --tf M5 --broker headway_cent --trials 500 --balance 15
+python main.py --mode optimize --tf M5 --broker headway_cent --trials 1000 --balance 15
 # Terminal 2 (same command)
-python main.py --mode optimize --tf M5 --broker headway_cent --trials 500 --balance 15
+python main.py --mode optimize --tf M5 --broker headway_cent --trials 1000 --balance 15
 ```
 
 Each terminal runs an independent Optuna worker. This is more reliable than `--n_jobs` for CPU-bound HMM+XGBoost objectives.
@@ -970,7 +978,7 @@ When staleness is detected:
 ```
 ⚠️ Market Drift/Staleness detected. Pausing trade loop — [M5] model is 18 days old (limit: 14 days).
 Re-optimise before going live:
-  python main.py --mode optimize --tf M5 --broker headway_cent --trials 500
+  python main.py --mode optimize --tf M5 --broker headway_cent --trials 1000
   python main.py --mode train    --tf M5 --broker headway_cent
 ```
 
@@ -988,12 +996,12 @@ python main.py --mode sync_validate --tf M5 --period 3m --broker headway_cent --
 python main.py --mode wfa           --tf M5 --broker headway_cent --balance 15
 
 # If WFE < 50% or sync_validate fails:
-python main.py --mode optimize --tf M5  --broker headway_cent --balance 15 --trials 500
+python main.py --mode optimize --tf M5  --broker headway_cent --balance 15 --trials 1000
 python main.py --mode train    --tf M5  --broker headway_cent --balance 15
 
 # Monthly (H1 / M15): same pattern with longer intervals
 python main.py --mode wfa      --tf H1  --broker headway_cent --balance 15
-python main.py --mode optimize --tf H1  --broker headway_cent --balance 15 --trials 250
+python main.py --mode optimize --tf H1  --broker headway_cent --balance 15 --trials 400
 python main.py --mode train    --tf H1  --broker headway_cent --balance 15
 ```
 
