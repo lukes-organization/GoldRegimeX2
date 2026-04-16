@@ -851,6 +851,10 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     daily_trades  = 0
     last_bar_time = None
     current_day   = None
+    # M5 Trailing Daily Equity Lock — bank gains when day profit ≥ 20%.
+    # Ignored for H1/M15; only M5 scalps can realistically hit this threshold.
+    m5_day_open_balance = account_size   # normalised USD balance at day open
+    m5_equity_locked    = False          # True once day gain ≥ 20%
     # Tracks the tickets and entry context of the most recently placed signal
     # so the break-even SL logic can fire when TP1 closes position 1.
     signal_tracker = {"tickets": [], "entry_price": 0.0,
@@ -909,6 +913,19 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 daily_trades = 0
                 current_day  = today
                 equity_gate.reset_day(account_size)
+                # M5 equity lock resets at day-open; snapshot live balance
+                # so the 20% threshold is anchored to today's starting equity.
+                if tf.upper() == "M5":
+                    try:
+                        _raw_open = mt5.account_info().balance
+                        m5_day_open_balance = _normalise_balance(_raw_open, broker)
+                    except Exception:
+                        m5_day_open_balance = account_size
+                    m5_equity_locked = False
+                    logger.info(
+                        "M5 equity lock reset — day-open balance: $%.4f USD.",
+                        m5_day_open_balance,
+                    )
                 logger.info("New UTC day %s — session counter and equity gate reset.", today)
 
             # ── 2. Bar-change detection ───────────────────────────────────
@@ -1036,6 +1053,33 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             arm              = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
             arm.daily_trades = daily_trades   # restore session count
 
+            # ── M5 Trailing Daily Equity Lock check ───────────────────────
+            # Activate once and stay locked until midnight reset.
+            # Uses the live MT5 balance so realised + floating profits count.
+            if tf.upper() == "M5" and not m5_equity_locked:
+                try:
+                    _raw_live     = telemetry.get(
+                        "balance",
+                        m5_day_open_balance * (CENT_MULTIPLIER if broker == "headway_cent" else 1.0),
+                    )
+                    _live_bal     = _normalise_balance(_raw_live, broker)
+                    _day_gain_pct = (_live_bal - m5_day_open_balance) / m5_day_open_balance \
+                                    if m5_day_open_balance > 0 else 0.0
+                    if _day_gain_pct >= 0.20:
+                        m5_equity_locked = True
+                        logger.info(
+                            "M5 Equity Lock activated: day gain +%.1f%% ($%.4f → $%.4f USD). "
+                            "No new signals until UTC midnight.",
+                            _day_gain_pct * 100, m5_day_open_balance, _live_bal,
+                        )
+                        send_telegram_msg(
+                            f"🔒 <b>M5 Equity Lock [{broker}]</b>\n"
+                            f"Day gain: <b>+{_day_gain_pct*100:.1f}%</b> — profits banked.\n"
+                            f"No new signals until midnight UTC."
+                        )
+                except Exception as _exc:
+                    logger.debug("M5 equity lock check failed: %s", _exc)
+
             # ── 4. Compute live features + probability ────────────────────
             features_df, hmm_state, atr_price = compute_live_features(
                 DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
@@ -1108,6 +1152,14 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     "Session limit reached (state=%d  daily=%d/%d). Skipping bar.",
                     hmm_state, arm.daily_trades,
                     arm.get_trade_limits(hmm_state)["max_daily_trades"],
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # ── 7b. M5 Trailing Daily Equity Lock ────────────────────────
+            if m5_equity_locked:
+                logger.info(
+                    "M5 equity lock active (day gain ≥20%%) — no new signals until midnight."
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
