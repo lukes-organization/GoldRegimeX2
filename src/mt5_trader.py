@@ -663,7 +663,9 @@ def compute_live_features(
         raise ValueError(f"Live feature NaN/Inf in columns {bad_cols} — skipping bar.")
 
     atr_price   = atr_normalized * float(df["Close"].iloc[-1])
-    return features_df, current_state, atr_price
+    # Return raw (pre-scaler) atr_normalized separately so the live ER filter
+    # can compare it against spread_frac without using the scaled value.
+    return features_df, current_state, atr_price, atr_normalized
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -906,14 +908,12 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             today = datetime.now(timezone.utc).date()
             if today != current_day:
                 current_day  = today
-                # Snapshot live balance as the day-open anchor for both the loss
-                # gate (5%) and the Trailing Daily Equity Lock (profit side).
-                try:
-                    _day_open_bal = _normalise_balance(mt5.account_info().balance, broker)
-                except Exception:
-                    _day_open_bal = account_size
-                equity_gate.reset_day(_day_open_bal)
-                logger.info("New UTC day %s — equity gate reset (day-open $%.4f USD).", today, _day_open_bal)
+                # Anchor the equity gate to the fixed risk-sizing balance so loss%
+                # and profit-lock% are computed against the same reference that
+                # check() receives (account_size + open_pnl).  Using the live MT5
+                # balance here would mismatch the baseline and trigger a false lock.
+                equity_gate.reset_day(account_size)
+                logger.info("New UTC day %s — equity gate reset (anchor $%.2f USD).", today, account_size)
 
             # ── 2. Bar-change detection ───────────────────────────────────
             bars = mt5.copy_rates_from_pos(DEFAULT_SYMBOL, tf_mt5, 1, 1)
@@ -1054,7 +1054,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
 
             # ── 4. Compute live features + probability ────────────────────
-            features_df, hmm_state, atr_price = compute_live_features(
+            features_df, hmm_state, atr_price, raw_atr_norm = compute_live_features(
                 DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
                 feature_cols=feature_cols, mt5=mt5, tf=tf, broker=broker,
             )
@@ -1063,14 +1063,14 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             prob = float(_probs[0])
 
             # ── Spread efficiency filter ──────────────────────────────────────
-            # Skip signals where ATR / spread < 1.8 (candle move < 2× spread).
+            # Use the RAW (pre-scaler) atr_normalized fraction — the StandardScaler
+            # can produce negative values which make the ratio meaningless.
             _spread_frac = BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0.0004)
-            _atr_norm    = float(features_df["atr_normalized"].iloc[0])
-            _er          = _atr_norm / _spread_frac if _spread_frac > 0 else 999.0
-            if _er < 1.8:
+            _er          = raw_atr_norm / _spread_frac if _spread_frac > 0 else 999.0
+            if _er < 1.25:
                 logger.info(
-                    "Efficiency ratio %.2f < 1.8 (ATR=%.5f / spread=%.5f) — no signal.",
-                    _er, _atr_norm, _spread_frac,
+                    "Efficiency ratio %.2f < 1.25 (ATR=%.5f / spread=%.5f) — no signal.",
+                    _er, raw_atr_norm, _spread_frac,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
