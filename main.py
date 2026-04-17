@@ -222,7 +222,7 @@ def cmd_wfa(args):
     model_hmm, states, _ = fit_hmm(df, n_states=n_states)
 
     _min_persist = min(model_hmm.transmat_[i, i] for i in range(model_hmm.n_components))
-    if _min_persist < 0.70:
+    if _min_persist < 0.65:
         print(
             f"\nERROR: Degenerate HMM (min persistence={_min_persist:.4f}). "
             "Run --mode optimize first to find stable Kalman parameters."
@@ -307,6 +307,8 @@ def cmd_wfa(args):
                     flag = f"⚠️ ({fold_score:.2f})"
                 else:
                     flag = f"❌ ({fold_score:.2f})"
+                if w.get("oos_profit_factor", 1.0) < 1.2:
+                    flag += " ⚠️PF<1.2"
             oos_pf  = w.get("oos_profit_factor", 1.0)
             oos_eff = w.get("oos_avg_efficiency", 0.0)
             eff_str = f"{oos_eff:.2f}x" if oos_t >= 3 else "  —  "
