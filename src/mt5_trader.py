@@ -1065,7 +1065,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             )
             signal_tracker["atr_price"] = atr_price   # cache for between-bar ATR trail
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
-            prob = float(_probs[0])
+            prob        = float(_probs[0])
+            gmm_cluster = int(features_df["gmm_vol_cluster"].iloc[0]) if "gmm_vol_cluster" in features_df.columns else -1
 
             # ── Spread efficiency filter ──────────────────────────────────────
             # Use the RAW (pre-scaler) atr_normalized fraction — the StandardScaler
@@ -1161,6 +1162,11 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     "[MEAN REVERSION SIGNAL] BUY — Chop state=%d  prob=%.3f < %.3f (mr_buy ceiling)",
                     hmm_state, prob, mr_buy_threshold,
                 )
+                if gmm_cluster == 2:
+                    logger.warning(
+                        "[MR WARNING] High-Vol environment (GMM cluster=2). "
+                        "Mean Reversion has lower edge in breakout conditions — watch closely."
+                    )
             elif is_chop and prob > mr_sell_threshold:
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
@@ -1169,18 +1175,63 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     "[MEAN REVERSION SIGNAL] SELL — Chop state=%d  prob=%.3f > %.3f (mr_sell floor)",
                     hmm_state, prob, mr_sell_threshold,
                 )
+                if gmm_cluster == 2:
+                    logger.warning(
+                        "[MR WARNING] High-Vol environment (GMM cluster=2). "
+                        "Mean Reversion has lower edge in breakout conditions — watch closely."
+                    )
             else:
-                # Explain exactly why no signal fired
-                if hmm_state == BULL_STATE:
-                    reason = f"Bull state but prob={prob:.3f} not >{prob_threshold:.3f}"
+                # ── Logic Audit — structured diagnostic explaining why no trade fired ──
+                regime_desc = ("BULL" if hmm_state == BULL_STATE
+                               else "BEAR" if hmm_state == BEAR_STATE
+                               else "CHOP")
+                signal_desc = "UP" if prob > 0.50 else "DOWN"
+
+                # Classify as Divergence (HMM and ML disagree on direction) or
+                # Alignment (same direction but probability hasn't crossed the hurdle).
+                if hmm_state == BULL_STATE and prob < 0.50:
+                    decision = (
+                        f"DIVERGENCE — HMM says {regime_desc} but ML leans {signal_desc}. "
+                        "Safety filter active: no trade."
+                    )
+                elif hmm_state == BEAR_STATE and prob > 0.50:
+                    decision = (
+                        f"DIVERGENCE — HMM says {regime_desc} but ML leans {signal_desc}. "
+                        "Safety filter active: no trade."
+                    )
+                elif hmm_state == BULL_STATE:
+                    decision = (
+                        f"ALIGNMENT — Both Bullish. "
+                        f"Prob {prob:.3f} needs >{prob_threshold:.3f} "
+                        f"(gap: {prob - prob_threshold:+.3f})"
+                    )
                 elif hmm_state == BEAR_STATE:
-                    reason = f"Bear state but prob={prob:.3f} not <{short_threshold:.3f}"
+                    decision = (
+                        f"ALIGNMENT — Both Bearish. "
+                        f"Prob {prob:.3f} needs <{short_threshold:.3f} "
+                        f"(gap: {short_threshold - prob:+.3f})"
+                    )
                 elif is_chop:
-                    reason = (f"Chop state={hmm_state} — prob={prob:.3f} not extreme enough "
-                              f"(MR-BUY<{mr_buy_threshold:.3f} or MR-SELL>{mr_sell_threshold:.3f})")
+                    decision = (
+                        f"CHOP REGIME — MR thresholds: "
+                        f"BUY<{mr_buy_threshold:.3f} / SELL>{mr_sell_threshold:.3f}. "
+                        f"Prob={prob:.3f} not extreme enough."
+                    )
                 else:
-                    reason = f"state={hmm_state} prob={prob:.3f}"
-                logger.info("No signal (%s).", reason)
+                    decision = f"Scanning... state={hmm_state} prob={prob:.3f}"
+
+                logger.info(
+                    "[LOGIC AUDIT] %s Regime | ML %s (%.3f) | %s",
+                    regime_desc, signal_desc, prob, decision,
+                )
+                # Show exact distance to both thresholds so the user can visualise
+                # how close they are to an entry without needing to do the maths.
+                # Positive = would have fired in that direction; negative = still needs to move.
+                logger.info(
+                    "  Distance → BUY: %+.3f  |  SELL: %+.3f",
+                    prob - prob_threshold,    # positive means prob already > buy hurdle
+                    short_threshold - prob,   # positive means prob already < sell hurdle
+                )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
