@@ -299,8 +299,9 @@ def cmd_wfa(args):
                     "floating_max_drawdown": oos_fdd,
                     "sharpe_ratio":          oos_s,
                     "profit_factor":         w.get("oos_profit_factor", 1.0),
+                    "return_consistency":    w.get("oos_return_consistency", 0.0),
                 }
-                fold_score = _calc_score(fold_r)
+                fold_score = _calc_score(fold_r, tf=tf)
                 if fold_score >= WFA_FOLD_PASS_SCORE:
                     flag = f"✅ ({fold_score:.2f})"
                 elif fold_score >= 0:

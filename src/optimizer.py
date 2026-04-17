@@ -55,7 +55,7 @@ def _get_tier(balance: float) -> str:
 
 
 def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = "H1") -> float:
-    """Complex Criterion: (RF × 0.4) + (PF × 0.3) + (Sharpe × 0.3).
+    """Complex Criterion: (RF × 0.4) + (PF × 0.3) + (Sharpe × 0.3) + Consistency bonus (M5/M15).
 
     RF  = OOS Net Profit / OOS Max Floating Drawdown   (capped at 50)
     PF  = Gross Profit / |Gross Loss|                  (capped at 10)
@@ -64,6 +64,9 @@ def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = 
     - RF (40 %): primary capital-preservation metric; rewards profit relative to risk
     - PF (30 %): trade quality; filters inconsistent winners that inflate Sharpe
     - Sharpe (30 %): risk-adjusted consistency; prevents high-RF/noisy trajectories
+    - Consistency bonus (M5/M15 only, max +0.5): rewards steady week-to-week income
+      over models that owe their RF/PF to 1-2 outlier streaks.  Not applied to H1
+      (swing TF with only 1-2 trades/week — weekly bucketing adds no signal there).
     """
     net_profit  = result.get("total_return", 0.0)
     floating_dd = result.get("floating_max_drawdown", result.get("max_drawdown", 0.0))
@@ -75,7 +78,13 @@ def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = 
     else:
         rf = min(net_profit / floating_dd, 50.0)
 
-    return float((rf * 0.4) + (pf * 0.3) + (sharpe * 0.3))
+    score = float((rf * 0.4) + (pf * 0.3) + (sharpe * 0.3))
+
+    if tf.upper() in ("M5", "M15"):
+        consistency = result.get("return_consistency", 0.0)
+        score += consistency * 0.5   # max +0.5 for perfectly steady weekly income
+
+    return score
 
 
 def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
@@ -278,6 +287,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                     "sharpe_ratio":          result.get("oos_sharpe_ratio", 0.0),
                     "profit_factor":         result.get("oos_profit_factor", 1.0),
                     "expected_payoff":       result.get("oos_expected_payoff", 0.0),
+                    "return_consistency":    result.get("oos_return_consistency", 0.0),
                 }
                 score = _score_result(oos_result, tier, broker, tf)
 
@@ -312,12 +322,13 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             _oos_eff     = result.get("oos_avg_efficiency", result.get("avg_efficiency", 0.0))
             logger.info(
                 "Trial %d [%s/%s $%.0f]: score=%.3f  "
-                "RF=%.2f  PF=%.2f  Payoff=$%.4f  Eff=%.2fx  FloatDD=%.1f%%  "
+                "RF=%.2f  PF=%.2f  Consist=%.2f  Payoff=$%.4f  Eff=%.2fx  FloatDD=%.1f%%  "
                 "trades=%d  payout=%s",
                 trial.number, tf, broker, balance,
                 score,
                 result.get("oos_recovery_factor", result.get("recovery_factor", 0)),
                 result.get("oos_profit_factor",   result.get("profit_factor", 1.0)),
+                result.get("oos_return_consistency", result.get("return_consistency", 0.0)),
                 _oos_payoff * balance,
                 _oos_eff,
                 result.get("oos_floating_max_drawdown",

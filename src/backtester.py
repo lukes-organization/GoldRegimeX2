@@ -186,15 +186,36 @@ def _compute_metrics(strategy_returns, signals, tf: str = "H1"):
     else:
         recovery_factor = 0.0
 
+    # Return Consistency — weekly P&L stability.
+    # Bucket strategy_returns into approximate trading-week windows and compute
+    # how stable the weekly income is.  A model that earns steadily every week
+    # scores higher than one that earns the same total from 2 lucky streaks.
+    #
+    # Formula: consistency = 1 - (std / (std + |mean|))
+    #   → 1.0 when std ≈ 0 (all weeks identical)  → 0.0 when std >> mean (erratic)
+    # Only computed when ≥4 complete windows are available; 0.0 otherwise.
+    WEEKLY_BARS = {"H1": 40, "M15": 160, "M5": 480}   # ~5 trading days per window
+    _bpw = WEEKLY_BARS.get(tf.upper(), 40)
+    if n_trades >= 5 and len(strategy_returns) >= _bpw * 4:
+        _n       = (len(strategy_returns) // _bpw) * _bpw
+        _weekly  = strategy_returns[:_n].reshape(-1, _bpw).sum(axis=1)
+        _w_std   = float(np.std(_weekly))
+        _w_mean  = float(np.mean(_weekly))
+        _denom   = _w_std + abs(_w_mean)
+        return_consistency = float(1.0 - _w_std / _denom) if _denom > 1e-9 else 0.0
+    else:
+        return_consistency = 0.0
+
     return {
-        "sharpe_ratio":    float(sharpe),
-        "max_drawdown":    max_dd,
-        "win_rate":        win_rate,
-        "total_return":    total_return,
-        "n_trades":        n_trades,
-        "recovery_factor": recovery_factor,
-        "profit_factor":   profit_factor,
-        "expected_payoff": expected_payoff,
+        "sharpe_ratio":       float(sharpe),
+        "max_drawdown":       max_dd,
+        "win_rate":           win_rate,
+        "total_return":       total_return,
+        "n_trades":           n_trades,
+        "recovery_factor":    recovery_factor,
+        "profit_factor":      profit_factor,
+        "expected_payoff":    expected_payoff,
+        "return_consistency": return_consistency,
     }
 
 
