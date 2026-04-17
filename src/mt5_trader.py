@@ -35,7 +35,7 @@ from src.processor import (
     load_feature_scaler,
     CONTINUOUS_FEATURE_COLS,
 )
-from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
+from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH, STATE_NAMES_2, STATE_NAMES_3, STATE_NAMES_4
 from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
     get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
@@ -1082,7 +1082,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
 
             # ── 5. Log bar info on every new bar (always visible) ─────────
             bar_str   = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            state_lbl = {0: "Bull", 1: "Bear", 2: "Chop"}.get(hmm_state, str(hmm_state))
+            _snames   = {2: STATE_NAMES_2, 3: STATE_NAMES_3, 4: STATE_NAMES_4}
+            state_lbl = _snames.get(model_hmm.n_components, STATE_NAMES_4).get(hmm_state, str(hmm_state))
             logger.info(
                 "Bar %s | state=%s | prob=%.3f | Efficiency=%.1fx",
                 bar_str, hmm_state, prob, _er,
@@ -1114,14 +1115,14 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     signal_tracker["tp1_hit"] = True
                     for ticket in active:
                         _move_sl_to_breakeven(ticket, signal_tracker["entry_price"], mt5)
-                # Regime shifted to Chop while a TREND runner is active → close immediately.
-                # Mean-reversion positions stay open in Chop; close them if state breaks out.
-                if signal_tracker.get("signal_type") == "trend" and hmm_state == CHOP_STATE and active:
+                # Regime shifted to any Chop state while a TREND runner is active → close immediately.
+                # Use >= CHOP_STATE to cover both Chop_Low (2) and Chop_High (3) in 4-state models.
+                if signal_tracker.get("signal_type") == "trend" and hmm_state >= CHOP_STATE and active:
                     for ticket in active:
                         _close_position(ticket, mt5)
                     logger.info("Trend runner(s) closed: regime shifted to Chop.")
                     active = []
-                elif signal_tracker.get("signal_type") == "mean_reversion" and hmm_state != CHOP_STATE and active:
+                elif signal_tracker.get("signal_type") == "mean_reversion" and hmm_state < CHOP_STATE and active:
                     for ticket in active:
                         _close_position(ticket, mt5, comment="GRX_close_mr_breakout")
                     logger.info("MR position(s) closed: Chop ended, regime broke out to state %d.", hmm_state)
