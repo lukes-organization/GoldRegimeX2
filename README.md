@@ -21,10 +21,11 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 13. [Performance Metrics & Scoring](#performance-metrics--scoring)
 14. [Optimizer Anti-Overfitting Rules](#optimizer-anti-overfitting-rules)
 15. [Telegram Remote Control](#telegram-remote-control)
-16. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
-17. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
-18. [Troubleshooting](#troubleshooting)
-19. [Security Notes](#security-notes)
+16. [Multi-TF Live Trading](#multi-tf-live-trading)
+17. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
+18. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
+19. [Troubleshooting](#troubleshooting)
+20. [Security Notes](#security-notes)
 
 ---
 
@@ -38,6 +39,11 @@ Kalman Filter  →  Log Returns (smoothed)
       │
       ▼
 GaussianHMM   →  Regime Labels  (Bull=0, Bear=1, Chop=2/3)
+               Observation features (3):
+                 [kalman_return, volatility, rsi_slope]
+               All 3 features StandardScaler-normalised before fit
+               so rsi_slope (range ±5) cannot dominate over
+               kalman_return (range ±0.003) and volatility (±0.001)
       │
       ▼
 GMM Vol Cluster  →  Volatility regime label (quiet / normal / volatile)
@@ -66,6 +72,12 @@ Complex Criterion Score  →  RF×0.4 + PF×0.3 + Sharpe×0.3
       │
       ▼
 Live Bridge   →  MT5 Market Orders  (IOC fill, ATR-based SL, staged TPs)
+               Signal routing:
+                 Bull → Trend BUY    (prob > prob_threshold)
+                 Bear → Trend SELL   (prob < short_threshold)
+                 Chop → Mean Reversion BUY/SELL (extreme probs only)
+               TF-specific magic: H1=123456, M15=123457, M5=123458
+               Global guard: skip if ≥ 4 positions open across all TFs
 ```
 
 The optimizer (Optuna) searches across Kalman parameters, HMM states, XGBoost hyperparameters, and signal probability thresholds simultaneously, scoring every trial on the **Complex Criterion** (which weights capital preservation, trade quality, and return smoothness) computed on **out-of-sample data only** to prevent overfitting.
@@ -77,7 +89,7 @@ The optimizer (Optuna) searches across Kalman parameters, HMM states, XGBoost hy
 | File | Purpose |
 |------|---------|
 | `src/processor.py` | Kalman filter, log returns, RSI, ATR, GMM vol cluster, per-TF config |
-| `src/engine_hmm.py` | GaussianHMM training, TF persistence boost, regime prediction |
+| `src/engine_hmm.py` | GaussianHMM training (3-feature obs, StandardScaler normalised), TF persistence boost, regime prediction |
 | `src/engine_xgb.py` | XGBoost training, TF-specific IS/OOS splits, StandardScaler, ONNX export |
 | `src/backtester.py` | Vectorized NumPy backtest — IS/OOS split, session limits, broker costs, floating drawdown, profit/efficiency metrics |
 | `src/optimizer.py` | Optuna study — Complex Criterion scoring, per-broker SQLite crash-safe resume, RAM guard, Telegram heartbeat |
@@ -377,11 +389,11 @@ python main.py --mode report --broker headway_cent --balance 15 --tf H1
 ```
 
 Saves 5 charts to `reports/H1_headway_cent/`:
-1. Regime overlay on price
-2. Equity curve (IS vs OOS)
-3. Feature analysis
-4. HMM transition matrix
-5. Summary dashboard
+1. **Regime overlay** on price
+2. **Equity curve** — IS vs OOS, with 4-category entry markers (Trend BUY/SELL triangles, MR BUY/SELL circles)
+3. **Feature analysis** — feature importance, RSI regime distributions, 2D regime scatter (RSI slope vs ATR), and feature pie
+4. **HMM transition matrix**
+5. **Summary dashboard** — key metrics, Profit Attribution table (Trend vs MR win rates + P&L), USD drawdown display, and best Optuna params
 
 Reports are saved to a **broker- and TF-specific folder** so cent and standard charts never overwrite each other:
 
@@ -450,7 +462,7 @@ You will be prompted to type `YES` to confirm. This is the **only difference** f
 6. Logs closed P&L in real USD with pip movement after every trade
 7. **(M5 only)** Activates Trailing Daily Equity Lock if day gain ≥ 20%
 
-**Important**: Remove the GoldRegimeX.mq5 EA from the XAUUSD chart before starting the Python bridge. Both use `MAGIC_NUMBER = 123456` — running both simultaneously causes the bridge to see the EA's positions as its own, blocking all signal generation. The bridge logs a `CONFLICT` warning at startup if it detects existing positions with that magic number.
+**Important**: Remove the GoldRegimeX.mq5 EA from any XAUUSD chart before starting the same-TF Python bridge. The H1 EA uses `MAGIC_NUMBER = 123456`, which matches the H1 Python bridge — running both simultaneously causes the bridge to see the EA's positions as its own, and the Global Guard (≥ 4 open positions) may block all signal generation. The bridge logs a `CONFLICT` warning at startup if it detects existing positions with a matching magic number.
 
 ---
 
@@ -503,15 +515,29 @@ A trade fires when **all** of the following are true:
 |-----------|-----|------|
 | XGBoost probability | `prob > prob_threshold` | `prob < short_threshold` |
 | HMM regime (regime-aligned) | **Bull state (0) only** | **Bear state (1) only** |
-| Chop state (2 or 3) | Blocked — no signal ever | Blocked — no signal ever |
+| Chop state (2 or 3) | Blocked for trend — MR possible | Blocked for trend — MR possible |
 | ER filter | ATR / spread ≥ 1.25 | ATR / spread ≥ 1.25 |
 | Session limit | Under daily cap | Under daily cap |
 | No open position | No existing GRX position | No existing GRX position |
 | Margin check | Sufficient free margin | Sufficient free margin |
 | Spread viability | TP1 ≥ spread × ratio | TP1 ≥ spread × ratio |
-| M5 equity lock | Day gain < 20% | Day gain < 20% |
+| DailyEquityGate | Loss < 5% AND day gain < profit lock | Loss < 5% AND day gain < profit lock |
+| Global guard | < 4 positions open across all TFs | < 4 positions open across all TFs |
 
-**Regime-aligned filter:** BUY signals only fire when the HMM is in Bull state. SELL signals only fire in Bear state. Any Chop state (2 or 3) suppresses all signals regardless of XGBoost probability.
+**Regime-aligned filter (Trend):** BUY signals only fire when the HMM is in Bull state. SELL signals only fire in Bear state.
+
+**Mean Reversion in Chop:** When the HMM is in a Chop state (2 or 3), the live loop trades *against* extreme model conviction:
+
+| Direction | MR Condition | Logic |
+|-----------|-------------|-------|
+| MR BUY | `prob < short_threshold − 0.10` | Model is extremely bearish inside a sideways market → fade the oversell |
+| MR SELL | `prob > prob_threshold + 0.10` | Model is extremely bullish inside a sideways market → fade the overbuy |
+
+MR trades use the same SL/TP/lot logic as trend trades. They are tagged as `📐 MEAN REVERSION` in Telegram and in MT5 order comments. If the HMM breaks out of Chop mid-trade (hmm_state moves to Bull or Bear), any open MR positions are closed immediately.
+
+⚠️ **High-Vol MR Warning:** If `gmm_cluster == 2` (high-volatility environment) when a MR signal fires, the bridge logs `[MR WARNING]` — mean reversion has lower edge when volatility is elevated and breakouts are more likely.
+
+**Logic Audit:** Every bar where no trade fires, the bridge logs a structured reason — **Divergence** (HMM and XGBoost disagree on direction), **Low Conviction** (probability too close to 0.50), **Chop Suppressed** (Chop state, prob not extreme enough for MR), or another specific gate that blocked the signal. This makes it easy to diagnose why signals aren't firing.
 
 **ER filter (Efficiency Ratio):** `ATR / spread >= 1.25` — ensures the expected move on the bar is large enough to overcome the bid/ask spread with margin. Trades in tight-range bars where spread consumes the majority of the move are silently skipped.
 
@@ -523,10 +549,10 @@ A trade fires when **all** of the following are true:
 | M5 | `standard` | 0.55 – 0.60 | 0.40 – 0.45 |
 | M15 | `headway_cent` | 0.50 – 0.58 | 0.42 – 0.50 |
 | M15 | `standard` | 0.50 – 0.58 | 0.42 – 0.50 |
-| H1 | `headway_cent` | 0.55 – 0.72 | 0.28 – 0.45 |
-| H1 | `standard` | 0.55 – 0.72 | 0.28 – 0.45 |
+| H1 | `headway_cent` | **0.65 – 0.80** | 0.28 – 0.45 |
+| H1 | `standard` | **0.65 – 0.80** | 0.28 – 0.45 |
 
-H1 uses a wider search space (0.55–0.72 / 0.28–0.45) because H1 regime signals are more decisive — when the optimizer builds high conviction it can push thresholds much wider than on M5/M15.
+H1 uses a higher BUY threshold range (0.65–0.80) because hourly regime signals are more decisive — the HMM classifies bars more cleanly at the hourly frequency, so only high-confidence XGBoost signals are worth trading. Lower thresholds made H1 too noisy in testing.
 
 **Spread viability guard:**
 
@@ -535,17 +561,23 @@ H1 uses a wider search space (0.55–0.72 / 0.28–0.45) because H1 regime signa
 | `headway_cent` | M5 only | TP1 ≥ 1.5× spread |
 | `standard` | All timeframes | TP1 ≥ 3.0× spread |
 
-### M5 Trailing Daily Equity Lock
+### Two-Sided DailyEquityGate
 
-To prevent a regime shift from giving back gains earned during a strong M5 session, the live trader tracks intraday balance progression:
+`DailyEquityGate` controls whether the live loop generates new signals each day. It fires in either direction:
 
-- At UTC midnight each day, the bot records the current live account balance as the **day-open baseline**.
-- After every completed bar, the live balance is re-fetched and compared to the baseline.
-- If the **day gain reaches ≥ 20%** of the opening balance, the bot activates the **Equity Lock** — no new entry signals are generated for the remainder of that day.
-- At midnight the lock resets automatically and trading resumes normally.
-- A Telegram alert `🔒 M5 Equity Lock` is sent with the exact gain percentage and locked balance.
+**Loss gate (all TFs):** If the floating equity drops ≥ 5% below the start-of-day baseline, the loss gate locks and all open GRX positions are closed. No new signals fire for the rest of the day.
 
-This is specific to M5. H1 and M15 use the standard `DailyEquityGate` which blocks new positions once the floating drawdown reaches 5% of account equity.
+**Profit lock (locks in gains):** If the day's floating equity gain reaches the TF-specific threshold, the profit lock activates — no new entries are opened, banking the day's gains.
+
+| Timeframe | Profit Lock Threshold | Loss Gate |
+|-----------|----------------------|-----------|
+| M5 | **20%** gain on day | 5% loss |
+| M15 | **10%** gain on day | 5% loss |
+| H1 | **10%** gain on day | 5% loss |
+
+At UTC midnight, both gates reset automatically. A Telegram alert is sent when either gate activates, showing the exact gain/loss percentage and locked balance.
+
+> **Previous behaviour:** The M5 equity lock was a separate code path (≥ 20% day gain). It has been unified into `DailyEquityGate` which now covers all TFs bidirectionally.
 
 ### Staged Take-Profits
 
@@ -645,16 +677,16 @@ lot_size = (1% × account_balance_USD) / (ATR(14) × SL_multiplier)
 
 Minimum lot is always 0.01 (micro-lot). All lots are rounded to 2 decimal places.
 
-### Daily Trade Limits
+### Daily Exposure Limits
 
-| Account Balance | TF | Regime | Max Positions/Day | Positions/Signal |
-|----------------|----|--------|-------------------|-----------------|
-| ≤ $50 | M5 / M15 | Any | 4 | **2** |
-| ≤ $50 | H1 | Any | 2 | **2** |
-| > $50 | Any | Bull / Bear | 3 signals | **3** |
-| > $50 | Any | Chop | 2 signals | **3** |
+Stop-trading decisions are handled entirely by `DailyEquityGate` (see [Two-Sided DailyEquityGate](#two-sided-dailyequitygate) above). `AdaptiveRiskManager` handles **lot sizing per signal** and the number of positions opened per signal — it no longer imposes a daily trade count limit.
 
-Each signal opens `pos_per_trade` independent positions with separate TPs. The daily counter tracks **individual positions** — with `pos_per_trade=2` and `max=4`, that gives 2 signals per day on M5/M15 small accounts.
+| Account Balance | TF | Positions/Signal |
+|----------------|----|-----------------|
+| ≤ $50 | Any | **2** |
+| > $50 | Any | **3** |
+
+Each signal opens `pos_per_trade` independent positions with separate TPs. The maximum total open positions across all TFs is controlled by the Global Guard (≥ 4 = no new entries).
 
 **Lot floor:** All positions are individually floored to **0.01 lots** regardless of what the 1% risk formula calculates.
 
@@ -667,7 +699,7 @@ Each signal opens `pos_per_trade` independent positions with separate TPs. The d
 | Kalman `obs_cov` default | 0.05 | 4.0 | 1.0 |
 | Bars/day (annualization) | 288 | 96 | 24 |
 | HMM `n_states` search space | `{2, 4}` only | 3–4 | 3–4 |
-| HMM persistence gate (training) | ≥ 0.72 | ≥ 0.72 | ≥ 0.72 |
+| HMM persistence gate (training) | ≥ 0.65 | ≥ 0.65 | ≥ 0.65 |
 | IS/OOS split | 65% / 35% | 65% / 35% | **70% / 30%** |
 | Min OOS trades (penalty threshold) | 400 | 150 | 60 |
 | Positions/signal (≤ $50) | **2** | **2** | **2** |
@@ -682,7 +714,8 @@ Each signal opens `pos_per_trade` independent positions with separate TPs. The d
 | Fixed scalp target | **$4 USD default** | Off | Off |
 | Trailing guard activation | **$2 peak** | Off | Off |
 | Trailing guard drawdown | **50% of peak** | Off | Off |
-| Trailing daily equity lock | **≥ 20% day gain** | — | — |
+| DailyEquityGate loss limit | 5% | 5% | 5% |
+| DailyEquityGate profit lock | **20% day gain** | **10% day gain** | **10% day gain** |
 | Base deviation | 30 pts | 20 pts | 20 pts |
 | Spread viability guard | Yes (cent: M5 only, standard: all) | standard only | standard only |
 | 5-day readiness gate | Yes | No | No |
@@ -812,7 +845,7 @@ Training and reporting output automatically shows payout in the natural unit for
 | Complex Criterion | `RF×0.4+PF×0.3+Sharpe×0.3` instead of raw Sharpe eliminates "high-Sharpe, deep-DD" winners |
 | Progressive trade penalty | OOS trades below TF threshold: score × 0.1 (soft penalty, not hard cutoff) |
 | Payoff floor | OOS expected payoff < $0.035: score × 0.1 (forces alpha-generating configs) |
-| HMM persistence gate | Any HMM self-transition < 0.72: trial discarded as degenerate |
+| HMM persistence gate | Any HMM self-transition < **0.65**: trial discarded as degenerate (relaxed from 0.72 to allow faster regime transitions) |
 | n_states restrictions | M5: `{2,4}` only; H1/M15: `{3,4}` — prevents broken regime detection |
 | XGBoost regularization | `reg_alpha` 0.01–1.2, `gamma` 0.01–0.5, `max_depth` 3–6 (H1/M15); M5 uses `max_depth` 2–3, `reg_alpha` 1.0–20.0 |
 | Short threshold crossover | `short_threshold >= prob_threshold` → trial returns -10 (no hedging the same signal both ways) |
@@ -878,15 +911,67 @@ Each terminal runs an independent Optuna worker. This is more reliable than `--n
 
 ---
 
+## Multi-TF Live Trading
+
+Each timeframe runs as an **independent Python process** and uses its own Magic Number so MT5 can distinguish positions by originating TF. You can run H1, M15, and M5 bridges simultaneously on the same $15 account.
+
+### TF Magic Number Map
+
+| Timeframe | Magic Number | Comment format |
+|-----------|-------------|----------------|
+| H1 | `123456` | `GRX_H1_BUY_s0_tp1` |
+| M15 | `123457` | `GRX_M15_SELL_s1_tp2` |
+| M5 | `123458` | `GRX_M5_BUY_s0_tp1` |
+
+Order comments follow the format `GRX_{tf}_{direction}_s{hmm_state}_tp{index}`, making every position instantly identifiable in the MT5 Trade tab.
+
+### Global Exposure Guard
+
+Before placing any new signal across **any** TF, the bridge counts all open positions that carry a GRX magic number (`123456`, `123457`, or `123458`). If there are **≥ 4 positions** already open, the signal is skipped with `[GLOBAL GUARD]` logged. This prevents over-leveraging the account when two or more TFs fire simultaneously.
+
+### Starting Multiple TFs
+
+Open separate terminal windows and start each bridge independently:
+
+```bash
+# Terminal 1 — H1
+python main.py --mode live --tf H1 --broker headway_cent --balance 15
+
+# Terminal 2 — M15
+python main.py --mode live --tf M15 --broker headway_cent --balance 15
+
+# Terminal 3 — M5
+python main.py --mode live --tf M5 --broker headway_cent --balance 15
+```
+
+Or use the Telegram remote control (`--mode listen`) which lets you start each TF individually via inline buttons.
+
+### Midnight Daily P&L Audit
+
+At UTC midnight, each bridge automatically sends a **Daily P&L Audit** to Telegram that breaks down the previous day's closed trades by timeframe:
+
+```
+📊 Daily P&L Audit (headway_cent)
+H1  :  +$0.45  (1 trade)
+M15 :  +$1.20  (4 trades)
+M5  :  −$0.18  (6 trades)
+──────────────────────────
+Total: +$1.47  (11 trades)
+```
+
+This fires from whichever bridge(s) are running at midnight — if only M15 is running, only M15's trades are reported.
+
+---
+
 ## MQL5 EA (Alternative Execution)
 
 `mql5/GoldRegimeX.mq5` is a fully self-contained MT5 Expert Advisor that:
 - Loads the exported ONNX model directly inside MT5
 - Replicates the same regime → signal → risk logic in MQL5
 - Supports both cent and standard accounts via the `IsCentAccount` input
-- Uses the same `MAGIC_NUMBER = 123456`
+- Uses `MAGIC_NUMBER = 123456` (H1 default — matches `TF_MAGIC_MAP["H1"]`)
 
-**Do not run the EA and the Python bridge simultaneously** — they share the magic number and will double-count daily trades.
+**Do not run the EA and the Python bridge for the same TF simultaneously** — they share the same magic number and will double-count daily trades. The H1 bridge will see the EA's positions as its own, triggering the `[CONFLICT]` startup warning and blocking all signals.
 
 To use the EA:
 1. Run `--mode export --tf H1 --broker headway_cent` to generate the ONNX file
@@ -1023,6 +1108,10 @@ python main.py --mode train    --tf H1  --broker headway_cent --balance 15
 | `Order failed: retcode=10015` | Price moved past deviation window | Will retry next bar; elevated deviation auto-applies on high-vol |
 | `Insufficient margin` repeated | Account below safe minimum for lot | Top up account or check `--balance` value |
 | No signals firing — standard M5 | Default threshold too low (0.50) | Re-optimize with `--broker standard` to use the 0.55–0.60 range |
+| `MR WARNING: High-Vol GMM cluster` in logs | MR signal fired during volatile regime | Normal warning — watch position closely; MR edge is lower during breakouts |
+| No MR signals firing | Probability never extreme enough in Chop | Expected — MR needs `prob < short_threshold−0.10` or `prob > prob_threshold+0.10` |
+| Global guard blocking signals frequently | Too many TFs running simultaneously | Use Telegram `BOT STATUS` to check open positions; global guard threshold is 4 |
+| `[CONFLICT]` warning at startup | GRX positions already open from EA or another bridge | Stop the other process / EA before starting a new bridge |
 | Double positions / trades=0 | MQL5 EA running alongside Python bridge (same MAGIC_NUMBER) | Remove GoldRegimeX.mq5 EA from chart |
 | M5 equity lock firing too early | `m5_day_open_balance` set to startup balance, not live balance | Balance is refreshed from live MT5 at each midnight reset |
 | Cent P&L logged as $0.00 | Exit deal not yet posted to MT5 history | Bridge waits up to 20 retries (~30s) — this is expected |
