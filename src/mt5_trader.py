@@ -49,7 +49,11 @@ logger = setup_logger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_SYMBOL               = "XAUUSD"
-MAGIC_NUMBER                 = 123456   # must match GoldRegimeX.mq5 MagicNumber
+# Each timeframe gets its own magic number so H1/M15/M5 instances running
+# simultaneously don't block or close each other's positions.
+TF_MAGIC_MAP  = {"H1": 123456, "M15": 123457, "M5": 123458}
+ALL_GRX_MAGICS = frozenset(TF_MAGIC_MAP.values())   # used for cross-TF global guard
+MAGIC_NUMBER  = TF_MAGIC_MAP["H1"]   # backwards-compat alias (MQL5 EA default)
 CHOP_STATE                   = 2        # HMM Chop state index
 BULL_STATE                   = 0        # HMM Bull state index
 BEAR_STATE                   = 1        # HMM Bear state index
@@ -384,7 +388,7 @@ def _set_trailing_sl(
     return False
 
 
-def _execute_partial_close(ticket: int, symbol: str, mt5) -> bool:
+def _execute_partial_close(ticket: int, symbol: str, mt5, magic: int = MAGIC_NUMBER) -> bool:
     """Close 50 % of a position's volume to bank partial profit.
 
     Skips and returns False if volume <= MIN_LOT_GUARD (0.01) since MT5
@@ -411,7 +415,7 @@ def _execute_partial_close(ticket: int, symbol: str, mt5) -> bool:
         "volume":       close_vol,
         "type":         close_type,
         "price":        price,
-        "magic":        MAGIC_NUMBER,
+        "magic":        magic,
         "comment":      "GRX_Partial_Profit",
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -430,7 +434,7 @@ def _execute_partial_close(ticket: int, symbol: str, mt5) -> bool:
 
 
 
-def _close_position(ticket: int, mt5, comment: str = "GRX_close_chop") -> None:
+def _close_position(ticket: int, mt5, comment: str = "GRX_close_chop", magic: int = MAGIC_NUMBER) -> None:
     """Close a specific open position at market price."""
     positions = mt5.positions_get(ticket=ticket)
     if not positions:
@@ -447,7 +451,7 @@ def _close_position(ticket: int, mt5, comment: str = "GRX_close_chop") -> None:
         "type":         close_type,
         "price":        price,
         "deviation":    20,
-        "magic":        MAGIC_NUMBER,
+        "magic":        magic,
         "comment":      comment,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -459,7 +463,7 @@ def _close_position(ticket: int, mt5, comment: str = "GRX_close_chop") -> None:
                        ticket, res.retcode if res else "None")
 
 
-def _log_closed_pnl(tickets: list, mt5, broker: str = "headway_cent") -> None:
+def _log_closed_pnl(tickets: list, mt5, broker: str = "headway_cent", tf: str = "H1") -> None:
     """Query MT5 deal history for each closed ticket and log realized P&L.
 
     MT5 deal profits are reported in the account currency.  On Headway Cent
@@ -522,14 +526,64 @@ def _log_closed_pnl(tickets: list, mt5, broker: str = "headway_cent") -> None:
                 ticket, pnl, tag, direction, entry_px, exit_px, pts_str, lot,
             )
             send_telegram_msg(
-                f"{emoji} <b>Trade closed</b>  #{ticket}\n"
+                f"{emoji} <b>[{tf}] Trade closed</b>  #{ticket}\n"
                 f"{direction}  lot=<b>{lot:.2f}</b>  "
-                f"entry: <b>{entry_px:.2f}</b> → exit: <b>{exit_px:.2f}</b>\n"
+                f"entry: <b>{entry_px:.2f}</b> -> exit: <b>{exit_px:.2f}</b>\n"
                 f"Move: <b>{pts_str}</b>  |  "
                 f"Realized P&L: <b>{pnl:+.2f} USD</b>  [{emoji} {tag}]"
             )
         except Exception as exc:
             logger.warning("Could not fetch P&L for ticket #%d: %s", ticket, exc)
+
+
+def send_daily_audit_report(mt5, broker: str = "headway_cent") -> None:
+    """Query today's closed deals for all GRX magic numbers and send a P&L summary.
+
+    Groups realized profit by timeframe (H1 / M15 / M5), then sends one
+    consolidated Telegram message.  Called automatically at UTC midnight reset.
+    """
+    from src.notifier import send_telegram_msg
+    now   = datetime.now(timezone.utc)
+    start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) - timedelta(days=1)
+
+    is_cent = (broker == "headway_cent")
+    try:
+        deals = mt5.history_deals_get(start, now) or []
+    except Exception as exc:
+        logger.warning("Daily audit: could not fetch MT5 deal history: %s", exc)
+        return
+
+    # Group closing fills (DEAL_ENTRY_OUT = 1) by TF magic number
+    tf_results: dict[str, tuple[float, int]] = {}
+    for tf_name, magic in TF_MAGIC_MAP.items():
+        tf_deals = [d for d in deals if d.magic == magic and d.entry == 1]
+        if tf_deals:
+            pnl_raw = sum(d.profit + d.commission for d in tf_deals)
+            pnl     = pnl_raw / CENT_MULTIPLIER if is_cent else pnl_raw
+            tf_results[tf_name] = (pnl, len(tf_deals))
+
+    if not tf_results:
+        send_telegram_msg("📅 <b>Daily Performance Report</b>\nNo GRX trades closed today.")
+        return
+
+    lines = ["📅 <b>DAILY PERFORMANCE REPORT</b>"]
+    for tf_name in ["H1", "M15", "M5"]:
+        if tf_name in tf_results:
+            pnl, count = tf_results[tf_name]
+            sign = "+" if pnl >= 0 else ""
+            trade_word = "trade" if count == 1 else "trades"
+            lines.append(f"{tf_name}: <b>{sign}${pnl:.2f}</b> ({count} {trade_word})")
+
+    total_pnl    = sum(v[0] for v in tf_results.values())
+    total_trades = sum(v[1] for v in tf_results.values())
+    sign = "+" if total_pnl >= 0 else ""
+    lines.append(f"<b>TOTAL: {sign}${total_pnl:.2f} USD  ({total_trades} trades)</b>")
+
+    logger.info(
+        "Daily audit: total P&L=%+.2f USD  trades=%d  (broker=%s)",
+        total_pnl, total_trades, broker,
+    )
+    send_telegram_msg("\n".join(lines))
 
 
 def _build_live_df(
@@ -803,6 +857,11 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
 
     display_account_info(trading_balance=account_size)
 
+    # Resolve TF-specific magic number — each TF instance must use its own number
+    # so H1/M15/M5 running simultaneously don't see each other's positions.
+    magic = TF_MAGIC_MAP.get(tf.upper(), TF_MAGIC_MAP["H1"])
+    logger.info("Magic number for [%s]: %d", tf.upper(), magic)
+
     # Load models — prefer broker+TF specific file; fall back to generic
     hmm_path = hmm_model_path(tf, broker)
     if not hmm_path.exists():
@@ -893,18 +952,16 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         PROFIT_ACTIVATION_USD, _atr_mult_log, tf.upper(), MIN_LOT_GUARD,
     )
 
-    # Warn if the MQL5 EA (same MAGIC_NUMBER) already has open positions.
-    # Running both simultaneously causes Python to see EA positions as its own
-    # and block all signal generation via the "Open position — holding" guard.
+    # Warn if the MQL5 EA (same magic number) already has open positions.
     _startup_positions = mt5.positions_get(symbol=DEFAULT_SYMBOL) or []
-    _ea_conflict = [p for p in _startup_positions if p.magic == MAGIC_NUMBER]
+    _ea_conflict = [p for p in _startup_positions if p.magic == magic]
     if _ea_conflict:
         logger.warning(
-            "CONFLICT: %d open position(s) with MAGIC_NUMBER=%d detected at startup. "
+            "CONFLICT: %d open position(s) with magic=%d detected at startup. "
             "These were likely placed by the MQL5 EA (GoldRegimeX.mq5). "
             "Running both EA and Python bridge simultaneously causes signal blocking. "
             "Detach the EA from the chart before continuing.",
-            len(_ea_conflict), MAGIC_NUMBER,
+            len(_ea_conflict), magic,
         )
 
     while True:
@@ -919,6 +976,11 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 # balance here would mismatch the baseline and trigger a false lock.
                 equity_gate.reset_day(account_size)
                 logger.info("New UTC day %s — equity gate reset (anchor $%.2f USD).", today, account_size)
+                # Send yesterday's P&L summary to Telegram at day rollover
+                try:
+                    send_daily_audit_report(mt5, broker=broker)
+                except Exception as _audit_exc:
+                    logger.warning("Daily audit report failed: %s", _audit_exc)
 
             # ── 2. Bar-change detection ───────────────────────────────────
             bars = mt5.copy_rates_from_pos(DEFAULT_SYMBOL, tf_mt5, 1, 1)
@@ -932,11 +994,11 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     open_set = {
                         p.ticket
                         for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                        if p.magic == MAGIC_NUMBER
+                        if p.magic == magic
                     }
                     closed = [t for t in signal_tracker["tickets"] if t not in open_set]
                     if closed:
-                        _log_closed_pnl(closed, mt5)
+                        _log_closed_pnl(closed, mt5, broker=broker, tf=tf)
                         for _t in closed:
                             peak_pnl_tracker.pop(_t, None)
                             atr_state_tracker.pop(_t, None)
@@ -950,21 +1012,22 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 _pnl_divisor = 100 if broker == "headway_cent" else 1
                 _open_pnl = sum(
                     p.profit for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                    if p.magic == MAGIC_NUMBER
+                    if p.magic == magic
                 ) / _pnl_divisor
                 if equity_gate.check(account_size + _open_pnl):
                     if equity_gate.needs_loss_notification:
                         _loss_usd = -_open_pnl
                         logger.warning(
                             "Daily loss limit hit: equity=%.2f  loss=%.2f  "
-                            "(%.0f%% of $%.2f) — closing all & locking until UTC midnight.",
+                            "(%.0f%% of $%.2f) -- closing all & locking until UTC midnight.",
                             account_size + _open_pnl, _loss_usd,
                             equity_gate.loss_pct * 100, account_size,
                         )
                         for _gp in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or []):
-                            if _gp.magic == MAGIC_NUMBER:
+                            if _gp.magic == magic:
                                 _close_position(_gp.ticket, mt5,
-                                                comment="GRX_Daily_Loss_Limit")
+                                                comment="GRX_Daily_Loss_Limit",
+                                                magic=magic)
                         try:
                             send_telegram_msg(
                                 f"🚨 UNIVERSAL SAFETY TRIGGERED [{tf}]: "
@@ -999,7 +1062,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     _atr_cache = signal_tracker.get("atr_price", 0.0)
                     _open_pos  = [
                         p for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                        if p.magic == MAGIC_NUMBER
+                        if p.magic == magic
                         and p.ticket in set(signal_tracker["tickets"])
                     ]
                     for _pos in _open_pos:
@@ -1029,7 +1092,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                             )
                             # Partial close — skipped automatically if lot <= MIN_LOT_GUARD
                             if not _atr_st["partial_done"]:
-                                if _execute_partial_close(_ticket, DEFAULT_SYMBOL, mt5):
+                                if _execute_partial_close(_ticket, DEFAULT_SYMBOL, mt5, magic=magic):
                                     _atr_st["partial_done"] = True
 
                         elif _atr_st["activated"] and _atr_cache > 0:
@@ -1101,13 +1164,13 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 open_set = {
                     p.ticket
                     for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                    if p.magic == MAGIC_NUMBER
+                    if p.magic == magic
                 }
                 active = [t for t in signal_tracker["tickets"] if t in open_set]
                 closed = [t for t in signal_tracker["tickets"] if t not in open_set]
                 # Log P&L for any positions that closed since last bar
                 if closed:
-                    _log_closed_pnl(closed, mt5, broker=broker)
+                    _log_closed_pnl(closed, mt5, broker=broker, tf=tf)
                 # Profit guard: move SL to entry+spread when 70% to TP1 (all TFs)
                 if active:
                     _apply_profit_guard(signal_tracker, mt5)
@@ -1120,21 +1183,37 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 # Use >= CHOP_STATE to cover both Chop_Low (2) and Chop_High (3) in 4-state models.
                 if signal_tracker.get("signal_type") == "trend" and hmm_state >= CHOP_STATE and active:
                     for ticket in active:
-                        _close_position(ticket, mt5)
+                        _close_position(ticket, mt5, magic=magic)
                     logger.info("Trend runner(s) closed: regime shifted to Chop.")
                     active = []
                 elif signal_tracker.get("signal_type") == "mean_reversion" and hmm_state < CHOP_STATE and active:
                     for ticket in active:
-                        _close_position(ticket, mt5, comment="GRX_close_mr_breakout")
+                        _close_position(ticket, mt5, comment="GRX_close_mr_breakout", magic=magic)
                     logger.info("MR position(s) closed: Chop ended, regime broke out to state %d.", hmm_state)
                     active = []
                 signal_tracker["tickets"] = active
 
             # ── 7. Skip new signals if a position is still open ──────────
-            if has_open_position(DEFAULT_SYMBOL, MAGIC_NUMBER):
+            if has_open_position(DEFAULT_SYMBOL, magic):
                 logger.info(
-                    "Open position — holding (prob=%.3f  state=%s).",
+                    "Open position -- holding (prob=%.3f  state=%s).",
                     prob, state_lbl,
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # ── 8. Global multi-TF exposure guard ────────────────────────
+            # Count open positions across ALL three GRX magic numbers so that
+            # H1 + M15 + M5 running simultaneously on the same $15 account
+            # can't exceed 4 open positions total.
+            _all_grx_open = sum(
+                1 for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
+                if p.magic in ALL_GRX_MAGICS
+            )
+            if _all_grx_open >= 4:
+                logger.info(
+                    "[GLOBAL GUARD] Max account exposure reached (%d positions across all TFs). "
+                    "Skipping %s signal.", _all_grx_open, tf,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -1314,7 +1393,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             for p in range(pos_per_trade):
                 tp_price    = tp_levels[p]
                 current_lot = forced_lots[p] if p < len(forced_lots) else forced_lots[-1]
-                comment     = f"GRX_{direction}_p{p+1}of{pos_per_trade}_s{hmm_state}_tp{p+1}"
+                comment     = f"GRX_{tf}_{direction}_s{hmm_state}_tp{p+1}"
                 result = send_market_order(
                     symbol=DEFAULT_SYMBOL,
                     order_type=order_type,
@@ -1322,7 +1401,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     sl=sl_price,
                     tp=tp_price,
                     deviation=deviation,
-                    magic=MAGIC_NUMBER,
+                    magic=magic,
                     comment=comment,
                 )
                 if result["success"]:
