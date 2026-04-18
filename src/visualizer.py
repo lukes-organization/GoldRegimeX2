@@ -41,12 +41,52 @@ def _tf_dir(tf: str = "H1", broker: str = "headway_cent") -> Path:
     return d
 
 
+def _signal_attribution(signals: np.ndarray, hmm_states: np.ndarray,
+                         strategy_returns: np.ndarray, chop_state: int = 2):
+    """Split per-trade stats into Trend vs Mean-Reversion categories.
+
+    Returns a dict with keys:
+        trend_n, trend_win_rate, trend_return
+        mr_n, mr_win_rate, mr_return
+    """
+    prev_sig = np.concatenate([[0], signals[:-1]])
+    is_entry = (signals != 0) & (signals != prev_sig)
+    trade_id = np.cumsum(is_entry)
+
+    entry_bars = np.where(is_entry)[0]
+    trade_type: dict[int, str] = {}
+    for bar_idx in entry_bars:
+        tid = int(trade_id[bar_idx])
+        trade_type[tid] = "trend" if hmm_states[bar_idx] < chop_state else "mr"
+
+    in_trade = signals != 0
+    per_trade: dict[int, float] = {}
+    if in_trade.any():
+        for tid in np.unique(trade_id[in_trade]):
+            per_trade[int(tid)] = float(strategy_returns[(trade_id == tid) & in_trade].sum())
+
+    trend_tr = [v for tid, v in per_trade.items() if trade_type.get(tid) == "trend"]
+    mr_tr    = [v for tid, v in per_trade.items() if trade_type.get(tid) == "mr"]
+
+    def _stats(trades):
+        if not trades:
+            return 0, 0.0, 0.0
+        wr  = sum(1 for v in trades if v > 0) / len(trades)
+        ret = float(np.sum(trades))
+        return len(trades), wr, ret
+
+    tn, twr, tr = _stats(trend_tr)
+    mn, mwr, mr_r = _stats(mr_tr)
+    return {
+        "trend_n": tn, "trend_win_rate": twr, "trend_return": tr,
+        "mr_n":    mn, "mr_win_rate":    mwr, "mr_return":    mr_r,
+    }
+
+
 def plot_regime_overlay(df, hmm_states, state_names, tf="H1", broker="headway_cent", save_path=None):
     """Price chart with HMM regime shading."""
     save_path = save_path or _tf_dir(tf, broker) / "1_regime_overlay.png"
 
-    # Downsample for display — avoids straight-line weekend-gap artefacts and
-    # noisy regime fills that appear white at high bar density (e.g. M5 10yr).
     df_plot, states_plot = _downsample(df, hmm_states)
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 10), height_ratios=[3, 1],
@@ -91,48 +131,80 @@ def plot_regime_overlay(df, hmm_states, state_names, tf="H1", broker="headway_ce
 
 def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", broker="headway_cent",
                       prob_threshold=None, short_threshold=None, save_path=None):
-    """Equity curve, drawdown, and signal markers with train/test split."""
+    """Equity curve with signal-type differentiated entry markers.
+
+    Entry markers are split into four visual categories:
+      Blue   triangle-up   = Trend BUY   (HMM Bull state, prob > threshold)
+      Red    triangle-down = Trend SELL  (HMM Bear state, prob < short_threshold)
+      Gold   circle        = MR BUY      (HMM Chop state, prob at low extreme)
+      Purple circle        = MR SELL     (HMM Chop state, prob at high extreme)
+    """
     save_path = save_path or _tf_dir(tf, broker) / "2_equity_curve.png"
 
-    from src.backtester import compute_signals, compute_position_sizes, PROB_THRESHOLD
+    from src.backtester import compute_signals, compute_position_sizes, PROB_THRESHOLD, CHOP_STATE
 
     _threshold = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
     signals = compute_signals(probabilities, hmm_states,
                               threshold=_threshold, short_threshold=short_threshold)
     sizes = compute_position_sizes(signals, df["atr_normalized"].values)
 
-    log_returns = df["log_return"].values
+    log_returns  = df["log_return"].values
     next_returns = np.roll(log_returns, -1)
     next_returns[-1] = 0.0
     strategy_returns = sizes * next_returns
 
     cumulative_strat = np.cumsum(strategy_returns)
-    cumulative_bh = np.cumsum(log_returns)
+    cumulative_bh    = np.cumsum(log_returns)
 
     running_max = np.maximum.accumulate(cumulative_strat)
     drawdown = running_max - cumulative_strat
 
-    # Downsample display arrays — same reason as regime overlay
+    # Detect first bar of each new signal (entries only, not holds)
+    prev_sig = np.concatenate([[0], signals[:-1]])
+    is_entry = (signals != 0) & (signals != prev_sig)
+
+    trend_buy  = is_entry & (signals == 1)  & (hmm_states < CHOP_STATE)
+    trend_sell = is_entry & (signals == -1) & (hmm_states < CHOP_STATE)
+    mr_buy     = is_entry & (signals == 1)  & (hmm_states >= CHOP_STATE)
+    mr_sell    = is_entry & (signals == -1) & (hmm_states >= CHOP_STATE)
+
+    # Downsample display arrays
     n_total = len(df)
-    step = max(1, n_total // _MAX_DISPLAY_BARS)
-    dates      = df.index[::step]
-    cum_strat  = cumulative_strat[::step]
-    cum_bh     = cumulative_bh[::step]
-    dd_plot    = drawdown[::step]
-    probs_plot = probabilities[::step]
-    sig_plot   = signals[::step]
+    step    = max(1, n_total // _MAX_DISPLAY_BARS)
+    dates        = df.index[::step]
+    cum_strat    = cumulative_strat[::step]
+    cum_bh       = cumulative_bh[::step]
+    dd_plot      = drawdown[::step]
+    probs_plot   = probabilities[::step]
+    trend_buy_p  = trend_buy[::step]
+    trend_sell_p = trend_sell[::step]
+    mr_buy_p     = mr_buy[::step]
+    mr_sell_p    = mr_sell[::step]
 
     fig, axes = plt.subplots(3, 1, figsize=(18, 12), height_ratios=[3, 1, 1],
                               sharex=True, gridspec_kw={"hspace": 0.08})
 
-    # Equity curves
+    # ── Equity curves ───────────────────────────────────────────────────────
     ax1 = axes[0]
     ax1.plot(dates, cum_strat, color="#2980b9", linewidth=1.2, label="Strategy (log return)")
     ax1.plot(dates, cum_bh, color="#95a5a6", linewidth=0.8, alpha=0.7, label="Buy & Hold")
-    entry_mask = sig_plot == 1
-    n_entries = int(np.sum(signals == 1))   # use full signals for true count
-    ax1.scatter(dates[entry_mask], cum_strat[entry_mask],
-                c="#2ecc71", s=5, alpha=0.6, label=f"Long entries ({n_entries})", zorder=3)
+
+    if trend_buy_p.any():
+        ax1.scatter(dates[trend_buy_p], cum_strat[trend_buy_p],
+                    marker="^", c="#2980b9", s=35, alpha=0.75, zorder=4,
+                    label=f"Trend BUY ({int(trend_buy.sum())})")
+    if trend_sell_p.any():
+        ax1.scatter(dates[trend_sell_p], cum_strat[trend_sell_p],
+                    marker="v", c="#e74c3c", s=35, alpha=0.75, zorder=4,
+                    label=f"Trend SELL ({int(trend_sell.sum())})")
+    if mr_buy_p.any():
+        ax1.scatter(dates[mr_buy_p], cum_strat[mr_buy_p],
+                    marker="o", c="#f39c12", s=30, alpha=0.85, zorder=5,
+                    label=f"MR BUY ({int(mr_buy.sum())})")
+    if mr_sell_p.any():
+        ax1.scatter(dates[mr_sell_p], cum_strat[mr_sell_p],
+                    marker="o", c="#9b59b6", s=30, alpha=0.85, zorder=5,
+                    label=f"MR SELL ({int(mr_sell.sum())})")
 
     # Train/test split line
     all_dates = df.index
@@ -141,18 +213,18 @@ def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", br
         for ax in axes:
             ax.axvline(x=split_date, color="#e74c3c", linewidth=1.5, linestyle="--", alpha=0.7)
         ax1.axvspan(split_date, dates[-1], alpha=0.04, color="#e74c3c")
-        ax1.text(split_date, ax1.get_ylim()[1] * 0.95, "  OOS \u2192", fontsize=10,
+        ax1.text(split_date, ax1.get_ylim()[1] * 0.95, "  OOS ->", fontsize=10,
                  color="#e74c3c", fontweight="bold", va="top")
-        ax1.text(split_date, ax1.get_ylim()[1] * 0.95, "\u2190 Train  ", fontsize=10,
+        ax1.text(split_date, ax1.get_ylim()[1] * 0.95, "<- Train  ", fontsize=10,
                  color="#2980b9", fontweight="bold", va="top", ha="right")
 
     ax1.set_ylabel("Cumulative Log Return", fontsize=11)
-    ax1.set_title("Gold Regime X \u2014 Strategy Equity Curve vs Buy & Hold", fontsize=14, fontweight="bold")
-    ax1.legend(loc="upper left", fontsize=10)
+    ax1.set_title("Gold Regime X — Strategy Equity Curve vs Buy & Hold", fontsize=14, fontweight="bold")
+    ax1.legend(loc="upper left", fontsize=9, ncol=2)
     ax1.grid(True, alpha=0.3)
     ax1.axhline(y=0, color="black", linewidth=0.5, alpha=0.5)
 
-    # Drawdown
+    # ── Drawdown ────────────────────────────────────────────────────────────
     ax2 = axes[1]
     ax2.fill_between(dates, 0, -dd_plot * 100, color="#e74c3c", alpha=0.5)
     ax2.set_ylabel("Drawdown (%)", fontsize=11)
@@ -162,11 +234,15 @@ def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", br
                  xy=(dates[max_dd_idx], -dd_plot[max_dd_idx] * 100),
                  fontsize=9, color="#c0392b", fontweight="bold")
 
-    # XGB probability
+    # ── XGB probability ─────────────────────────────────────────────────────
     ax3 = axes[2]
     ax3.scatter(dates, probs_plot, c=probs_plot, cmap="RdYlGn", s=2, alpha=0.4, vmin=0.3, vmax=0.7)
-    ax3.axhline(y=0.65, color="#2ecc71", linewidth=1, linestyle="--", alpha=0.8, label="Long threshold (0.65)")
-    ax3.axhline(y=0.35, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.8, label="Short threshold (0.35)")
+    _buy_th  = _threshold
+    _sell_th = (1.0 - _threshold) if short_threshold is None else short_threshold
+    ax3.axhline(y=_buy_th,  color="#2ecc71", linewidth=1, linestyle="--", alpha=0.8,
+                label=f"Buy threshold ({_buy_th:.2f})")
+    ax3.axhline(y=_sell_th, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.8,
+                label=f"Sell threshold ({_sell_th:.2f})")
     ax3.axhline(y=0.5, color="#7f8c8d", linewidth=0.5, linestyle=":", alpha=0.5)
     ax3.set_ylabel("XGB Probability", fontsize=11)
     ax3.set_ylim(0.25, 0.75)
@@ -183,16 +259,17 @@ def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", br
 
 
 def plot_feature_analysis(X, hmm_states, metrics, tf="H1", broker="headway_cent", save_path=None):
-    """Feature importance, distributions per regime, and correlation."""
+    """Feature importance, RSI regime distributions, regime scatter, and pie."""
     save_path = save_path or _tf_dir(tf, broker) / "3_feature_analysis.png"
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
+    # ── Top-left: XGBoost feature importance ────────────────────────────────
     ax = axes[0, 0]
     importance = metrics.get("feature_importance", {})
-    names = list(importance.keys())
+    names  = list(importance.keys())
     values = [float(v) for v in importance.values()]
-    colors = ["#2980b9", "#27ae60", "#e67e22", "#8e44ad"]
+    colors = ["#2980b9", "#27ae60", "#e67e22", "#8e44ad", "#16a085", "#d35400"]
     bars = ax.barh(names, values, color=colors[:len(names)])
     ax.set_xlabel("Importance (Gain)", fontsize=10)
     ax.set_title("XGBoost Feature Importance", fontsize=12, fontweight="bold")
@@ -201,13 +278,15 @@ def plot_feature_analysis(X, hmm_states, metrics, tf="H1", broker="headway_cent"
                 f"{val:.3f}", va="center", fontsize=9)
     ax.grid(True, alpha=0.3, axis="x")
 
+    # ── Top-right: RSI slope distribution by regime ──────────────────────────
     ax = axes[0, 1]
     unique_states = sorted(np.unique(hmm_states))
     for s in unique_states:
         mask = hmm_states == s
-        data = X.loc[mask, "rsi_slope"].dropna()
-        ax.hist(data, bins=80, alpha=0.5, label=REGIME_LABELS.get(s, str(s)),
-                color=REGIME_COLORS.get(s, "#95a5a6"), density=True)
+        data = X.loc[mask, "rsi_slope"].dropna() if "rsi_slope" in X.columns else pd.Series(dtype=float)
+        if len(data):
+            ax.hist(data, bins=80, alpha=0.5, label=REGIME_LABELS.get(s, str(s)),
+                    color=REGIME_COLORS.get(s, "#95a5a6"), density=True)
     ax.set_xlabel("RSI Slope", fontsize=10)
     ax.set_ylabel("Density", fontsize=10)
     ax.set_title("RSI Slope Distribution by Regime", fontsize=12, fontweight="bold")
@@ -215,22 +294,39 @@ def plot_feature_analysis(X, hmm_states, metrics, tf="H1", broker="headway_cent"
     ax.set_xlim(-10, 10)
     ax.grid(True, alpha=0.3)
 
+    # ── Bottom-left: 2D regime scatter (RSI Slope vs ATR) ───────────────────
+    # This directly visualises how the 3-feature HMM separates Trend from Chop
+    # using momentum (rsi_slope) as the third axis.
     ax = axes[1, 0]
-    for s in unique_states:
-        mask = hmm_states == s
-        data = X.loc[mask, "atr_normalized"].dropna()
-        ax.hist(data, bins=80, alpha=0.5, label=REGIME_LABELS.get(s, str(s)),
-                color=REGIME_COLORS.get(s, "#95a5a6"), density=True)
-    ax.set_xlabel("ATR Normalized", fontsize=10)
-    ax.set_ylabel("Density", fontsize=10)
-    ax.set_title("ATR (Normalized) Distribution by Regime", fontsize=12, fontweight="bold")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    n_feat  = len(X)
+    step_s  = max(1, n_feat // 6000)   # cap scatter pts for readability
+    X_sub   = X.iloc[::step_s]
+    st_sub  = hmm_states[::step_s] if isinstance(hmm_states, np.ndarray) else hmm_states.values[::step_s]
+    if "rsi_slope" in X.columns and "atr_normalized" in X.columns:
+        for s in sorted(np.unique(st_sub)):
+            mask = st_sub == s
+            ax.scatter(
+                X_sub.loc[X_sub.index[np.where(mask)[0]], "rsi_slope"].clip(-8, 8),
+                X_sub.loc[X_sub.index[np.where(mask)[0]], "atr_normalized"],
+                c=REGIME_COLORS.get(int(s), "#95a5a6"), alpha=0.25, s=5,
+                label=REGIME_LABELS.get(int(s), str(s)),
+            )
+        ax.set_xlabel("RSI Slope   (momentum — HMM feature 3)", fontsize=10)
+        ax.set_ylabel("ATR Normalized   (volatility — HMM feature 2)", fontsize=10)
+        ax.set_title("Regime Clusters: RSI Slope vs ATR", fontsize=12, fontweight="bold")
+        ax.legend(fontsize=9, markerscale=3)
+        ax.set_xlim(-8, 8)
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, "rsi_slope / atr_normalized\nnot in feature matrix",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11, color="#7f8c8d")
+        ax.axis("off")
 
+    # ── Bottom-right: Regime distribution pie ───────────────────────────────
     ax = axes[1, 1]
     state_counts = pd.Series(hmm_states).value_counts().sort_index()
-    labels_pie = [REGIME_LABELS.get(s, str(s)) for s in state_counts.index]
-    colors_pie = [REGIME_COLORS.get(s, "#95a5a6") for s in state_counts.index]
+    labels_pie   = [REGIME_LABELS.get(s, str(s)) for s in state_counts.index]
+    colors_pie   = [REGIME_COLORS.get(s, "#95a5a6") for s in state_counts.index]
     wedges, texts, autotexts = ax.pie(
         state_counts.values, labels=labels_pie, colors=colors_pie,
         autopct="%1.1f%%", startangle=90, textprops={"fontsize": 10}
@@ -248,7 +344,7 @@ def plot_transition_matrix(model_hmm, state_names, tf="H1", broker="headway_cent
     """HMM transition matrix heatmap."""
     save_path = save_path or _tf_dir(tf, broker) / "4_transition_matrix.png"
 
-    n = model_hmm.n_components
+    n     = model_hmm.n_components
     trans = model_hmm.transmat_
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -277,90 +373,146 @@ def plot_transition_matrix(model_hmm, state_names, tf="H1", broker="headway_cent
     return str(save_path)
 
 
-def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent", save_path=None):
-    """Single-panel summary card with key metrics and params."""
+def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent",
+                           account_size: float = 15.0, save_path=None):
+    """Single-panel summary card with key metrics, attribution table, and params."""
     save_path = save_path or _tf_dir(tf, broker) / "5_summary_dashboard.png"
 
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, ax = plt.subplots(figsize=(14, 10))
     ax.axis("off")
 
-    # Title block
-    ax.text(0.50, 0.96, "GOLD REGIME X", fontsize=20,
+    # ── Title block ──────────────────────────────────────────────────────────
+    ax.text(0.50, 0.97, "GOLD REGIME X", fontsize=20,
             fontweight="bold", transform=ax.transAxes, va="top", ha="center", color="#2c3e50")
-    ax.text(0.50, 0.90, f"Hybrid HMM + XGBoost | XAUUSD {tf.upper()}", fontsize=12,
-            transform=ax.transAxes, va="top", ha="center", color="#7f8c8d")
+    ax.text(0.50, 0.91, f"Hybrid HMM + XGBoost  |  XAUUSD {tf.upper()}  |  ${account_size:.0f} account",
+            fontsize=12, transform=ax.transAxes, va="top", ha="center", color="#7f8c8d")
+    ax.plot([0.05, 0.95], [0.87, 0.87], color="#bdc3c7", linewidth=1, transform=ax.transAxes)
 
-    # Divider line
-    ax.plot([0.05, 0.95], [0.86, 0.86], color="#bdc3c7", linewidth=1, transform=ax.transAxes)
+    # ── Left column: Full-period performance ─────────────────────────────────
+    fdd      = result.get("floating_max_drawdown", result.get("max_drawdown", 0.0))
+    fdd_usd  = fdd * account_size
+    sharpe   = result["sharpe_ratio"]
+    wr       = result["win_rate"]
+    ret      = result["total_return"]
+    rf       = result.get("recovery_factor", 0.0)
+    pf       = result.get("profit_factor", 1.0)
 
-    # Left column: Full-period metrics
-    metrics_data = [
-        ["Sharpe Ratio", f"{result['sharpe_ratio']:.3f}"],
-        ["Max Drawdown", f"{result['max_drawdown']*100:.1f}%"],
-        ["Win Rate", f"{result['win_rate']*100:.1f}%"],
-        ["Total Return", f"{result['total_return']*100:.1f}%"],
-        ["Trade Count", f"{result['n_trades']}"],
-    ]
-    sharpe_color = "#2ecc71" if 1.0 <= result["sharpe_ratio"] <= 1.5 else "#e67e22"
-    dd_color = "#2ecc71" if 0.08 <= result["max_drawdown"] <= 0.15 else "#e67e22"
-    wr_color = "#2ecc71" if 0.50 <= result["win_rate"] <= 0.55 else "#e67e22"
-    metric_colors = [sharpe_color, dd_color, wr_color, "#3498db", "#3498db"]
-
-    ax.text(0.05, 0.82, "Performance (Full Period)", fontsize=13, fontweight="bold",
+    ax.text(0.05, 0.83, "Performance (Full Period)", fontsize=13, fontweight="bold",
             transform=ax.transAxes, va="top", color="#2c3e50")
-    y = 0.74
-    for i, (label, value) in enumerate(metrics_data):
-        ax.text(0.08, y, label, fontsize=12, transform=ax.transAxes, va="top",
+    metrics_data = [
+        ("Sharpe Ratio",    f"{sharpe:.3f}",  "#2ecc71" if sharpe >= 1.0 else "#e67e22"),
+        ("Recovery Factor", f"{rf:.2f}",      "#2ecc71" if rf >= 1.5 else "#e67e22"),
+        ("Profit Factor",   f"{pf:.2f}",      "#2ecc71" if pf >= 1.2 else "#e67e22"),
+        ("Win Rate",        f"{wr*100:.1f}%", "#3498db"),
+        ("Total Return",    f"{ret*100:.1f}%","#3498db"),
+        ("Trade Count",     f"{result['n_trades']}", "#3498db"),
+        ("Max Float DD",    f"{fdd*100:.1f}%  (~${fdd_usd:.2f})", "#e74c3c" if fdd > 0.10 else "#e67e22"),
+    ]
+    y = 0.75
+    for label, value, color in metrics_data:
+        ax.text(0.07, y, label, fontsize=11, transform=ax.transAxes, va="top",
                 fontfamily="monospace", color="#2c3e50")
-        ax.text(0.35, y, value, fontsize=12, transform=ax.transAxes, va="top",
-                fontfamily="monospace", fontweight="bold", color=metric_colors[i])
-        y -= 0.085
+        ax.text(0.33, y, value, fontsize=11, transform=ax.transAxes, va="top",
+                fontfamily="monospace", fontweight="bold", color=color)
+        y -= 0.075
 
-    # OOS metrics if available
+    # ── OOS metrics ──────────────────────────────────────────────────────────
     if "oos_sharpe_ratio" in result:
-        y -= 0.02
-        ax.text(0.05, y, "Out-of-Sample (Test 20%)", fontsize=13, fontweight="bold",
+        y -= 0.01
+        ax.text(0.05, y, "Out-of-Sample", fontsize=12, fontweight="bold",
                 transform=ax.transAxes, va="top", color="#c0392b")
-        y -= 0.08
+        y -= 0.06
+        oos_fdd = result.get("oos_floating_max_drawdown", result.get("oos_max_drawdown", 0.0))
         oos_data = [
-            ["Sharpe", f"{result['oos_sharpe_ratio']:.3f}"],
-            ["Max DD", f"{result['oos_max_drawdown']*100:.1f}%"],
-            ["Win Rate", f"{result['oos_win_rate']*100:.1f}%"],
-            ["Trades", f"{result['oos_n_trades']}"],
+            ("Sharpe",   f"{result['oos_sharpe_ratio']:.3f}"),
+            ("Max DD",   f"{oos_fdd*100:.1f}%  (~${oos_fdd*account_size:.2f})"),
+            ("Win Rate", f"{result['oos_win_rate']*100:.1f}%"),
+            ("Trades",   f"{result['oos_n_trades']}"),
         ]
         for label, value in oos_data:
-            ax.text(0.08, y, label, fontsize=11, transform=ax.transAxes, va="top",
+            ax.text(0.07, y, label, fontsize=10, transform=ax.transAxes, va="top",
                     fontfamily="monospace", color="#7f8c8d")
-            ax.text(0.25, y, value, fontsize=11, transform=ax.transAxes, va="top",
+            ax.text(0.25, y, value, fontsize=10, transform=ax.transAxes, va="top",
                     fontfamily="monospace", fontweight="bold", color="#c0392b")
-            y -= 0.07
+            y -= 0.065
 
-    # Right column: Target ranges + Params
-    ax.text(0.55, 0.82, "Target Ranges", fontsize=13, fontweight="bold",
+    # ── Middle column: Signal-type attribution ───────────────────────────────
+    ax.text(0.50, 0.83, "Profit Attribution", fontsize=13, fontweight="bold",
             transform=ax.transAxes, va="top", color="#2c3e50")
-    targets = [
-        "Sharpe:   1.0 - 1.5",
-        "Max DD:   8% - 15%",
-        "Win Rate: 50% - 55%",
+    ax.plot([0.48, 0.73], [0.80, 0.80], color="#bdc3c7", linewidth=0.7, transform=ax.transAxes)
+
+    trend_n  = result.get("trend_n", 0)
+    trend_wr = result.get("trend_win_rate", 0.0)
+    trend_r  = result.get("trend_return", 0.0)
+    mr_n     = result.get("mr_n", 0)
+    mr_wr    = result.get("mr_win_rate", 0.0)
+    mr_r     = result.get("mr_return", 0.0)
+
+    def _pnl_str(log_ret):
+        """Convert log-return fraction to approximate USD P&L string."""
+        approx = (float(np.exp(log_ret)) - 1.0) * account_size
+        sign = "+" if approx >= 0 else ""
+        return f"{sign}${approx:.2f}"
+
+    attr_rows = [
+        ("",          "Signal Type", "WR",           "P&L (approx)"),
+        ("Trend",     f"{trend_n} trades", f"{trend_wr*100:.0f}%", _pnl_str(trend_r)),
+        ("MR (Fade)", f"{mr_n} trades",    f"{mr_wr*100:.0f}%",    _pnl_str(mr_r)),
     ]
-    y_right = 0.74
+    col_xs = [0.50, 0.60, 0.67, 0.73]
+    y_attr = 0.77
+    for row_idx, row in enumerate(attr_rows):
+        for col_idx, cell in enumerate(row):
+            weight = "bold" if row_idx == 0 else "normal"
+            fsize  = 9 if row_idx == 0 else 10
+            color  = "#7f8c8d" if row_idx == 0 else "#2c3e50"
+            if row_idx > 0 and col_idx == 3:
+                val = float(np.exp(trend_r if row_idx == 1 else mr_r)) - 1.0
+                color = "#2ecc71" if val >= 0 else "#e74c3c"
+                weight = "bold"
+            ax.text(col_xs[col_idx], y_attr, cell, fontsize=fsize,
+                    transform=ax.transAxes, va="top", fontfamily="monospace",
+                    fontweight=weight, color=color)
+        y_attr -= 0.07
+
+    # Attribution bar chart
+    if trend_n + mr_n > 0:
+        y_bar = y_attr - 0.01
+        bar_w = 0.20
+        bar_h = 0.065
+        trend_frac = trend_n / (trend_n + mr_n) if (trend_n + mr_n) > 0 else 0.5
+        ax.add_patch(plt.Rectangle((0.50, y_bar), bar_w * trend_frac, bar_h,
+                                    transform=ax.transAxes, color="#2980b9", alpha=0.7, zorder=2))
+        ax.add_patch(plt.Rectangle((0.50 + bar_w * trend_frac, y_bar),
+                                    bar_w * (1 - trend_frac), bar_h,
+                                    transform=ax.transAxes, color="#f39c12", alpha=0.7, zorder=2))
+        ax.text(0.50, y_bar - 0.025, "Trade mix: Trend (blue) vs MR (gold)",
+                fontsize=8, transform=ax.transAxes, va="top", color="#7f8c8d")
+
+    # ── Right column: Optimized params ───────────────────────────────────────
+    ax.text(0.78, 0.83, "Optimized Params", fontsize=13, fontweight="bold",
+            transform=ax.transAxes, va="top", color="#2c3e50")
+    ax.text(0.78, 0.79, "Target Ranges", fontsize=10,
+            transform=ax.transAxes, va="top", color="#7f8c8d")
+    targets = ["Sharpe: >= 1.0", "Max DD: <= 15%", "Win Rate: 50-55%", "PF: >= 1.2"]
+    y_right = 0.73
     for t in targets:
-        ax.text(0.58, y_right, t, fontsize=11, transform=ax.transAxes, va="top",
+        ax.text(0.80, y_right, t, fontsize=9, transform=ax.transAxes, va="top",
                 fontfamily="monospace", color="#7f8c8d")
-        y_right -= 0.07
+        y_right -= 0.065
 
     if params:
-        y_right -= 0.04
-        ax.text(0.55, y_right, "Optimized Params", fontsize=13, fontweight="bold",
+        y_right -= 0.02
+        ax.text(0.78, y_right, "Parameters", fontsize=10, fontweight="bold",
                 transform=ax.transAxes, va="top", color="#2c3e50")
-        y_right -= 0.08
+        y_right -= 0.06
         for k, v in params.items():
             val_str = f"{v:.4f}" if isinstance(v, float) else str(v)
-            ax.text(0.58, y_right, f"{k}: {val_str}", fontsize=9, transform=ax.transAxes,
+            ax.text(0.80, y_right, f"{k}: {val_str}", fontsize=8, transform=ax.transAxes,
                     va="top", fontfamily="monospace", color="#34495e")
-            y_right -= 0.055
+            y_right -= 0.05
 
-    # Border
+    # ── Border ───────────────────────────────────────────────────────────────
     fig.patch.set_facecolor("#fafafa")
     rect = plt.Rectangle((0.02, 0.02), 0.96, 0.96, fill=False, edgecolor="#bdc3c7",
                           linewidth=2, transform=ax.transAxes)
@@ -375,15 +527,44 @@ def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent", save_
 def generate_full_report(df, hmm_states, state_names, model_hmm,
                          X, probabilities, metrics, result, params=None,
                          split_idx=None, tf="H1", broker="headway_cent",
-                         prob_threshold=None, short_threshold=None):
-    """Generate all 5 charts into reports/<TF>_<broker>/ and return list of file paths."""
+                         prob_threshold=None, short_threshold=None,
+                         account_size: float = 15.0):
+    """Generate all 5 charts into reports/<TF>_<broker>/ and return list of file paths.
+
+    account_size is used to convert drawdown fractions and signal-attribution
+    log-returns into approximate USD figures on the summary dashboard.
+    """
+    from src.backtester import compute_signals, compute_position_sizes, PROB_THRESHOLD
+
+    # Compute attribution metrics and inject into an enriched copy of result
+    # so plot_summary_dashboard can render the Trend vs MR breakdown.
+    _threshold = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
+    try:
+        _sigs = compute_signals(probabilities, hmm_states,
+                                threshold=_threshold, short_threshold=short_threshold)
+        _sizes = compute_position_sizes(_sigs, df["atr_normalized"].values)
+        _lr    = df["log_return"].values
+        _nr    = np.roll(_lr, -1)
+        _nr[-1] = 0.0
+        _sr    = _sizes * _nr
+        _attr  = _signal_attribution(_sigs, hmm_states, _sr)
+    except Exception as _exc:
+        logger.warning("Signal attribution failed (%s) — dashboard will show zeros.", _exc)
+        _attr = {"trend_n": 0, "trend_win_rate": 0.0, "trend_return": 0.0,
+                 "mr_n": 0, "mr_win_rate": 0.0, "mr_return": 0.0}
+
+    result_enriched = dict(result)
+    result_enriched.update(_attr)
+
     paths = []
     paths.append(plot_regime_overlay(df, hmm_states, state_names, tf=tf, broker=broker))
-    paths.append(plot_equity_curve(df, probabilities, hmm_states, split_idx=split_idx, tf=tf, broker=broker,
+    paths.append(plot_equity_curve(df, probabilities, hmm_states, split_idx=split_idx,
+                                   tf=tf, broker=broker,
                                    prob_threshold=prob_threshold, short_threshold=short_threshold))
     paths.append(plot_feature_analysis(X, hmm_states, metrics, tf=tf, broker=broker))
     paths.append(plot_transition_matrix(model_hmm, state_names, tf=tf, broker=broker))
-    paths.append(plot_summary_dashboard(result, params or {}, tf=tf, broker=broker))
+    paths.append(plot_summary_dashboard(result_enriched, params or {},
+                                        tf=tf, broker=broker, account_size=account_size))
     logger.info("Full report [%s/%s]: %d charts in %s", tf, broker, len(paths),
                 REPORT_DIR / f"{tf.upper()}_{broker}")
     return paths
