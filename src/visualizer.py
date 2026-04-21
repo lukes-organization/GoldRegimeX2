@@ -526,6 +526,116 @@ def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent",
     return str(save_path)
 
 
+def plot_mt5_equity_curve(
+    result: dict,
+    account_size: float = 15.0,
+    split_idx: int = None,
+    tf: str = "H1",
+    broker: str = "headway_cent",
+) -> Path:
+    """MT5 Strategy Tester-style Balance/Equity vs time chart.
+
+    Top panel  — Balance (blue step-line) and Equity (teal continuous line)
+                 with an optional IS/OOS divider.
+    Bottom panel — Deposit Load: shaded fill showing when a position is open
+                   (100%) vs flat (0%), mirroring the MT5 margin-usage strip.
+
+    Balance is sourced from ``result["balance_values"]`` (staircase that only
+    steps at trade close) and Equity from ``result["equity_values"]``
+    (continuous cumulative P&L).  Both arrays are injected by
+    ``vectorized_backtest``; the function is a safe no-op when absent.
+    """
+    timestamps     = result.get("equity_timestamps")
+    equity_values  = result.get("equity_values")
+    balance_values = result.get("balance_values")
+    deposit_load   = result.get("deposit_load")
+    if timestamps is None or equity_values is None:
+        logger.warning("Equity series not in result — skipping MT5 chart.")
+        return None
+
+    dates = pd.to_datetime(timestamps)
+
+    # ── MT5 dark theme ────────────────────────────────────────────────────────
+    BG      = "#131722"
+    GRID    = "#1e2535"
+    BAL_CLR = "#2196f3"   # blue   — Balance
+    EQ_CLR  = "#26a69a"   # teal   — Equity
+    DL_CLR  = "#546e7a"   # slate  — Deposit Load fill
+    TXT     = "#d1d4dc"
+    SPLIT   = "#f59f00"   # amber  — IS/OOS divider
+
+    fig = plt.figure(figsize=(16, 6), facecolor=BG)
+    gs  = fig.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.04)
+    ax1 = fig.add_subplot(gs[0])
+    ax2 = fig.add_subplot(gs[1], sharex=ax1)
+
+    for ax in (ax1, ax2):
+        ax.set_facecolor(BG)
+        ax.tick_params(colors=TXT, labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_color(GRID)
+        ax.grid(True, color=GRID, linewidth=0.5, linestyle="--", alpha=0.7)
+        ax.yaxis.set_label_position("right")
+        ax.yaxis.tick_right()
+        ax.tick_params(axis="y", colors=TXT, labelsize=9)
+
+    # Balance + Equity
+    ax1.plot(dates, balance_values, color=BAL_CLR, linewidth=1.3,
+             label="Balance", drawstyle="steps-post")
+    ax1.plot(dates, equity_values,  color=EQ_CLR,  linewidth=0.9,
+             label="Equity",  alpha=0.85)
+
+    # IS/OOS split line
+    if split_idx and 0 < split_idx < len(dates):
+        split_date = dates[split_idx]
+        ax1.axvline(split_date, color=SPLIT, linewidth=1.0,
+                    linestyle="--", alpha=0.8, label="IS / OOS")
+        ax2.axvline(split_date, color=SPLIT, linewidth=1.0,
+                    linestyle="--", alpha=0.8)
+        # Label just above the x-axis
+        ax2.text(split_date, ax2.get_ylim()[1] * 0.9 if ax2.get_ylim()[1] > 0 else 0.9,
+                 "OOS", color=SPLIT, fontsize=7, ha="left", va="top")
+
+    # Deposit Load
+    if deposit_load is not None:
+        pct = deposit_load * 100.0
+        ax2.fill_between(dates, pct, 0, color=DL_CLR, alpha=0.75, step="post")
+        ax2.set_ylim(0, 120)
+        ax2.set_yticks([0, 100])
+        ax2.set_yticklabels(["0.0%", "100%"], color=TXT, fontsize=8)
+
+    ax1.set_ylabel("USD", color=TXT, fontsize=9)
+    ax2.set_ylabel("Deposit\nLoad", color=TXT, fontsize=8)
+
+    # Legend
+    leg = ax1.legend(facecolor="#1e2535", edgecolor=GRID,
+                     labelcolor=TXT, fontsize=9, loc="upper left")
+
+    # Legend label in top-left corner like MT5
+    ax1.text(0.01, 0.97, "Balance / Equity",
+             transform=ax1.transAxes, color=EQ_CLR,
+             fontsize=9, va="top")
+
+    title = (
+        f"Balance / Equity — {tf.upper()} [{broker}]"
+        f"   Initial: ${account_size:.0f}"
+        f"   Final balance: ${float(balance_values[-1]):.2f}"
+        f"   Final equity: ${float(equity_values[-1]):.2f}"
+    )
+    ax1.set_title(title, color=TXT, fontsize=9, pad=6)
+
+    plt.setp(ax1.get_xticklabels(), visible=False)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y.%m"))
+    ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+    fig.autofmt_xdate(rotation=0, ha="center")
+
+    out_path = _tf_dir(tf, broker) / "6_balance_equity.png"
+    fig.savefig(out_path, dpi=130, bbox_inches="tight", facecolor=BG)
+    plt.close(fig)
+    logger.info("Balance/Equity chart saved: %s", out_path)
+    return out_path
+
+
 def generate_full_report(df, hmm_states, state_names, model_hmm,
                          X, probabilities, metrics, result, params=None,
                          split_idx=None, tf="H1", broker="headway_cent",
@@ -567,6 +677,8 @@ def generate_full_report(df, hmm_states, state_names, model_hmm,
     paths.append(plot_transition_matrix(model_hmm, state_names, tf=tf, broker=broker))
     paths.append(plot_summary_dashboard(result_enriched, params or {},
                                         tf=tf, broker=broker, account_size=account_size))
+    paths.append(plot_mt5_equity_curve(result, account_size=account_size,
+                                       split_idx=split_idx, tf=tf, broker=broker))
     logger.info("Full report [%s/%s]: %d charts in %s", tf, broker, len(paths),
                 REPORT_DIR / f"{tf.upper()}_{broker}")
     return paths

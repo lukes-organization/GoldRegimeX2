@@ -300,6 +300,31 @@ def _compute_floating_drawdown(
     return float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
 
 
+def _compute_balance_curve(
+    equity_arr: np.ndarray,
+    signals: np.ndarray,
+    account_size: float,
+) -> np.ndarray:
+    """Step-function balance: constant while a trade is open, steps at close.
+
+    MT5 Strategy Tester style — Balance only moves when a position is fully
+    closed.  Equity is continuous (includes floating P&L between entries).
+    """
+    in_trade    = signals != 0
+    balance_arr = equity_arr.copy().astype(float)
+    balance_arr[in_trade] = np.nan            # mask in-trade bars
+    if in_trade[0]:
+        balance_arr[0] = account_size         # seed before first trade
+    # Forward-fill: hold the last closed balance across in-trade bars
+    prev = np.nan
+    for i in range(len(balance_arr)):
+        if np.isnan(balance_arr[i]):
+            balance_arr[i] = prev
+        else:
+            prev = balance_arr[i]
+    return balance_arr
+
+
 def vectorized_backtest(
     df,
     probabilities,
@@ -427,6 +452,17 @@ def vectorized_backtest(
         BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0)
         + BROKER_CONFIGS.get(broker, {}).get("commission_frac", 0),
     )
+
+    # ── Equity / Balance series for MT5-style chart ───────────────────────────
+    _cumulative     = np.cumsum(strategy_returns)
+    _equity_arr     = account_size * np.exp(_cumulative)
+    _balance_arr    = _compute_balance_curve(_equity_arr, signals, account_size)
+    _deposit_load   = (signals != 0).astype(np.float32)   # 1 = in-trade bar
+    result["equity_timestamps"] = np.array(df.index)
+    result["equity_values"]     = _equity_arr
+    result["balance_values"]    = _balance_arr
+    result["deposit_load"]      = _deposit_load
+
     return result
 
 

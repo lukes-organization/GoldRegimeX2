@@ -750,12 +750,13 @@ def cmd_report(args):
         split_idx=split_idx, tf=tf, broker=broker,
         prob_threshold=params.get("prob_threshold"),
         short_threshold=params.get("short_threshold"),
+        account_size=balance,
     )
 
     print(f"\n=== Report Generated [{tf} / {broker}] ===")
     for p in paths:
         print(f"  {p}")
-    print(f"\n5 charts saved to reports/{tf}_{broker}/")
+    print(f"\n{len(paths)} charts saved to reports/{tf}_{broker}/")
 
 
 def cmd_audit(args):
