@@ -1193,7 +1193,16 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     active = []
                 signal_tracker["tickets"] = active
 
-            # ── 7. Skip new signals if a position is still open ──────────
+            # ── 7. Skip new signals if equity gate is locked ─────────────
+            if equity_gate.locked:
+                logger.info(
+                    "Equity gate locked — no new signal (state=%s prob=%.3f).",
+                    state_lbl, prob,
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # ── 8. Skip new signals if a position is still open ──────────
             if has_open_position(DEFAULT_SYMBOL, magic):
                 logger.info(
                     "Open position -- holding (prob=%.3f  state=%s).",

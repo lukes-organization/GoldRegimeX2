@@ -167,8 +167,8 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             short_threshold = trial.suggest_float("short_threshold", 0.20, 0.35)
         else:
             # M15 — intermediate between M5 scalp and H1 swing
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.75)
-            short_threshold = trial.suggest_float("short_threshold", 0.25, 0.45)
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.65)
+            short_threshold = trial.suggest_float("short_threshold", 0.35, 0.45)
 
         # Guard: thresholds must not overlap — a crossover means every bar gets
         # both a BUY and SELL signal simultaneously, which is nonsensical.

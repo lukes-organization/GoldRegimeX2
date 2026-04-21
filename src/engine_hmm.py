@@ -3,6 +3,7 @@ import pandas as pd
 import joblib
 from pathlib import Path
 from hmmlearn.hmm import GaussianHMM
+from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from src.logger import setup_logger, log_regime_transition
 
@@ -90,6 +91,43 @@ def _log_transition_matrix(model: GaussianHMM, state_names: dict):
         )
 
 
+def _kmeans_init(X: np.ndarray, n_states: int, random_state: int):
+    """Seed HMM parameters from k-means clusters.
+
+    Pre-seeding means_, covars_, transmat_, and startprob_ from k-means puts
+    the Baum-Welch algorithm near a good solution from iteration 0, reducing
+    local-minima variance across Optuna trials (especially beneficial on the
+    long H1/M15 series where random init shows higher result scatter).
+
+    Returns (means, covars, transmat, startprob) ready to assign to a
+    GaussianHMM instance before calling fit() with init_params="".
+    """
+    km = KMeans(n_clusters=n_states, random_state=random_state, n_init=10)
+    labels = km.fit_predict(X)
+    n_features = X.shape[1]
+
+    means = km.cluster_centers_                               # (k, f)
+    covars = np.array([
+        np.cov(X[labels == k].T) + np.eye(n_features) * 1e-6 # regularise
+        if (labels == k).sum() > 1
+        else np.eye(n_features)
+        for k in range(n_states)
+    ])                                                         # (k, f, f)
+
+    # Sequential transition counts → row-normalised transmat
+    transmat = np.zeros((n_states, n_states))
+    for t in range(len(labels) - 1):
+        transmat[labels[t], labels[t + 1]] += 1
+    row_sums = transmat.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    transmat /= row_sums
+
+    counts = np.bincount(labels, minlength=n_states).astype(float)
+    startprob = counts / counts.sum()
+
+    return means, covars, transmat, startprob
+
+
 def fit_hmm(
     df: pd.DataFrame,
     n_states: int = 3,
@@ -107,13 +145,22 @@ def fit_hmm(
     # time the H1 bar closes.  StandardScaler ensures equal contribution.
     obs_scaler = StandardScaler()
     X = obs_scaler.fit_transform(X_raw)
+
+    # Seed HMM from k-means clusters — reduces local-minima variance vs random init.
+    # init_params="" tells hmmlearn not to overwrite our priors before fitting.
+    means, covars, transmat, startprob = _kmeans_init(X, n_states, random_state)
     model = GaussianHMM(
         n_components=n_states,
         covariance_type="full",
         n_iter=n_iter,
         random_state=random_state,
         verbose=False,
+        init_params="",
     )
+    model.means_     = means
+    model.covars_    = covars
+    model.transmat_  = transmat
+    model.startprob_ = startprob
     model.fit(X)
     # Persist the scaler as an attribute so predict_states can reuse it.
     # joblib.dump preserves custom attributes, so save_model/load_model
