@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 # ── Default Z-Score configuration ─────────────────────────────────────────────
 _DEFAULT_CONFIG: Dict[str, Any] = {
     # Trend-following cutoffs
-    "Z_CUTOFF_BULL":  1.5,   # BUY  when z > +1.5σ in Bull regime
-    "Z_CUTOFF_BEAR": -1.5,   # SELL when z < −1.5σ in Bear regime
+    "Z_CUTOFF_BULL":  2.5,   # BUY  when z > +2.5σ in Bull regime
+    "Z_CUTOFF_BEAR": -2.5,   # SELL when z < −2.5σ in Bear regime
     # Per-chop-state MR cutoffs (Chop_Low is easier to fade than Chop_High)
     "Z_CUTOFF_CHOP_MR": {2: 2.2, 3: 2.8},
     # Volatility adjustments applied when GMM cluster == 2 (high vol)
