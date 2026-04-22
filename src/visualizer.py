@@ -130,22 +130,24 @@ def plot_regime_overlay(df, hmm_states, state_names, tf="H1", broker="headway_ce
 
 
 def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", broker="headway_cent",
-                      prob_threshold=None, short_threshold=None, save_path=None):
+                      regime_stats=None, save_path=None):
     """Equity curve with signal-type differentiated entry markers.
 
     Entry markers are split into four visual categories:
-      Blue   triangle-up   = Trend BUY   (HMM Bull state, prob > threshold)
-      Red    triangle-down = Trend SELL  (HMM Bear state, prob < short_threshold)
-      Gold   circle        = MR BUY      (HMM Chop state, prob at low extreme)
-      Purple circle        = MR SELL     (HMM Chop state, prob at high extreme)
+      Blue   triangle-up   = Trend BUY   (HMM Bull state, high positive Z-Score)
+      Red    triangle-down = Trend SELL  (HMM Bear state, high negative Z-Score)
+      Gold   circle        = MR BUY      (HMM Chop state, extreme low Z-Score)
+      Purple circle        = MR SELL     (HMM Chop state, extreme high Z-Score)
     """
     save_path = save_path or _tf_dir(tf, broker) / "2_equity_curve.png"
 
-    from src.backtester import compute_signals, compute_position_sizes, PROB_THRESHOLD, CHOP_STATE
+    from src.backtester import compute_signals, compute_signals_zscore, compute_position_sizes, PROB_THRESHOLD, CHOP_STATE
 
-    _threshold = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
-    signals = compute_signals(probabilities, hmm_states,
-                              threshold=_threshold, short_threshold=short_threshold)
+    if regime_stats:
+        gmm_clusters = df["gmm_vol_cluster"].values if "gmm_vol_cluster" in df.columns else None
+        signals = compute_signals_zscore(probabilities, hmm_states, regime_stats, gmm_clusters)
+    else:
+        signals = compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD)
     sizes = compute_position_sizes(signals, df["atr_normalized"].values)
 
     log_returns  = df["log_return"].values
@@ -237,13 +239,7 @@ def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", br
     # ── XGB probability ─────────────────────────────────────────────────────
     ax3 = axes[2]
     ax3.scatter(dates, probs_plot, c=probs_plot, cmap="RdYlGn", s=2, alpha=0.4, vmin=0.3, vmax=0.7)
-    _buy_th  = _threshold
-    _sell_th = (1.0 - _threshold) if short_threshold is None else short_threshold
-    ax3.axhline(y=_buy_th,  color="#2ecc71", linewidth=1, linestyle="--", alpha=0.8,
-                label=f"Buy threshold ({_buy_th:.2f})")
-    ax3.axhline(y=_sell_th, color="#e74c3c", linewidth=1, linestyle="--", alpha=0.8,
-                label=f"Sell threshold ({_sell_th:.2f})")
-    ax3.axhline(y=0.5, color="#7f8c8d", linewidth=0.5, linestyle=":", alpha=0.5)
+    ax3.axhline(y=0.5, color="#7f8c8d", linewidth=1, linestyle="--", alpha=0.7, label="Mid (0.50)")
     ax3.set_ylabel("XGB Probability", fontsize=11)
     ax3.set_ylim(0.25, 0.75)
     ax3.legend(loc="upper right", fontsize=9)
@@ -639,21 +635,24 @@ def plot_mt5_equity_curve(
 def generate_full_report(df, hmm_states, state_names, model_hmm,
                          X, probabilities, metrics, result, params=None,
                          split_idx=None, tf="H1", broker="headway_cent",
-                         prob_threshold=None, short_threshold=None,
                          account_size: float = 15.0):
-    """Generate all 5 charts into reports/<TF>_<broker>/ and return list of file paths.
+    """Generate all 6 charts into reports/<TF>_<broker>/ and return list of file paths.
 
     account_size is used to convert drawdown fractions and signal-attribution
     log-returns into approximate USD figures on the summary dashboard.
     """
-    from src.backtester import compute_signals, compute_position_sizes, PROB_THRESHOLD
+    from src.backtester import compute_signals_zscore, compute_signals, compute_position_sizes, PROB_THRESHOLD
+
+    regime_stats = metrics.get("regime_stats") if metrics else None
 
     # Compute attribution metrics and inject into an enriched copy of result
     # so plot_summary_dashboard can render the Trend vs MR breakdown.
-    _threshold = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
     try:
-        _sigs = compute_signals(probabilities, hmm_states,
-                                threshold=_threshold, short_threshold=short_threshold)
+        if regime_stats:
+            gmm_clusters = df["gmm_vol_cluster"].values if "gmm_vol_cluster" in df.columns else None
+            _sigs = compute_signals_zscore(probabilities, hmm_states, regime_stats, gmm_clusters)
+        else:
+            _sigs = compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD)
         _sizes = compute_position_sizes(_sigs, df["atr_normalized"].values)
         _lr    = df["log_return"].values
         _nr    = np.roll(_lr, -1)
@@ -672,7 +671,7 @@ def generate_full_report(df, hmm_states, state_names, model_hmm,
     paths.append(plot_regime_overlay(df, hmm_states, state_names, tf=tf, broker=broker))
     paths.append(plot_equity_curve(df, probabilities, hmm_states, split_idx=split_idx,
                                    tf=tf, broker=broker,
-                                   prob_threshold=prob_threshold, short_threshold=short_threshold))
+                                   regime_stats=regime_stats))
     paths.append(plot_feature_analysis(X, hmm_states, metrics, tf=tf, broker=broker))
     paths.append(plot_transition_matrix(model_hmm, state_names, tf=tf, broker=broker))
     paths.append(plot_summary_dashboard(result_enriched, params or {},

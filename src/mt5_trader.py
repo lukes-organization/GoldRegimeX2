@@ -878,8 +878,6 @@ def run_live_loop(
     tf: str          = "H1",
     broker: str      = "headway_cent",
     account_size: float = None,
-    prob_threshold_override: float = None,
-    short_threshold_override: float = None,
     profit_target: float = None,
 ) -> None:
     """Connect to MT5 and run the signal → order loop until interrupted.
@@ -903,17 +901,13 @@ def run_live_loop(
         raise ConnectionError("Could not connect to MT5 terminal.")
 
     try:
-        _run_loop_inner(tf, broker, account_size, mt5,
-                        prob_threshold_override, short_threshold_override,
-                        profit_target)
+        _run_loop_inner(tf, broker, account_size, mt5, profit_target)
     finally:
         disconnect_mt5()
         logger.info("Live loop terminated.  MT5 disconnected.")
 
 
 def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
-                    prob_threshold_override: float = None,
-                    short_threshold_override: float = None,
                     profit_target: float = None) -> None:
     """Inner loop extracted to allow clean finally / disconnect in run_live_loop."""
     tf_mt5 = _get_tf_map()[tf.upper()]
@@ -976,31 +970,14 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         params    = get_best_params(balance=account_size, broker=broker, tf=tf)
         obs_cov   = params.get("obs_cov")
         trans_cov = params.get("trans_cov")
-        prob_threshold_opt = params.get("prob_threshold")
     except Exception:
         params    = {}
         obs_cov   = None
         trans_cov = None
-        prob_threshold_opt = None
 
     cfg_tf    = TF_CONFIG[tf.upper()]
     obs_cov   = obs_cov   if obs_cov   is not None else cfg_tf["obs_cov_default"]
     trans_cov = trans_cov if trans_cov is not None else cfg_tf["trans_cov_default"]
-
-    # Use optimized thresholds if available; otherwise fall back to TF hardcoded values.
-    # Both prob_threshold (BUY) and short_threshold (SELL) are now Optuna-tuned
-    # so the optimizer finds the best asymmetric no-trade zone for each TF.
-    if prob_threshold_opt is not None:
-        prob_threshold  = prob_threshold_opt
-        short_threshold = params.get("short_threshold", 1.0 - prob_threshold_opt)
-    else:
-        prob_threshold  = TF_PROB_THRESHOLD.get(tf.upper(), 0.65)
-        short_threshold = TF_SHORT_THRESHOLD.get(tf.upper(), 0.35)
-    # CLI override has highest priority — applied after Optuna resolution
-    if prob_threshold_override is not None:
-        prob_threshold  = prob_threshold_override
-    if short_threshold_override is not None:
-        short_threshold = short_threshold_override
 
     # Session state (persists across bars within a day)
     last_bar_time = None
@@ -1034,12 +1011,6 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     logger.info(
         "Live loop started — TF=%s  broker=%s  balance=$%.2f  %s",
         tf, broker, account_size, arm,
-    )
-    logger.info(
-        "Signal thresholds — BUY>%.3f  SELL<%.3f  (source: %s)",
-        prob_threshold, short_threshold,
-        "override" if (prob_threshold_override or short_threshold_override)
-        else ("optuna" if prob_threshold_opt is not None else "hardcoded"),
     )
 
     # ATR-linked trailing stop applies to all TFs unconditionally.
@@ -1301,8 +1272,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             # ── 7. Skip new signals if equity gate is locked ─────────────
             if equity_gate.locked:
                 logger.info(
-                    "Equity gate locked — no new signal (state=%s prob=%.3f).",
-                    state_lbl, prob,
+                    "Equity gate locked — no new signal (state=%s).",
+                    state_lbl,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -1310,8 +1281,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             # ── 8. Skip new signals if a position is still open ──────────
             if has_open_position(DEFAULT_SYMBOL, magic):
                 logger.info(
-                    "Open position -- holding (prob=%.3f  state=%s).",
-                    prob, state_lbl,
+                    "Open position -- holding (state=%s).",
+                    state_lbl,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -1399,9 +1370,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                                else "CHOP")
                 _z = _sig_eval["confidence"]
                 logger.info(
-                    "[LOGIC AUDIT] %s Regime | state=%d  prob=%.3f  z=%.2f  "
+                    "[LOGIC AUDIT] %s Regime | state=%d  z=%.2f  "
                     "bars=%d  P(stay)=%.2f  BB=%.2f | %s",
-                    regime_desc, hmm_state, prob, _z,
+                    regime_desc, hmm_state, _z,
                     _stability["consecutive_bars"], _t_prob, _bb_pos,
                     _sig_eval["reason"],
                 )
@@ -1479,8 +1450,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                               "signal_type": signal_type}
             peak_pnl_tracker = {}
             logger.info(
-                "SIGNAL %s | state=%d | prob=%.3f | lots=%s | sl=%.2f | tp=%s | dev=%d",
-                direction, hmm_state, prob,
+                "SIGNAL %s | state=%d | z=%.2f | lots=%s | sl=%.2f | tp=%s | dev=%d",
+                direction, hmm_state, _sig_eval["confidence"],
                 "+".join(f"{l:.2f}" for l in forced_lots[:pos_per_trade]),
                 sl_price, "/".join(f"{t:.2f}" for t in tp_levels), deviation,
             )

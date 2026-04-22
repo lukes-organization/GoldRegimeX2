@@ -166,7 +166,7 @@ def _handle(token: str, chat_id, user_id: str, text: str) -> None:
         _reply(
             token, chat_id,
             "📉 <b>M5 Optimisation started</b>\n"
-            "prob_threshold range: <b>0.50 – 0.55</b>\n"
+            "Signal thresholds: <b>Z-Score calibrated</b> (auto from IS regime stats)\n"
             "Target: <b>500 trials</b> (resumes from study.db if interrupted)\n\n"
             "You will receive Telegram updates at every 10% milestone.",
         )
