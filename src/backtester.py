@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from src.logger import setup_logger
 from src.risk_manager import BROKER_CONFIGS, AdaptiveRiskManager
+from src.signal_evaluator import SignalEvaluator
 
 logger = setup_logger(__name__)
 
@@ -105,6 +106,39 @@ def compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD,
     mr_sell = ((probabilities > (threshold + 0.10))       & chop_regime).astype(int)
 
     return (buy - sell + mr_buy - mr_sell).clip(-1, 1)
+
+
+def compute_signals_zscore(
+    probabilities: np.ndarray,
+    hmm_states:    np.ndarray,
+    regime_stats:  dict,
+    gmm_clusters:  np.ndarray | None = None,
+) -> np.ndarray:
+    """Vectorised Z-Score signal generation — used when regime_stats are available.
+
+    No live-safety gates (consecutive-bars / transition-prob / Bollinger Bands)
+    are applied here.  Those are execution safeguards added only by the live
+    bridge.  This function evaluates the *pure signal edge* so the backtester
+    and optimiser score the same logic the SignalEvaluator implements.
+
+    Signal encoding matches :func:`compute_signals`: ``1=BUY, -1=SELL, 0=no trade``.
+    MR_BUY and MR_SELL are collapsed to +1 / −1 respectively.
+    """
+    evaluator = SignalEvaluator(regime_stats)
+    n         = len(probabilities)
+    signals   = np.zeros(n, dtype=np.int8)
+    for i in range(n):
+        gmc = int(gmm_clusters[i]) if gmm_clusters is not None else 1
+        sig, _ = evaluator.evaluate_signal_fast(
+            prob_buy=float(probabilities[i]),
+            hmm_state=int(hmm_states[i]),
+            gmm_cluster=gmc,
+        )
+        if sig in ("BUY", "MR_BUY"):
+            signals[i] = 1
+        elif sig in ("SELL", "MR_SELL"):
+            signals[i] = -1
+    return signals
 
 
 def compute_position_sizes(
@@ -335,6 +369,7 @@ def vectorized_backtest(
     tf: str = "H1",
     prob_threshold: float = None,
     short_threshold: float = None,
+    regime_stats: dict = None,
 ):
     """Vectorized backtest with adaptive session limits and broker costs.
 
@@ -346,21 +381,36 @@ def vectorized_backtest(
         account_size: Account balance in USD; drives adaptive session limits.
         broker: Broker profile key from ``BROKER_CONFIGS``.
         tf: Timeframe string used for correct annualization ("H1" or "M15").
-        prob_threshold: BUY threshold — signal when prob > this value.
-                        Defaults to PROB_THRESHOLD (0.65) if not supplied.
-        short_threshold: SELL threshold — signal when prob < this value.
-                         Defaults to ``1 - prob_threshold`` if not supplied,
-                         giving a symmetric no-trade zone around 0.5.
+        prob_threshold: BUY threshold (legacy fixed-threshold mode).  Ignored
+                        when *regime_stats* is supplied.
+        short_threshold: SELL threshold (legacy).  Ignored when *regime_stats*
+                         is supplied.
+        regime_stats: Per-HMM-state probability statistics produced by
+                      :func:`~src.engine_xgb.compute_regime_stats`.  When
+                      provided, signals are generated via Z-Score calibration
+                      (:func:`compute_signals_zscore`) instead of the legacy
+                      fixed-threshold method.
     """
     log_returns = df["log_return"].values
     atr_norm    = df["atr_normalized"].values
 
-    buy_th = prob_threshold  if prob_threshold  is not None else PROB_THRESHOLD
-    raw_signals = compute_signals(
-        probabilities, hmm_states,
-        threshold=buy_th,
-        short_threshold=short_threshold,   # None → symmetric default inside
-    )
+    # ── Signal generation ─────────────────────────────────────────────────
+    if regime_stats:
+        gmm_clusters = (
+            df["gmm_vol_cluster"].values
+            if "gmm_vol_cluster" in df.columns
+            else None
+        )
+        raw_signals = compute_signals_zscore(
+            probabilities, hmm_states, regime_stats, gmm_clusters
+        )
+    else:
+        buy_th = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
+        raw_signals = compute_signals(
+            probabilities, hmm_states,
+            threshold=buy_th,
+            short_threshold=short_threshold,  # None → symmetric default inside
+        )
 
     # Spread-Aware Adaptive Filter: suppress signals where ATR / spread is below
     # the TF-specific minimum efficiency threshold.
@@ -477,6 +527,7 @@ def run_walk_forward(
     tf: str                = "H1",
     prob_threshold: float  = None,
     short_threshold: float = None,
+    regime_stats: dict     = None,
 ) -> dict:
     """Roll a fixed-weight model across time to compute Walk-Forward Efficiency.
 
@@ -539,6 +590,7 @@ def run_walk_forward(
                 account_size=account_size,
                 broker=broker,
                 tf=tf,
+                regime_stats=regime_stats,
                 prob_threshold=prob_threshold,
                 short_threshold=short_threshold,
             )

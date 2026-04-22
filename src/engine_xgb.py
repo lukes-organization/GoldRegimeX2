@@ -424,13 +424,61 @@ def get_predictions_ensemble(
     return predictions, probabilities
 
 
+def compute_regime_stats(
+    models: dict,
+    thresholds: tuple[float, float],
+    X_is: pd.DataFrame,
+    hmm_states_is: np.ndarray,
+) -> dict:
+    """Compute per-HMM-state probability statistics from In-Sample data.
+
+    These statistics calibrate the :class:`~src.signal_evaluator.SignalEvaluator`
+    Z-Score thresholds.  Call on IS data only (no look-ahead into OOS bars).
+
+    Args:
+        models:       ``{"low": xgb, "med": xgb, "high": xgb}`` trained ensemble.
+        thresholds:   ``(p33, p66)`` ATR percentile from IS data.
+        X_is:         IS feature DataFrame (same index slice as used for training).
+        hmm_states_is: HMM state labels aligned with ``X_is``.
+
+    Returns:
+        Mapping of ``state_id → {"mean": float, "std": float, "count": int}``.
+    """
+    _, probs = get_predictions_ensemble(models, thresholds, X_is)
+
+    regime_stats: dict = {}
+    for state in sorted(np.unique(hmm_states_is)):
+        mask     = hmm_states_is == state
+        n        = int(mask.sum())
+        state_p  = probs[mask]
+        if n >= 30:
+            mean = float(np.mean(state_p))
+            std  = float(max(np.std(state_p), 0.02))
+        else:
+            logger.warning(
+                "State %d: only %d IS samples — using fallback stats (mean=0.50, std=0.15)",
+                state, n,
+            )
+            mean, std = 0.50, 0.15
+        regime_stats[int(state)] = {"mean": mean, "std": std, "count": n}
+        logger.info(
+            "  Regime stats  state=%d  mean=%.4f  std=%.4f  n=%d", state, mean, std, n
+        )
+    return regime_stats
+
+
 def save_xgb_ensemble(
     models: dict,
     thresholds: tuple[float, float],
     metrics: dict,
     path: Path = ENSEMBLE_PKL_PATH,
 ) -> None:
-    """Persist the ensemble (3 models + thresholds + metadata) to a single pkl."""
+    """Persist the ensemble (3 models + thresholds + metadata) to a single pkl.
+
+    ``metrics`` may include a ``"regime_stats"`` key (added by callers after
+    :func:`compute_regime_stats`) which is stored transparently alongside the
+    model weights and loaded back by :func:`load_xgb_ensemble`.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({"models": models, "thresholds": thresholds, "metrics": metrics}, path)
     logger.info("Ensemble saved to %s", path)

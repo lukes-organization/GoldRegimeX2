@@ -182,7 +182,7 @@ def run_validation(
                 "Run --mode train --tf %s --broker %s to create a dedicated model.", tf, broker, xgb_path, tf, broker
             )
     try:
-        models_xgb, thresholds_xgb, _ = load_xgb_ensemble(xgb_path)
+        models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble(xgb_path)
     except FileNotFoundError:
         raise FileNotFoundError(
             "XGB ensemble not found at models/xgb_ensemble.pkl. "
@@ -211,8 +211,7 @@ def run_validation(
         account_size=account_size,
         broker=broker,
         tf=tf,
-        prob_threshold=params.get("prob_threshold"),
-        short_threshold=params.get("short_threshold"),
+        regime_stats=xgb_meta.get("regime_stats"),
     )
 
     sharpe   = result["sharpe_ratio"]

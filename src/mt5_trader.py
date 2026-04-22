@@ -41,6 +41,7 @@ from src.engine_xgb import (
     get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
 )
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
+from src.signal_evaluator import SignalEvaluator
 
 logger = setup_logger(__name__)
 
@@ -802,6 +803,77 @@ def send_market_order(
 # Live execution loop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _update_regime_stability(tracker: dict, hmm_state: int) -> dict:
+    """Update per-bar regime stability state and return a stability info dict.
+
+    The *tracker* dict is mutated in-place and must be initialised once per
+    loop run as::
+
+        tracker = {"current_state": None, "consecutive_bars": 0,
+                   "previous_state": None, "exited_from_state": None}
+    """
+    if tracker["current_state"] is None:
+        tracker["current_state"]   = hmm_state
+        tracker["consecutive_bars"] = 1
+        tracker["previous_state"]  = hmm_state
+        tracker["exited_from_state"] = None
+    elif hmm_state != tracker["current_state"]:
+        logger.info(
+            "[REGIME CHANGE] %d → %d after %d bars",
+            tracker["current_state"], hmm_state, tracker["consecutive_bars"],
+        )
+        tracker["exited_from_state"] = tracker["current_state"]
+        tracker["previous_state"]    = tracker["current_state"]
+        tracker["current_state"]     = hmm_state
+        tracker["consecutive_bars"]  = 1
+    else:
+        tracker["consecutive_bars"] += 1
+
+    is_chop = hmm_state in (2, 3)
+    return {
+        "is_chop":              is_chop,
+        "consecutive_bars":     tracker["consecutive_bars"],
+        "is_stable_chop":       is_chop and tracker["consecutive_bars"] >= 3,
+        "just_entered_state":   tracker["consecutive_bars"] == 1,
+        "regime_changed_this_bar": tracker["consecutive_bars"] == 1,
+        "exited_from_state":    tracker["exited_from_state"],
+        "previous_state":       tracker["previous_state"],
+    }
+
+
+def _get_transition_prob(model_hmm, hmm_state: int) -> float:
+    """Return P(state → state) from the HMM transition matrix (self-transition)."""
+    try:
+        transmat = model_hmm.transmat_
+        if hmm_state < transmat.shape[0]:
+            return float(transmat[hmm_state, hmm_state])
+    except Exception:
+        pass
+    return 0.70
+
+
+def _calculate_bb_position(close_prices: np.ndarray, period: int = 20,
+                            num_std: float = 2.0) -> float:
+    """Return price position within Bollinger Bands: 0 = lower band, 1 = upper band.
+
+    Returns 0.5 (neutral) if there are insufficient bars or the band is too narrow.
+    """
+    if len(close_prices) < period:
+        return 0.5
+    try:
+        sma    = np.mean(close_prices[-period:])
+        std    = np.std(close_prices[-period:])
+        upper  = sma + num_std * std
+        lower  = sma - num_std * std
+        bw     = upper - lower
+        if bw < 1e-6:
+            return 0.5
+        pos = (close_prices[-1] - lower) / bw
+        return float(np.clip(pos, 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
 def run_live_loop(
     tf: str          = "H1",
     broker: str      = "headway_cent",
@@ -880,6 +952,24 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     except FileNotFoundError:
         raise FileNotFoundError("XGB ensemble model not found. Run --mode train first.")
 
+    # Load regime statistics and build the adaptive signal evaluator
+    regime_stats     = xgb_meta.get("regime_stats", {})
+    signal_evaluator = SignalEvaluator(regime_stats)
+    if regime_stats:
+        logger.info(
+            "Z-Score signal mode: regime stats loaded for %d states", len(regime_stats)
+        )
+        for _s, _st in regime_stats.items():
+            logger.info(
+                "  State %d: mean=%.4f  std=%.4f  n=%d",
+                _s, _st["mean"], _st["std"], _st["count"],
+            )
+    else:
+        logger.warning(
+            "No regime_stats found in model — fixed-threshold fallback active. "
+            "Re-train to enable Z-Score calibration."
+        )
+
     # Resolve Kalman params from Optuna study or TF defaults
     try:
         from src.optimizer import get_best_params
@@ -929,6 +1019,16 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     # Two-sided equity gate: loss side (5%) + Trailing Daily Equity Lock (profit side)
     equity_gate = DailyEquityGate(tf=tf)
     equity_gate.reset_day(account_size)
+
+    # Regime stability tracker for adaptive Z-Score gating
+    regime_stability_tracker: dict = {
+        "current_state":    None,
+        "consecutive_bars": 0,
+        "previous_state":   None,
+        "exited_from_state": None,
+    }
+    # Rolling close-price cache for Bollinger Band confluence filter (live only)
+    close_prices_cache: list = []
 
     arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
     logger.info(
@@ -1111,6 +1211,11 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 continue
             last_bar_time = bar_time
 
+            # Update rolling close cache for Bollinger Band confluence filter
+            close_prices_cache.append(float(bars[0]["close"]))
+            if len(close_prices_cache) > 50:
+                close_prices_cache.pop(0)
+
             # ── 3. Refresh telemetry for margin/display (risk sizing always
             #        uses the caller-supplied account_size, not the live MT5
             #        balance, because demo accounts carry arbitrary balances).
@@ -1227,98 +1332,78 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── 9. Signal routing — mirrors compute_signals() in backtester ──
-            # Trend regime: trade WITH model conviction (Bull→BUY, Bear→SELL).
-            # Mean Reversion regime: trade AGAINST extremes in Chop states.
-            is_chop = (hmm_state >= CHOP_STATE)
-            mr_buy_threshold  = short_threshold - 0.10
-            mr_sell_threshold = prob_threshold  + 0.10
+            # ── 9. Signal routing — adaptive Z-Score evaluation ──────────
+            # Updates regime stability and evaluates via SignalEvaluator when
+            # regime_stats are available; falls back to fixed-threshold logic
+            # for models trained before Z-Score calibration was added.
+            _stability  = _update_regime_stability(regime_stability_tracker, hmm_state)
+            _t_prob     = _get_transition_prob(model_hmm, hmm_state)
+            _bb_pos     = _calculate_bb_position(np.array(close_prices_cache))
+            _gmc        = gmm_cluster if gmm_cluster >= 0 else 1
+            _sig_eval   = signal_evaluator.evaluate_signal(
+                prob_buy=prob,
+                hmm_state=hmm_state,
+                gmm_cluster=_gmc,
+                stability=_stability,
+                bb_position=_bb_pos,
+                transition_prob=_t_prob,
+            )
+            _sig_str = _sig_eval["signal"]
 
-            if prob > prob_threshold and hmm_state == BULL_STATE:
+            if _sig_str == "BUY":
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
                 signal_type = "trend"
-            elif prob < short_threshold and hmm_state == BEAR_STATE:
+                logger.info(
+                    "[SIGNAL] BUY (trend) | z=%.2f | %s",
+                    _sig_eval["confidence"], _sig_eval["reason"],
+                )
+            elif _sig_str == "SELL":
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
                 signal_type = "trend"
-            elif is_chop and prob < mr_buy_threshold:
+                logger.info(
+                    "[SIGNAL] SELL (trend) | z=%.2f | %s",
+                    _sig_eval["confidence"], _sig_eval["reason"],
+                )
+            elif _sig_str == "MR_BUY":
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
                 signal_type = "mean_reversion"
                 logger.info(
-                    "[MEAN REVERSION SIGNAL] BUY — Chop state=%d  prob=%.3f < %.3f (mr_buy ceiling)",
-                    hmm_state, prob, mr_buy_threshold,
+                    "[SIGNAL] MR_BUY | z=%.2f | %s",
+                    _sig_eval["confidence"], _sig_eval["reason"],
                 )
                 if gmm_cluster == 2:
                     logger.warning(
-                        "[MR WARNING] High-Vol environment (GMM cluster=2). "
-                        "Mean Reversion has lower edge in breakout conditions — watch closely."
+                        "[MR WARNING] High-vol environment (GMM cluster=2) — "
+                        "MR has lower edge in breakout conditions."
                     )
-            elif is_chop and prob > mr_sell_threshold:
+            elif _sig_str == "MR_SELL":
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
                 signal_type = "mean_reversion"
                 logger.info(
-                    "[MEAN REVERSION SIGNAL] SELL — Chop state=%d  prob=%.3f > %.3f (mr_sell floor)",
-                    hmm_state, prob, mr_sell_threshold,
+                    "[SIGNAL] MR_SELL | z=%.2f | %s",
+                    _sig_eval["confidence"], _sig_eval["reason"],
                 )
                 if gmm_cluster == 2:
                     logger.warning(
-                        "[MR WARNING] High-Vol environment (GMM cluster=2). "
-                        "Mean Reversion has lower edge in breakout conditions — watch closely."
+                        "[MR WARNING] High-vol environment (GMM cluster=2) — "
+                        "MR has lower edge in breakout conditions."
                     )
             else:
-                # ── Logic Audit — structured diagnostic explaining why no trade fired ──
+                # ── Logic Audit — Z-Score diagnostic ─────────────────────
                 regime_desc = ("BULL" if hmm_state == BULL_STATE
                                else "BEAR" if hmm_state == BEAR_STATE
                                else "CHOP")
-                signal_desc = "UP" if prob > 0.50 else "DOWN"
-
-                # Classify as Divergence (HMM and ML disagree on direction) or
-                # Alignment (same direction but probability hasn't crossed the hurdle).
-                if hmm_state == BULL_STATE and prob < 0.50:
-                    decision = (
-                        f"DIVERGENCE — HMM says {regime_desc} but ML leans {signal_desc}. "
-                        "Safety filter active: no trade."
-                    )
-                elif hmm_state == BEAR_STATE and prob > 0.50:
-                    decision = (
-                        f"DIVERGENCE — HMM says {regime_desc} but ML leans {signal_desc}. "
-                        "Safety filter active: no trade."
-                    )
-                elif hmm_state == BULL_STATE:
-                    decision = (
-                        f"ALIGNMENT — Both Bullish. "
-                        f"Prob {prob:.3f} needs >{prob_threshold:.3f} "
-                        f"(gap: {prob - prob_threshold:+.3f})"
-                    )
-                elif hmm_state == BEAR_STATE:
-                    decision = (
-                        f"ALIGNMENT — Both Bearish. "
-                        f"Prob {prob:.3f} needs <{short_threshold:.3f} "
-                        f"(gap: {short_threshold - prob:+.3f})"
-                    )
-                elif is_chop:
-                    decision = (
-                        f"CHOP REGIME — MR thresholds: "
-                        f"BUY<{mr_buy_threshold:.3f} / SELL>{mr_sell_threshold:.3f}. "
-                        f"Prob={prob:.3f} not extreme enough."
-                    )
-                else:
-                    decision = f"Scanning... state={hmm_state} prob={prob:.3f}"
-
+                _z = _sig_eval["confidence"]
                 logger.info(
-                    "[LOGIC AUDIT] %s Regime | ML %s (%.3f) | %s",
-                    regime_desc, signal_desc, prob, decision,
-                )
-                # Show exact distance to both thresholds so the user can visualise
-                # how close they are to an entry without needing to do the maths.
-                # Positive = would have fired in that direction; negative = still needs to move.
-                logger.info(
-                    "  Distance -> BUY: %+.3f  |  SELL: %+.3f",
-                    prob - prob_threshold,    # positive means prob already > buy hurdle
-                    short_threshold - prob,   # positive means prob already < sell hurdle
+                    "[LOGIC AUDIT] %s Regime | state=%d  prob=%.3f  z=%.2f  "
+                    "bars=%d  P(stay)=%.2f  BB=%.2f | %s",
+                    regime_desc, hmm_state, prob, _z,
+                    _stability["consecutive_bars"], _t_prob, _bb_pos,
+                    _sig_eval["reason"],
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue

@@ -21,7 +21,9 @@ import optuna
 
 from src.processor import process_pipeline
 from src.engine_hmm import fit_hmm
-from src.engine_xgb import prepare_features, train_xgb_ensemble, get_predictions_ensemble
+from src.engine_xgb import (
+    prepare_features, train_xgb_ensemble, get_predictions_ensemble, compute_regime_stats,
+)
 from src.backtester import vectorized_backtest, format_payout
 from src.risk_manager import SMALL_ACCOUNT_THRESHOLD
 from src.logger import setup_logger
@@ -143,38 +145,6 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             n_states = trial.suggest_categorical("n_states", [4])
         else:
             n_states   = trial.suggest_int("n_states", 3, 4)
-        # M5 probs cluster below 0.56 in live — narrow range forces the
-        # optimizer to find high-frequency signals in the 0.50–0.55 window
-        # for cent accounts.  Standard accounts have higher per-trade costs
-        # so a more conservative range (0.55–0.60) ensures spread is covered.
-        # H1/M15: wide range (0.50–0.85). Signal locking in the backtester ensures
-        # trades are counted per entry (not per active bar), so the Recovery Factor
-        # Threshold ranges are TF-specific to match each timeframe's edge profile.
-        # The spread-aware adaptive filter (ATR/spread ≥ 1.25) handles low-conviction
-        # bars at the backtest level, so these ranges reflect natural bar confidence.
-        # short_threshold is symmetric: short = 1 - prob (≈ same conviction for SELL).
-        if tf.upper() == "M5":
-            # Scalp: lower hurdle, high-frequency positive-expectancy clusters
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.65)
-            short_threshold = trial.suggest_float("short_threshold", 0.30, 0.48)
-        elif tf.upper() == "H1":
-            # Swing: moderate conviction thresholds — H1 gold XGBoost probs
-            # cluster in the 0.45–0.65 range in live data; the 0.65–0.80 range
-            # used previously produced only 1 trade per 3-6 months (unusable).
-            # 0.52–0.65 / 0.35–0.48 matches the model's actual output distribution
-            # while still requiring more conviction than M15.
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.65)
-            short_threshold = trial.suggest_float("short_threshold", 0.35, 0.48)
-        else:
-            # M15 — intermediate between M5 scalp and H1 swing
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.65)
-            short_threshold = trial.suggest_float("short_threshold", 0.35, 0.45)
-
-        # Guard: thresholds must not overlap — a crossover means every bar gets
-        # both a BUY and SELL signal simultaneously, which is nonsensical.
-        if short_threshold >= prob_threshold:
-            return -10.0
-
         # M5 uses shallower trees (2-3) to prevent IS memorisation across the
         # large bar count; heavier L1 reg (1-20) to sparsify feature weights.
         # H1/M15: max_depth 3-6 allows the model to map complex HMM-state ×
@@ -256,16 +226,21 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             )
             _, probabilities = get_predictions_ensemble(models, thresholds, X)
 
+            # Compute IS regime statistics for Z-Score signal calibration
+            split_idx = metrics.get("split_idx")
+            X_is      = X.iloc[:split_idx] if split_idx else X
             states_aligned = states[df.index.isin(df_aligned.index)]
-            split_idx      = metrics.get("split_idx")
+            hmm_states_is  = states_aligned[:len(X_is)]
+            regime_stats   = compute_regime_stats(models, thresholds, X_is, hmm_states_is)
+            metrics["regime_stats"] = regime_stats
+
             result = vectorized_backtest(
                 df_aligned, probabilities, states_aligned,
                 split_idx=split_idx,
                 account_size=balance,
                 broker=broker,
                 tf=tf,
-                prob_threshold=prob_threshold,
-                short_threshold=short_threshold,
+                regime_stats=regime_stats,
             )
 
             # Score on OOS only to prevent IS data leakage

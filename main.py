@@ -21,7 +21,7 @@ from src.engine_xgb import (
     export_onnx, save_xgb, load_xgb, ONNX_PATH, FEATURE_COLS,
     train_xgb_ensemble, get_predictions_ensemble,
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
-    get_ensemble_path, TF_TRAIN_RATIO,
+    get_ensemble_path, TF_TRAIN_RATIO, compute_regime_stats,
 )
 from src.optimizer import run_optimization, get_best_params, _score_result as _calc_score
 from src.backtester import vectorized_backtest, format_payout
@@ -119,14 +119,17 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
     _, probabilities = get_predictions_ensemble(models_ensemble, thresholds, X)
     states_aligned = states[df.index.isin(df_aligned.index)]
     split_idx = metrics.get("split_idx")
+    # Compute IS regime statistics for Z-Score signal calibration
+    _X_is = X.iloc[:split_idx] if split_idx else X
+    _hs_is = states_aligned[:len(_X_is)]
+    metrics["regime_stats"] = compute_regime_stats(models_ensemble, thresholds, _X_is, _hs_is)
     result = vectorized_backtest(
         df_aligned, probabilities, states_aligned,
         split_idx=split_idx,
         account_size=balance,
         broker=broker,
         tf=tf,
-        prob_threshold=params.get("prob_threshold"),
-        short_threshold=params.get("short_threshold"),
+        regime_stats=metrics["regime_stats"],
     )
     return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
 
@@ -245,6 +248,10 @@ def cmd_wfa(args):
     )
     _, probs    = get_predictions_ensemble(models_e, thresholds_e, X)
     states_aln  = states[df.index.isin(df_aligned.index)]
+    _cmp_split  = metrics_e.get("split_idx") or int(len(X) * 0.70)
+    _X_is_cmp   = X.iloc[:_cmp_split]
+    _hs_is_cmp  = states_aln[:len(_X_is_cmp)]
+    _regime_stats_cmp = compute_regime_stats(models_e, thresholds_e, _X_is_cmp, _hs_is_cmp)
 
     print(
         f"  Dataset: {len(df_aligned)} bars  "
@@ -254,13 +261,12 @@ def cmd_wfa(args):
 
     wfa = run_walk_forward(
         df_aligned, probs, states_aln,
-        train_days      = train_days,
-        test_days       = test_days,
-        account_size    = balance,
-        broker          = broker,
-        tf              = tf,
-        prob_threshold  = params.get("prob_threshold"),
-        short_threshold = params.get("short_threshold"),
+        train_days    = train_days,
+        test_days     = test_days,
+        account_size  = balance,
+        broker        = broker,
+        tf            = tf,
+        regime_stats  = _regime_stats_cmp,
     )
 
     n_win       = wfa["n_windows"]
@@ -719,6 +725,13 @@ def cmd_report(args):
     _, probabilities = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
     states_aligned = states[df.index.isin(df_aligned.index)]
 
+    # Ensure regime_stats are present (may be absent in pre-Z-Score saved models)
+    if not metrics.get("regime_stats"):
+        _rs_split = metrics.get("split_idx") or int(len(X) * 0.8)
+        _X_is     = X.iloc[:_rs_split]
+        _hs_is    = states_aligned[:len(_X_is)]
+        metrics["regime_stats"] = compute_regime_stats(models_xgb, thresholds_xgb, _X_is, _hs_is)
+
     # split_idx in saved metrics may come from a different TF's training run
     # (e.g. M15 split_idx ~186k used in an H1 report with only ~58k bars).
     # Recompute from current data when the stored value doesn't fit.
@@ -729,8 +742,7 @@ def cmd_report(args):
     result = vectorized_backtest(
         df_aligned, probabilities, states_aligned,
         split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
-        prob_threshold=params.get("prob_threshold"),
-        short_threshold=params.get("short_threshold"),
+        regime_stats=metrics.get("regime_stats"),
     )
 
     arm = AdaptiveRiskManager(balance, broker=broker)
