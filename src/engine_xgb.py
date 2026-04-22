@@ -453,7 +453,7 @@ def compute_regime_stats(
         state_p  = probs[mask]
         if n >= 30:
             mean = float(np.mean(state_p))
-            std  = float(max(np.std(state_p), 0.02))
+            std  = float(max(np.std(state_p), 0.003))
         else:
             logger.warning(
                 "State %d: only %d IS samples — using fallback stats (mean=0.50, std=0.15)",

@@ -52,7 +52,7 @@ PAYOFF_FLOOR_USD = 0.035 # $0.035 minimum average edge per trade — covers spre
 RAM_HIGH_PCT    = 90     # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30     # seconds to sleep when RAM is low
 # TF-specific progressive penalty thresholds — trades below these earn score × 0.1
-TF_MIN_OOS_TRADES = {"H1": 60, "M15": 150, "M5": 400}
+TF_MIN_OOS_TRADES = {"H1": 15, "M15": 100, "M5": 300}
 
 
 def _get_tier(balance: float) -> str:
