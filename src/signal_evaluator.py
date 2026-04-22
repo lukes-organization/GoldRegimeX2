@@ -24,7 +24,8 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "Z_CUTOFF_BULL":  2.5,   # BUY  when z > +2.5σ in Bull regime
     "Z_CUTOFF_BEAR": -2.5,   # SELL when z < −2.5σ in Bear regime
     # Per-chop-state MR cutoffs (Chop_Low is easier to fade than Chop_High)
-    "Z_CUTOFF_CHOP_MR": {2: 2.2, 3: 2.8},
+    # TF-specific overrides applied in __init__ via _TF_CUTOFF_OVERRIDES
+    "Z_CUTOFF_CHOP_MR": {2: 3.2, 3: 3.8},
     # Volatility adjustments applied when GMM cluster == 2 (high vol)
     "HIGH_VOL_ADJUSTMENT": 0.3,
     # Live-only MR safety gates
@@ -38,6 +39,33 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+## Per-TF Z-Score cutoff overrides ────────────────────────────────────────────
+# Applied in SignalEvaluator.__init__ after base config, before caller config.
+# M5 uses higher cutoffs (noisier bars → only fire on genuinely extreme probs).
+# H1/M15 use slightly lower MR cutoffs (fewer chop bars → need more triggered).
+_TF_CUTOFF_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "H1": {
+        "Z_CUTOFF_BULL":     2.5,
+        "Z_CUTOFF_BEAR":    -2.5,
+        "Z_CUTOFF_CHOP_MR": {2: 3.0, 3: 3.5},
+        "MIN_CHOP_BARS_FOR_MR": 2,
+    },
+    "M15": {
+        "Z_CUTOFF_BULL":     2.3,
+        "Z_CUTOFF_BEAR":    -2.3,
+        "Z_CUTOFF_CHOP_MR": {2: 3.0, 3: 3.5},
+        "MIN_CHOP_BARS_FOR_MR": 3,
+    },
+    "M5": {
+        "Z_CUTOFF_BULL":     2.8,
+        "Z_CUTOFF_BEAR":    -2.8,
+        "Z_CUTOFF_CHOP_MR": {2: 3.5, 3: 4.0},
+        "HIGH_VOL_ADJUSTMENT": 0.4,
+        "MIN_CHOP_BARS_FOR_MR": 4,
+    },
+}
+
+
 class SignalEvaluator:
     """Regime-specific Z-Score calibrated signal evaluator.
 
@@ -45,16 +73,22 @@ class SignalEvaluator:
         regime_stats: Mapping of HMM state_id → ``{"mean": float, "std": float,
                       "count": int}``.  Compute on IS data via
                       :func:`src.engine_xgb.compute_regime_stats`.
-        config:       Optional overrides for :data:`_DEFAULT_CONFIG`.
+        tf:           Timeframe string — applies TF-specific Z-Score cutoffs from
+                      :data:`_TF_CUTOFF_OVERRIDES` (e.g. M5 uses tighter thresholds).
+        config:       Optional overrides for :data:`_DEFAULT_CONFIG` (applied last,
+                      highest priority).
     """
 
     def __init__(
         self,
         regime_stats: Dict[int, Dict[str, float]],
+        tf: str = "H1",
         config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.regime_stats = regime_stats or {}
         self.config: Dict[str, Any] = {**_DEFAULT_CONFIG}
+        # Apply TF-specific overrides, then any caller-supplied config (highest priority)
+        self.config.update(_TF_CUTOFF_OVERRIDES.get(tf.upper(), {}))
         if config:
             self.config.update(config)
 

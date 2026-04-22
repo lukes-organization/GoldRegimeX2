@@ -948,7 +948,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
 
     # Load regime statistics and build the adaptive signal evaluator
     regime_stats     = xgb_meta.get("regime_stats", {})
-    signal_evaluator = SignalEvaluator(regime_stats)
+    signal_evaluator = SignalEvaluator(regime_stats, tf=tf)
     if regime_stats:
         logger.info(
             "Z-Score signal mode: regime stats loaded for %d states", len(regime_stats)
@@ -1384,6 +1384,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             limits        = arm.get_trade_limits(hmm_state)
             pos_per_trade = min(limits["pos_per_trade"], len(tp_mults))
             sl_distance   = max(atr_price * TF_ATR_MULTIPLIER.get(tf.upper(), 2.0), 0.01)
+            if signal_type == "mean_reversion":
+                sl_distance *= 0.70   # MR trades use tighter SL — mean-reversion has defined exit
+                logger.info("[MR RISK ADJ] SL tightened to 70%% of base: %.4f", sl_distance)
 
             # $15 accounts use hardcoded lot splits — bypass AdaptiveRiskManager.
             # Cent:     0.02 (pos1) + 0.03 (pos2) = 0.05 micro-lots total.
@@ -1458,7 +1461,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             for p in range(pos_per_trade):
                 tp_price    = tp_levels[p]
                 current_lot = forced_lots[p] if p < len(forced_lots) else forced_lots[-1]
-                comment     = f"GRX_{tf}_{direction}_s{hmm_state}_tp{p+1}"
+                _trade_tag  = "MR" if signal_type == "mean_reversion" else "TREND"
+                comment     = f"GRX_{tf}_{_trade_tag}_{direction}_s{hmm_state}_tp{p+1}"
                 result = send_market_order(
                     symbol=DEFAULT_SYMBOL,
                     order_type=order_type,

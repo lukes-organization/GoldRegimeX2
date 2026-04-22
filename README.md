@@ -65,11 +65,12 @@ StandardScaler  →  All continuous features scaled on IS data only (no leakage)
 Z-Score Signal Evaluation  →  Per-regime probability calibration
                IS mean/std computed per HMM state → stored in model pkl
                Signal fires when prob is N σ from the IS per-state mean:
-                 Bull  → BUY  when z ≥ +1.5σ  (high-vol: +1.8σ)
-                 Bear  → SELL when z ≤ −1.5σ  (high-vol: −1.8σ)
-                 Chop  → MR_BUY  when z ≤ −2.2σ  (extreme oversell fade)
-                         MR_SELL when z ≥ +2.8σ  (extreme overbuy fade)
-               Replaces fixed prob_threshold / short_threshold — no manual tuning
+                 Bull  → BUY  when z ≥ +2.5σ  (H1/default; M5: +2.8σ; M15: +2.3σ)
+                 Bear  → SELL when z ≤ −2.5σ  (H1/default; M5: −2.8σ; M15: −2.3σ)
+                 Chop  → MR_BUY  when z ≤ −3.0σ / −3.2σ  (H1/M15 / default)
+                         MR_SELL when z ≥ +3.5σ / +3.8σ  (H1/M15 / default)
+                         M5: MR cutoffs ±3.5σ / ±4.0σ (state 2/3)
+               TF-specific cutoffs applied automatically — no manual tuning
       │
       ▼
 Backtester    →  IS / OOS split (TF-specific ratio)
@@ -84,9 +85,10 @@ Complex Criterion Score  →  RF×0.4 + PF×0.3 + Sharpe×0.3
       ▼
 Live Bridge   →  MT5 Market Orders  (IOC fill, ATR-based SL, staged TPs)
                Signal routing (Z-Score + live safety gates):
-                 Bull → Trend BUY    (z ≥ +1.5σ  + stability + BB gate)
-                 Bear → Trend SELL   (z ≤ −1.5σ  + stability + BB gate)
-                 Chop → MR BUY/SELL  (extreme z  + 3 MR safety gates)
+                 Bull → Trend BUY    (z ≥ +2.5σ H1 / +2.3σ M15 / +2.8σ M5)
+                 Bear → Trend SELL   (z ≤ −2.5σ H1 / −2.3σ M15 / −2.8σ M5)
+                 Chop → MR BUY/SELL  (z ≤ ±3.0σ H1/M15 / ±3.5σ M5 + 3 safety gates)
+               MR trades: SL = 0.70 × base ATR SL; comment tagged MR vs TREND
                TF-specific magic: H1=123456, M15=123457, M5=123458
                Global guard: skip if ≥ 4 positions open across all TFs
 ```
@@ -102,8 +104,8 @@ The optimizer (Optuna) searches across Kalman parameters, HMM states, and XGBoos
 | `src/processor.py` | Kalman filter, log returns, RSI, ATR, GMM vol cluster, per-TF config |
 | `src/engine_hmm.py` | GaussianHMM with k-means prior init; TF persistence boost; regime prediction |
 | `src/engine_xgb.py` | XGBoost ensemble training; `compute_regime_stats()` for Z-Score calibration; ONNX export |
-| `src/signal_evaluator.py` | **Z-Score signal engine** — `evaluate_signal_fast()` (backtester/optimizer) and `evaluate_signal()` (live, with 3 MR safety gates) |
-| `src/backtester.py` | Vectorized NumPy backtest — IS/OOS split, Z-Score signals, broker costs, floating drawdown, MT5 equity curve |
+| `src/signal_evaluator.py` | **Z-Score signal engine** — `evaluate_signal_fast()` (backtester/optimizer) and `evaluate_signal()` (live, with 3 MR safety gates); **TF-specific cutoffs** via `_TF_CUTOFF_OVERRIDES` |
+| `src/backtester.py` | Vectorized NumPy backtest — IS/OOS split, Z-Score signals, broker costs, floating drawdown, MT5 equity curve; **MR attribution** (`mr_trades`, `mr_win_rate`, `mr_pnl`) in result dict |
 | `src/optimizer.py` | Optuna study — Complex Criterion scoring, per-broker SQLite crash-safe resume, RAM guard, Telegram heartbeat |
 | `src/risk_manager.py` | AdaptiveRiskManager, CentConverter, DailyEquityGate, broker cost configs |
 | `src/visualizer.py` | **6-chart report**: regime overlay, equity curve, features, transition matrix, dashboard, MT5 balance/equity chart |
@@ -490,18 +492,17 @@ Instead of fixed probability thresholds, signals are calibrated on a **per-regim
 2. At inference time, each bar's probability is converted to a Z-Score relative to its HMM state's IS distribution.
 3. A signal fires when the Z-Score exceeds the regime-specific cutoff.
 
-**Z-Score cutoffs:**
+**Z-Score cutoffs (TF-specific):**
 
-| State | Signal | Default cutoff | High-vol (GMM cluster=2) |
-|-------|--------|---------------|--------------------------|
-| Bull (0) | BUY | z ≥ **+1.5σ** | z ≥ **+1.8σ** |
-| Bear (1) | SELL | z ≤ **−1.5σ** | z ≤ **−1.8σ** |
-| Chop (2) | MR_BUY | z ≤ **−2.2σ** | z ≤ **−2.5σ** |
-| Chop (2) | MR_SELL | z ≥ **+2.8σ** | z ≥ **+3.1σ** |
-| Chop_Low (2, n=4) | MR_BUY | z ≤ **−2.2σ** | z ≤ **−2.5σ** |
-| Chop_High (3, n=4) | MR_SELL | z ≥ **+2.8σ** | z ≥ **+3.1σ** |
+| State | Signal | H1 cutoff | M15 cutoff | M5 cutoff | High-vol (+0.3σ / +0.4σ M5) |
+|-------|--------|-----------|------------|-----------|------------------------------|
+| Bull (0) | BUY | z ≥ **+2.5σ** | z ≥ **+2.3σ** | z ≥ **+2.8σ** | +0.3σ added (M5: +0.4σ) |
+| Bear (1) | SELL | z ≤ **−2.5σ** | z ≤ **−2.3σ** | z ≤ **−2.8σ** | −0.3σ added (M5: −0.4σ) |
+| Chop (2) | MR_BUY | z ≤ **−3.0σ** | z ≤ **−3.0σ** | z ≤ **−3.5σ** | cutoff raised further |
+| Chop (2) | MR_SELL | z ≥ **+3.0σ** | z ≥ **+3.0σ** | z ≥ **+3.5σ** | cutoff raised further |
+| Chop_High (3, n=4) | MR_SELL | z ≥ **+3.5σ** | z ≥ **+3.5σ** | z ≥ **+4.0σ** | cutoff raised further |
 
-This approach automatically adapts to each broker/TF combination's probability distribution — no manual threshold tuning, and no search space parameter for Optuna to exploit.
+TF-specific cutoffs are applied automatically by `SignalEvaluator(regime_stats, tf=tf)` — no manual configuration needed.
 
 ### Trade Gate Requirements
 
@@ -585,7 +586,11 @@ Both gates reset automatically at UTC midnight.
 | Bull / Bear | M5 | 0.8× SL | 1.5× SL | 3.0× SL | 1.5× |
 | Bull / Bear | M15 | 1.0× SL | 2.0× SL | — | 2.0× |
 | Bull / Bear | H1 | 1.5× SL | 3.0× SL | — | 2.0× |
-| Chop | any | blocked | blocked | blocked | — |
+| **Chop (MR)** | M5 | 0.5× SL | — | — | **1.5× × 0.70 = 1.05×** |
+| **Chop (MR)** | M15 | 0.8× SL | — | — | **2.0× × 0.70 = 1.40×** |
+| **Chop (MR)** | H1 | 1.0× SL | — | — | **2.0× × 0.70 = 1.40×** |
+
+MR trades use **70% of the base ATR SL distance** — tighter stop because mean-reversion has a defined fade target and a breakout quickly invalidates the thesis.
 
 **Full profit protection chain (M5):**
 
@@ -775,6 +780,11 @@ Score = (Recovery Factor × 0.4) + (Profit Factor × 0.3) + (Sharpe Ratio × 0.3
 | **Avg Efficiency** | Mean `ATR / spread` on active-trade bars |
 | **Cost Efficiency** | `1 - (total_costs / gross_profit)` |
 | **Total Payout** | `total_return × account_size` in broker currency |
+| **mr_trades** | Count of MR trades (HMM Chop state signals) |
+| **mr_win_rate** | Win rate of MR trades separately from trend |
+| **mr_pnl** | Cumulative log-return from MR trades only |
+
+`mr_trades`, `mr_win_rate`, and `mr_pnl` — and their `oos_` prefixed equivalents — are included in the backtester result dict and logged per-trial when the optimizer finds any OOS MR trades.
 
 ### IS/OOS Split Ratios
 
@@ -865,11 +875,11 @@ Each terminal runs an independent Optuna worker sharing the broker-specific SQLi
 
 Each timeframe runs as an **independent Python process** with its own Magic Number:
 
-| Timeframe | Magic Number | Comment format |
-|-----------|-------------|----------------|
-| H1 | `123456` | `GRX_H1_BUY_s0_tp1` |
-| M15 | `123457` | `GRX_M15_SELL_s1_tp2` |
-| M5 | `123458` | `GRX_M5_BUY_s0_tp1` |
+| Timeframe | Magic Number | Comment format (examples) |
+|-----------|-------------|---------------------------|
+| H1 | `123456` | `GRX_H1_TREND_BUY_s0_tp1` / `GRX_H1_MR_BUY_s2_tp1` |
+| M15 | `123457` | `GRX_M15_TREND_SELL_s1_tp2` / `GRX_M15_MR_SELL_s3_tp1` |
+| M5 | `123458` | `GRX_M5_TREND_BUY_s0_tp1` / `GRX_M5_MR_BUY_s2_tp1` |
 
 ### Global Exposure Guard
 

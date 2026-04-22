@@ -349,6 +349,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 result.get("oos_n_trades", result["n_trades"]),
                 _oos_payout,
             )
+            _oos_mr_n = result.get("oos_mr_trades", 0)
+            if _oos_mr_n > 0:
+                logger.info(
+                    "  MR Trades: %d | MR WR: %.1f%% | MR P&L (log): %.4f",
+                    _oos_mr_n,
+                    result.get("oos_mr_win_rate", 0.0) * 100,
+                    result.get("oos_mr_pnl", 0.0),
+                )
             return score
 
         except Exception as e:

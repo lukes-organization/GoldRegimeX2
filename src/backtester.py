@@ -113,6 +113,7 @@ def compute_signals_zscore(
     hmm_states:    np.ndarray,
     regime_stats:  dict,
     gmm_clusters:  np.ndarray | None = None,
+    tf:            str = "H1",
 ) -> np.ndarray:
     """Vectorised Z-Score signal generation — used when regime_stats are available.
 
@@ -124,7 +125,7 @@ def compute_signals_zscore(
     Signal encoding matches :func:`compute_signals`: ``1=BUY, -1=SELL, 0=no trade``.
     MR_BUY and MR_SELL are collapsed to +1 / −1 respectively.
     """
-    evaluator = SignalEvaluator(regime_stats)
+    evaluator = SignalEvaluator(regime_stats, tf=tf)
     n         = len(probabilities)
     signals   = np.zeros(n, dtype=np.int8)
     for i in range(n):
@@ -359,6 +360,43 @@ def _compute_balance_curve(
     return balance_arr
 
 
+def _mr_attribution(
+    signals: np.ndarray,
+    hmm_states: np.ndarray,
+    strategy_returns: np.ndarray,
+) -> dict:
+    """Compute MR trade statistics separately from trend trades.
+
+    Classifies each trade entry as 'trend' (HMM state < 2) or 'mr' (state >= 2),
+    then computes count, win rate, and total log-return for MR trades.
+
+    Returns dict with keys: mr_trades, mr_win_rate, mr_pnl.
+    """
+    prev_s   = np.concatenate([[0], signals[:-1]])
+    is_entry = (signals != 0) & (signals != prev_s)
+    if not is_entry.any():
+        return {"mr_trades": 0, "mr_win_rate": 0.0, "mr_pnl": 0.0}
+
+    trade_idx    = np.cumsum(is_entry)
+    entry_is_mr  = {int(trade_idx[i]): bool(hmm_states[i] >= CHOP_STATE)
+                    for i in np.where(is_entry)[0]}
+
+    in_trade  = signals != 0
+    mr_pnls: list[float] = []
+    for tid, is_mr in entry_is_mr.items():
+        if is_mr:
+            mask = (trade_idx == tid) & in_trade
+            if mask.any():
+                mr_pnls.append(float(strategy_returns[mask].sum()))
+
+    n = len(mr_pnls)
+    return {
+        "mr_trades":   n,
+        "mr_win_rate": float(sum(1 for r in mr_pnls if r > 0) / n) if n else 0.0,
+        "mr_pnl":      float(sum(mr_pnls)),
+    }
+
+
 def vectorized_backtest(
     df,
     probabilities,
@@ -402,7 +440,7 @@ def vectorized_backtest(
             else None
         )
         raw_signals = compute_signals_zscore(
-            probabilities, hmm_states, regime_stats, gmm_clusters
+            probabilities, hmm_states, regime_stats, gmm_clusters, tf=tf
         )
     else:
         buy_th = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
@@ -449,6 +487,8 @@ def vectorized_backtest(
         "tf":            tf,
         "pos_per_trade": pos_per_trade,
     })
+    # Full-period MR attribution
+    result.update(_mr_attribution(signals, hmm_states, strategy_returns))
 
     if split_idx is not None and 0 < split_idx < len(strategy_returns):
         is_m  = _compute_metrics(strategy_returns[:split_idx], signals[:split_idx], tf)
@@ -475,6 +515,12 @@ def vectorized_backtest(
         for k, v in is_m.items():
             result[f"is_{k}"] = v
         for k, v in oos_m.items():
+            result[f"oos_{k}"] = v
+        # MR attribution per slice
+        oos_attr = _mr_attribution(
+            signals[split_idx:], hmm_states[split_idx:], strategy_returns[split_idx:]
+        )
+        for k, v in oos_attr.items():
             result[f"oos_{k}"] = v
         logger.info(
             "Backtest IS  [%s]: Sharpe=%.3f | FloatDD=%.4f | WR=%.3f | Trades=%d | Eff=%.2fx | CostEff=%.1f%%",
