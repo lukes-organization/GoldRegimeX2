@@ -870,6 +870,75 @@ def cmd_listen(args):
     run_listener()
 
 
+
+def cmd_train_lstm(args):
+    """Train the LSTM context model on the processed feature DataFrame.
+
+    Loads existing processed parquet from disk (run --mode process first).
+    Optionally adds hmm_state from the saved HMM model so the LSTM can see
+    regime context during training.
+
+    After training, re-run --mode train to rebuild the XGBoost ensemble with
+    lstm_ctx_0..3 features included in the feature matrix.
+
+    Usage:
+        python main.py --mode train_lstm --tf H1 --broker headway_cent --epochs 100
+    """
+    from src.engine_lstm import LSTMContextModel, get_lstm_path
+    import pandas as pd
+
+    tf     = args.tf.upper()
+    broker = args.broker
+    epochs = getattr(args, "epochs", 100)
+    reconfigure_for_tf(tf)
+
+    cfg = TF_CONFIG.get(tf)
+    if cfg is None:
+        print(f"ERROR: Unknown timeframe '{tf}'.")
+        sys.exit(1)
+
+    parquet_path = cfg["processed_path"]
+    if not parquet_path.exists():
+        print(
+            f"\nERROR: Processed parquet not found at {parquet_path}.\n"
+            f"Run  python main.py --mode process --tf {tf}  first."
+        )
+        sys.exit(1)
+
+    logger.info("Loading processed data from %s", parquet_path)
+    df = pd.read_parquet(parquet_path)
+    logger.info("Loaded %d rows for LSTM training.", len(df))
+
+    # Optionally enrich with HMM states so LSTM can see regime labels
+    _hmm_path = hmm_model_path(tf, broker)
+    if not _hmm_path.exists():
+        from src.engine_hmm import MODEL_PATH as _hmm_generic
+        _hmm_path = _hmm_generic
+    try:
+        _hmm = load_hmm(_hmm_path)
+        from src.engine_hmm import predict_states
+        df["hmm_state"] = predict_states(_hmm, df)
+        logger.info("HMM states added to LSTM training data (%s).", _hmm_path)
+    except Exception as _hmm_exc:
+        logger.info(
+            "HMM model not found or predict failed (%s) — training without hmm_state.", _hmm_exc
+        )
+
+    model = LSTMContextModel()
+    model.fit(df, epochs=epochs)
+
+    save_path = get_lstm_path(tf, broker)
+    model.save(save_path)
+
+    # Report context quality so we can verify the model actually learned something
+    model.log_context_quality(df)
+
+    print(f"\n  LSTM context model saved: {save_path}")
+    print(f"  Re-run --mode train --tf {tf} --broker {broker} to rebuild")
+    print(f"  XGBoost with lstm_ctx_0..3 in the feature matrix.\n")
+
+
+
 def cmd_sensitivity(args):
     """Z-Score sensitivity analysis on already-trained models.
 
@@ -963,7 +1032,7 @@ def main():
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
                  "sync_validate", "demo", "live", "audit", "guardian", "listen",
-                 "consolidate", "wfa", "sensitivity"],
+                 "consolidate", "wfa", "sensitivity", "train_lstm"],
         required=True,
     )
     parser.add_argument("--trials",   type=int,   default=250)
@@ -997,6 +1066,8 @@ def main():
                         help="WFA IS window in calendar days (default: H1=365, M15=180, M5=90).")
     parser.add_argument("--test_days",  type=int, default=None,
                         help="WFA OOS step size in calendar days (default: H1=90, M15=60, M5=30).")
+    parser.add_argument("--epochs",     type=int, default=100,
+                        help="LSTM training epochs for --mode train_lstm (default 100).")
 
     args = parser.parse_args()
     {
@@ -1015,6 +1086,7 @@ def main():
         "consolidate":   cmd_consolidate,
         "wfa":           cmd_wfa,
         "sensitivity":   cmd_sensitivity,
+        "train_lstm":    cmd_train_lstm,
     }[args.mode](args)
 
 

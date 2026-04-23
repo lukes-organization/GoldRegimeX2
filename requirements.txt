@@ -12,3 +12,4 @@ pyarrow>=14.0
 matplotlib>=3.8
 onnxconverter-common>=1.14
 metatrader5
+tensorflow>=2.13

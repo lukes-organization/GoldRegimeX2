@@ -38,7 +38,7 @@ from src.processor import (
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH, STATE_NAMES_2, STATE_NAMES_3, STATE_NAMES_4
 from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
-    get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
+    get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH, LSTM_CONTEXT_COLS,
 )
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
 from src.signal_evaluator import SignalEvaluator
@@ -641,6 +641,7 @@ def compute_live_features(
     mt5=None,
     tf: str = "H1",
     broker: str = "headway_cent",
+    lstm_model=None,
 ):
     """Build the current-bar feature vector for XGBoost ensemble inference.
 
@@ -700,6 +701,25 @@ def compute_live_features(
         except FileNotFoundError:
             logger.warning("GMM model missing for [%s/%s] — using cluster=0", tf, broker)
             feature_dict["gmm_vol_cluster"] = 0.0
+
+    # ── LSTM context features (lstm_ctx_0..3) ────────────────────────────────
+    # Inject when the ensemble was trained with LSTM context columns.
+    # Falls back to 0.0 per-column when the LSTM model file is absent.
+    _lstm_cols_needed = [c for c in LSTM_CONTEXT_COLS if c in feature_cols]
+    if _lstm_cols_needed:
+        if lstm_model is not None:
+            # Pass the raw live df as DataFrame so predict_context derives
+            # rsi_normalized / volume_ratio / bb_position automatically
+            _ctx = lstm_model.predict_context(df)
+        else:
+            _ctx = np.zeros(len(LSTM_CONTEXT_COLS), dtype=np.float32)
+            logger.debug(
+                "LSTM context model absent — setting lstm_ctx features to 0.0 "
+                "for this bar.  Train with --mode train_lstm to enable."
+            )
+        for i, col in enumerate(LSTM_CONTEXT_COLS):
+            if col in feature_cols:
+                feature_dict[col] = float(_ctx[i])
 
     features_df = pd.DataFrame([feature_dict])[feature_cols]
 
@@ -954,6 +974,18 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     # Load regime statistics and build the adaptive signal evaluator
     regime_stats     = xgb_meta.get("regime_stats", {})
     signal_evaluator = SignalEvaluator(regime_stats, tf=tf)
+
+    # Load optional LSTM context model — gracefully absent before train_lstm is run
+    from src.engine_lstm import load_lstm_model as _load_lstm
+    lstm_model = _load_lstm(tf, broker)
+    if lstm_model is not None:
+        logger.info("LSTM context model loaded for [%s/%s].", tf, broker)
+    else:
+        logger.info(
+            "LSTM context model not found for [%s/%s] — context features = 0. "
+            "Run --mode train_lstm to enable.",
+            tf, broker,
+        )
     if regime_stats:
         logger.info(
             "Z-Score signal mode: regime stats loaded for %d states", len(regime_stats)
@@ -1206,6 +1238,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             features_df, hmm_state, atr_price, raw_atr_norm = compute_live_features(
                 DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
                 feature_cols=feature_cols, mt5=mt5, tf=tf, broker=broker,
+                lstm_model=lstm_model,
             )
             signal_tracker["atr_price"] = atr_price   # cache for between-bar ATR trail
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)

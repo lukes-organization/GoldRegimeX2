@@ -348,6 +348,7 @@ def process_pipeline(
     tf: str = "H1",
     save_models: bool = False,
     broker: str = "headway_cent",
+    lstm_model=None,
 ) -> pd.DataFrame:
     """Run the full feature-engineering pipeline for the given timeframe.
 
@@ -404,6 +405,15 @@ def process_pipeline(
         )
 
     df.dropna(inplace=True)
+
+    # ── Optional LSTM context features (lstm_ctx_0..3) ───────────────────────
+    # Only added when a trained LSTMContextModel is supplied.  If lstm_model is
+    # None the columns are absent and XGBoost trains without them (graceful
+    # degradation).  Run --mode train_lstm to produce the model file first.
+    if lstm_model is not None:
+        from src.engine_lstm import add_lstm_context
+        add_lstm_context(df, lstm_model)
+
     logger.info(
         "Pipeline [%s] complete: %d rows, columns: %s",
         tf, len(df), list(df.columns),

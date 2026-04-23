@@ -16,7 +16,11 @@ ENSEMBLE_PKL_PATH = Path("models/xgb_ensemble.pkl")
 
 # Continuous features that are StandardScaler-normalized before XGBoost.
 # Discrete/categorical columns (hmm_state, gmm_vol_cluster) are excluded.
+# LSTM context columns (lstm_ctx_0..3) are tanh-activated [-1,1] — no scaling.
 _CONTINUOUS_COLS = ["rsi_slope", "atr_normalized", "prev_log_return", "usdchf_log_return"]
+
+# LSTM context feature columns added when a trained LSTM context model is present.
+LSTM_CONTEXT_COLS = [f"lstm_ctx_{i}" for i in range(4)]
 
 
 def get_ensemble_path(tf: str, broker: str = "headway_cent") -> Path:
@@ -62,6 +66,10 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
             cols.append(c)
     if USDCHF_FEATURE in df.columns and df[USDCHF_FEATURE].notna().mean() > 0.5:
         cols.append(USDCHF_FEATURE)
+    # LSTM context features — added when the context model was run during processing
+    for c in LSTM_CONTEXT_COLS:
+        if c in df.columns and df[c].notna().mean() > 0.5:
+            cols.append(c)
     return cols
 
 
