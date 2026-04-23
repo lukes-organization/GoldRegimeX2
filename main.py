@@ -868,13 +868,99 @@ def cmd_listen(args):
     run_listener()
 
 
+def cmd_sensitivity(args):
+    """Z-Score sensitivity analysis on already-trained models.
+
+    Loops over Bull/Bear Z-Score cutoff values (1.5 .. 3.0 in 0.25 steps),
+    reruns the OOS backtest for each, and prints a comparison table so you can
+    see whether the current cutoff is optimal.  MR (Chop) cutoffs are held
+    constant throughout.
+
+    Usage:
+        python main.py --mode sensitivity --tf H1 --broker headway_cent --balance 15
+    """
+    from src.sensitivity import run_sensitivity
+
+    balance = _resolve_balance(args)
+    tf      = args.tf.upper()
+    broker  = args.broker
+    reconfigure_for_tf(tf)
+
+    # Load processed data + models exactly as cmd_report does
+    try:
+        params = get_best_params(balance=balance, broker=broker, tf=tf)
+    except Exception:
+        params = {}
+
+    df = process_pipeline(
+        obs_cov=params.get("obs_cov"), trans_cov=params.get("trans_cov"),
+        save=False, tf=tf,
+    )
+
+    _hmm_path = hmm_model_path(tf, broker)
+    if not _hmm_path.exists():
+        _hmm_path = None
+    try:
+        if _hmm_path is None:
+            raise FileNotFoundError
+        model_hmm = load_hmm(_hmm_path)
+        from src.engine_hmm import predict_states
+        states = predict_states(model_hmm, df)
+    except Exception:
+        logger.warning("No saved HMM found for %s/%s — fitting fresh.", tf, broker)
+        model_hmm, states, _ = fit_hmm(df, n_states=params.get("n_states", 3))
+
+    try:
+        _feat_scaler = load_feature_scaler(tf=tf, broker=broker)
+    except FileNotFoundError:
+        _feat_scaler = None
+
+    X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
+
+    _xgb_path = get_ensemble_path(tf, broker)
+    if not _xgb_path.exists():
+        _xgb_path = ENSEMBLE_PKL_PATH
+    try:
+        models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
+        if metrics.get("feature_cols") != list(X.columns):
+            raise ValueError("Feature mismatch")
+    except (FileNotFoundError, ValueError):
+        logger.warning("No saved ensemble found for %s/%s — can't run sensitivity.", tf, broker)
+        return
+
+    _, probabilities = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
+    states_aligned = states[df.index.isin(df_aligned.index)]
+
+    if not metrics.get("regime_stats"):
+        _rs_split = metrics.get("split_idx") or int(len(X) * 0.8)
+        metrics["regime_stats"] = compute_regime_stats(
+            models_xgb, thresholds_xgb,
+            X.iloc[:_rs_split], states_aligned[:_rs_split],
+        )
+
+    split_idx = metrics.get("split_idx")
+    if split_idx is None or not (0 < split_idx < len(X)):
+        split_idx = int(len(X) * 0.8)
+
+    run_sensitivity(
+        tf=tf,
+        broker=broker,
+        balance=balance,
+        df_aligned=df_aligned,
+        probabilities=probabilities,
+        states_aligned=states_aligned,
+        split_idx=split_idx,
+        regime_stats=metrics["regime_stats"],
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gold Regime X — Hybrid ML Trading System")
     parser.add_argument(
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
                  "sync_validate", "demo", "live", "audit", "guardian", "listen",
-                 "consolidate", "wfa"],
+                 "consolidate", "wfa", "sensitivity"],
         required=True,
     )
     parser.add_argument("--trials",   type=int,   default=250)
@@ -922,6 +1008,7 @@ def main():
         "listen":        cmd_listen,
         "consolidate":   cmd_consolidate,
         "wfa":           cmd_wfa,
+        "sensitivity":   cmd_sensitivity,
     }[args.mode](args)
 
 

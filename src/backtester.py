@@ -114,6 +114,7 @@ def compute_signals_zscore(
     regime_stats:  dict,
     gmm_clusters:  np.ndarray | None = None,
     tf:            str = "H1",
+    evaluator_config: dict | None = None,
 ) -> np.ndarray:
     """Vectorised Z-Score signal generation — used when regime_stats are available.
 
@@ -125,7 +126,7 @@ def compute_signals_zscore(
     Signal encoding matches :func:`compute_signals`: ``1=BUY, -1=SELL, 0=no trade``.
     MR_BUY and MR_SELL are collapsed to +1 / −1 respectively.
     """
-    evaluator = SignalEvaluator(regime_stats, tf=tf)
+    evaluator = SignalEvaluator(regime_stats, tf=tf, config=evaluator_config)
     n         = len(probabilities)
     signals   = np.zeros(n, dtype=np.int8)
     for i in range(n):
@@ -408,6 +409,7 @@ def vectorized_backtest(
     prob_threshold: float = None,
     short_threshold: float = None,
     regime_stats: dict = None,
+    evaluator_config: dict = None,
 ):
     """Vectorized backtest with adaptive session limits and broker costs.
 
@@ -440,7 +442,8 @@ def vectorized_backtest(
             else None
         )
         raw_signals = compute_signals_zscore(
-            probabilities, hmm_states, regime_stats, gmm_clusters, tf=tf
+            probabilities, hmm_states, regime_stats, gmm_clusters, tf=tf,
+            evaluator_config=evaluator_config,
         )
     else:
         buy_th = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
