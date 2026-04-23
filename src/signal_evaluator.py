@@ -106,7 +106,16 @@ class SignalEvaluator:
             std   = max(float(stats["std"]), 0.02)
         else:
             mean, std = 0.50, 0.15
-        return (prob_buy - mean) / std
+            logger.warning(
+                "[Z-CALC] No regime_stats for state %d — fallback mean=0.50 std=0.15",
+                hmm_state,
+            )
+        z = (prob_buy - mean) / std
+        logger.debug(
+            "[Z-CALC] state=%d prob=%.4f mean=%.4f std=%.4f → z=%.3f",
+            hmm_state, prob_buy, mean, std, z,
+        )
+        return float(z)
 
     def _vol_adjusted_cutoffs(
         self, gmm_cluster: int
@@ -171,17 +180,27 @@ class SignalEvaluator:
             else:
                 bear_cut = min(-1.0, bear_cut + reduction)
 
+        sig: Optional[str] = None
         if hmm_state == 0:
-            return ("BUY", z) if z > bull_cut else (None, z)
-        if hmm_state == 1:
-            return ("SELL", z) if z < bear_cut else (None, z)
-        if hmm_state in (2, 3):
+            if z > bull_cut:
+                sig = "BUY"
+        elif hmm_state == 1:
+            if z < bear_cut:
+                sig = "SELL"
+        elif hmm_state in (2, 3):
             cut = chop_cuts.get(hmm_state, 2.5)
             if z < -cut:
-                return ("MR_BUY",  z)
-            if z >  cut:
-                return ("MR_SELL", z)
-        return (None, z)
+                sig = "MR_BUY"
+            elif z > cut:
+                sig = "MR_SELL"
+
+        # Audit assertions — log ERROR if regime/signal mismatch (should never fire)
+        if sig == "BUY"  and hmm_state != 0: logger.error("[BUG] BUY in non-Bull state %d",  hmm_state)
+        if sig == "SELL" and hmm_state != 1: logger.error("[BUG] SELL in non-Bear state %d", hmm_state)
+        if sig in ("MR_BUY", "MR_SELL") and hmm_state not in (2, 3):
+            logger.error("[BUG] MR signal %s in non-Chop state %d", sig, hmm_state)
+
+        return (sig, z)
 
     # ── Live-trading interface ───────────────────────────────────────────────
 
@@ -497,5 +516,12 @@ class SignalEvaluator:
 
         if req.get("warning"):
             result["reason"] += f" [{req['warning']}]"
+
+        # Audit assertions — log ERROR if regime/signal mismatch (should never fire)
+        _sig = result["signal"]
+        if _sig == "BUY"  and hmm_state != 0: logger.error("[BUG] evaluate_signal: BUY in state %d",  hmm_state)
+        if _sig == "SELL" and hmm_state != 1: logger.error("[BUG] evaluate_signal: SELL in state %d", hmm_state)
+        if _sig in ("MR_BUY", "MR_SELL") and hmm_state not in (2, 3):
+            logger.error("[BUG] evaluate_signal: MR signal %s in state %d", _sig, hmm_state)
 
         return result
