@@ -1006,8 +1006,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     # ── LSTM startup health check ──────────────────────────────────────────
     if lstm_classifier is not None:
         try:
-            _hc_df = _build_live_df(DEFAULT_SYMBOL, tf_mt5, 150, obs_cov, trans_cov)
+            _hc_df    = _build_live_df(DEFAULT_SYMBOL, tf_mt5, 150, obs_cov, trans_cov)
             _hc_probs = lstm_classifier.predict_proba(_hc_df)
+            _n_models = getattr(lstm_classifier, "n_models", 1)   # 1 for single, N for ensemble
             if _hc_probs is None:
                 logger.warning(
                     "[LSTM HEALTH] FAILED — collapsed output on startup warmup data. "
@@ -1015,12 +1016,18 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 )
                 lstm_classifier = None
             else:
-                _hc_max = max(_hc_probs.values())
-                logger.info("[LSTM HEALTH] OK — max confidence: %.2f", _hc_max)
+                _hc_max  = max(_hc_probs.values())
+                _hc_type = f"ensemble ({_n_models} models)" if _n_models > 1 else "single model"
                 if _hc_max < 0.30:
                     logger.warning(
-                        "[LSTM HEALTH] LOW CONFIDENCE (%.2f) — LSTM may not add reliable signal. "
-                        "Consider retraining.", _hc_max,
+                        "[LSTM HEALTH] LOW CONFIDENCE %.2f — %s. "
+                        "LSTM will have minimal influence. Consider retraining.",
+                        _hc_max, _hc_type,
+                    )
+                else:
+                    logger.info(
+                        "[LSTM HEALTH] OK — %s  max_conf=%.2f",
+                        _hc_type, _hc_max,
                     )
         except Exception as _hc_exc:
             logger.warning("[LSTM HEALTH] ERROR — %s — running HMM-only.", _hc_exc)

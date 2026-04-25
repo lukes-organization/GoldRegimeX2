@@ -877,23 +877,50 @@ def cmd_listen(args):
 
 
 def cmd_train_lstm(args):
-    """Train the LSTM regime classifier.
+    """Train the LSTM regime classifier (single model or ensemble).
 
     Requires an existing HMM model (run --mode train first) to generate the
     state labels that the LSTM learns to predict.  Once trained the LSTM is
     ensembled with the HMM at inference time to provide early transition
-    detection and adaptive Z-Score tightening.
+    detection and adaptive Z-Score tightening/relaxation.
+
+    Ensemble (default, ensemble_size ≥ 2):
+        Trains N models with different random seeds.  Averaged predictions
+        are better calibrated: disagreement naturally lowers confidence.
+
+    Fine-tune mode (--fine_tune):
+        Adapts a pre-trained ensemble / single model to recent market data
+        using a lower learning rate.  Preserves general learned knowledge.
 
     Usage:
-        python main.py --mode train_lstm --tf H1 --broker headway_cent --epochs 100
+        # Full ensemble training (3 models, default):
+        python main.py --mode train_lstm --tf M15 --broker headway_cent \\
+            --epochs 100 --ensemble_size 3 --temperature 1.5
+
+        # Fine-tune on last 2 years:
+        python main.py --mode train_lstm --tf M15 --broker headway_cent \\
+            --epochs 20 --fine_tune --recent_years 2
+
+        # Single-model (legacy):
+        python main.py --mode train_lstm --tf H1 --broker headway_cent \\
+            --epochs 100 --ensemble_size 1
     """
-    from src.engine_lstm import LSTMRegimeClassifier, get_lstm_dir
+    from src.engine_lstm import (
+        LSTMRegimeClassifier,
+        LSTMEnsemble,
+        get_lstm_dir,
+        load_lstm_classifier,
+    )
     from src.processor import load_data_with_hmm_labels
 
-    tf     = args.tf.upper()
-    broker = args.broker
-    epochs = getattr(args, "epochs", 100)
-    seq_len = getattr(args, "lstm_seq_len", 100)
+    tf            = args.tf.upper()
+    broker        = args.broker
+    epochs        = getattr(args, "epochs", 100)
+    seq_len       = getattr(args, "lstm_seq_len", 100)
+    ensemble_size = getattr(args, "ensemble_size", 3)
+    temperature   = getattr(args, "temperature", 1.5)
+    fine_tune     = getattr(args, "fine_tune", False)
+    recent_years  = getattr(args, "recent_years", 2)
     reconfigure_for_tf(tf)
 
     try:
@@ -902,29 +929,76 @@ def cmd_train_lstm(args):
         print(f"\nERROR: {exc}\n")
         sys.exit(1)
 
+    # Filter to recent data when fine-tuning
+    if fine_tune:
+        import pandas as pd
+        cutoff = df.index[-1] - pd.DateOffset(years=recent_years)
+        df_ft  = df[df.index >= cutoff]
+        logger.info(
+            "Fine-tune mode: last %d years → %d bars from %s",
+            recent_years, len(df_ft), df_ft.index[0],
+        )
+        save_dir = get_lstm_dir(tf, broker)
+        existing = load_lstm_classifier(tf, broker)
+        if existing is None:
+            print("\nERROR: No existing LSTM model to fine-tune. "
+                  "Run without --fine_tune first.\n")
+            sys.exit(1)
+        existing.fine_tune(df_ft, tf=tf, epochs=epochs)
+        existing.save(save_dir)
+        print(f"\n  LSTM fine-tuned and saved: {save_dir}")
+        print(f"  Run --mode demo/live to use ensemble regime detection.\n")
+        return
+
     n_states = int(df["hmm_state"].nunique())
     logger.info(
-        "Training LSTM regime classifier [%s/%s] — %d states  %d bars",
-        tf, broker, n_states, len(df),
+        "Training LSTM [%s/%s] — %s  n_states=%d  %d bars  T=%.1f",
+        tf, broker,
+        f"ensemble ({ensemble_size} models)" if ensemble_size > 1 else "single model",
+        n_states, len(df), temperature,
     )
-
-    lstm = LSTMRegimeClassifier(sequence_length=seq_len, n_states=n_states)
-    lstm.fit(df, tf=tf, epochs=epochs)
 
     save_dir = get_lstm_dir(tf, broker)
-    lstm.save(save_dir)
 
-    # Quick sanity check on the most recent bars
-    recent = df.iloc[-seq_len - 50:]
-    probs  = lstm.predict_proba(recent)
-    pred   = max(probs, key=probs.get)
-    actual = int(df["hmm_state"].iloc[-1])
-    logger.info(
-        "Quick test — last bar: LSTM=%d (%.0f%%)  HMM=%d",
-        pred, probs[pred] * 100, actual,
-    )
+    if ensemble_size > 1:
+        clf = LSTMEnsemble(
+            n_models=ensemble_size,
+            sequence_length=seq_len,
+            temperature=temperature,
+        )
+        clf.fit(df, tf=tf, epochs=epochs)
+        clf.save(save_dir)
+        # Quick test
+        recent = df.iloc[-seq_len - 50:]
+        probs  = clf.predict_proba(recent)
+        if probs:
+            pred   = max(probs, key=probs.get)
+            actual = int(df["hmm_state"].iloc[-1])
+            logger.info(
+                "Quick test — last bar: LSTM=%d (%.0f%%)  HMM=%d",
+                pred, probs[pred] * 100, actual,
+            )
+        print(f"\n  LSTM ensemble ({ensemble_size} models) saved: {save_dir}")
+    else:
+        clf = LSTMRegimeClassifier(
+            sequence_length=seq_len,
+            n_states=n_states,
+            temperature=temperature,
+        )
+        clf.fit(df, tf=tf, epochs=epochs)
+        clf.save(save_dir)
+        # Quick test
+        recent = df.iloc[-seq_len - 50:]
+        probs  = clf.predict_proba(recent)
+        if probs:
+            pred   = max(probs, key=probs.get)
+            actual = int(df["hmm_state"].iloc[-1])
+            logger.info(
+                "Quick test — last bar: LSTM=%d (%.0f%%)  HMM=%d",
+                pred, probs[pred] * 100, actual,
+            )
+        print(f"\n  LSTM single model saved: {save_dir}")
 
-    print(f"\n  LSTM regime classifier saved: {save_dir}")
     print(f"  Run --mode demo/live to use ensemble regime detection.\n")
 
 
@@ -1060,6 +1134,16 @@ def main():
                         help="LSTM training epochs for --mode train_lstm (default 100).")
     parser.add_argument("--lstm_seq_len", type=int, default=100,
                         help="LSTM sequence length in bars for --mode train_lstm (default 100).")
+    parser.add_argument("--ensemble_size", type=int, default=3,
+                        help="Number of LSTM models in the ensemble (default 3). "
+                             "Pass 1 to train a single model.")
+    parser.add_argument("--temperature", type=float, default=1.5,
+                        help="Temperature for LSTM probability calibration (default 1.5). "
+                             ">1.0 softens; 1.0 = raw output; <1.0 sharpens.")
+    parser.add_argument("--fine_tune", action="store_true",
+                        help="Fine-tune an existing LSTM on recent data instead of full retraining.")
+    parser.add_argument("--recent_years", type=int, default=2,
+                        help="Years of recent data used for --fine_tune (default 2).")
 
     args = parser.parse_args()
     {
