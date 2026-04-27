@@ -1,6 +1,6 @@
 {
   "sequence_length": 100,
-  "n_states": 4,
+  "n_states": 3,
   "input_columns": [
     "log_return",
     "volatility",
@@ -12,5 +12,5 @@
     "dist_from_sma50"
   ],
   "temperature": 1.5,
-  "trained_at": "2026-04-26T11:41:48.867428+00:00"
+  "trained_at": "2026-04-26T10:55:45.120334+00:00"
 }

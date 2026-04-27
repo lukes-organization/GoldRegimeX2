@@ -1,0 +1,12 @@
+{
+  "n_models": 3,
+  "n_states": 4,
+  "sequence_length": 100,
+  "temperature": 1.5,
+  "trained_at": "2026-04-26T21:41:44.549514+00:00",
+  "model_dirs": [
+    "model_0",
+    "model_1",
+    "model_2"
+  ]
+}
