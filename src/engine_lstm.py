@@ -399,8 +399,11 @@ class LSTMRegimeClassifier:
             return {int(i): float(probs[i]) for i in range(self.n_states)}
 
         except Exception as exc:
-            logger.debug("LSTM predict_proba error: %s", exc)
-            return {s: 1.0 / self.n_states for s in range(self.n_states)}
+            logger.warning(
+                "[LSTM predict_proba] FAILED — returning None (HMM fallback): %s", exc,
+                exc_info=True,
+            )
+            return None
 
     def predict_state(self, df_recent: pd.DataFrame) -> Optional[int]:
         probs = self.predict_proba(df_recent)
@@ -448,8 +451,26 @@ class LSTMRegimeClassifier:
         lstm_confidence = lstm_probs[lstm_state]
         agreement       = (lstm_state == hmm_state)
 
-        # transition_risk: only meaningful when LSTM is CONFIDENT about a
-        # DIFFERENT state than HMM.  Agreement (or low confidence) → no risk.
+        # Near-uniform guard — if confidence barely beats random (≤ 1/n + 5%),
+        # the model has no conviction.  Treat as COLLAPSED so HMM drives the
+        # decision rather than letting argmax pick state 0 on tied probabilities.
+        _uniform_threshold = (1.0 / self.n_states) + 0.05
+        if lstm_confidence <= _uniform_threshold:
+            logger.debug(
+                "[LSTM] Near-uniform output (conf=%.3f ≤ %.3f) — falling back to HMM.",
+                lstm_confidence, _uniform_threshold,
+            )
+            return hmm_state, {
+                "agreement":       True,
+                "lstm_confidence": lstm_confidence,
+                "transition_risk": 0.0,
+                "lstm_state":      hmm_state,
+                "hmm_state":       hmm_state,
+                "ensemble_state":  hmm_state,
+                "lstm_probs":      lstm_probs,
+                "ensemble_scores": {s: 1.0 if s == hmm_state else 0.0 for s in range(self.n_states)},
+                "lstm_status":     "NEAR_UNIFORM",
+            }
         if lstm_state != hmm_state and lstm_confidence > 0.50:
             # LSTM disagrees AND is confident — genuine transition signal
             transition_risk = lstm_confidence

@@ -697,9 +697,11 @@ def compute_live_features(
                 df["volatility"].values, fitted_gmm=_gmm, fitted_scaler=_scaler
             )
             feature_dict["gmm_vol_cluster"] = float(_cluster[-1])
+            df["gmm_vol_cluster"] = _cluster.astype(float)   # LSTM needs this column
         except FileNotFoundError:
             logger.warning("GMM model missing for [%s/%s] — using cluster=0", tf, broker)
             feature_dict["gmm_vol_cluster"] = 0.0
+            df["gmm_vol_cluster"] = 0.0                       # LSTM fallback
 
     features_df = pd.DataFrame([feature_dict])[feature_cols]
 
@@ -1006,7 +1008,17 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     # ── LSTM startup health check ──────────────────────────────────────────
     if lstm_classifier is not None:
         try:
-            _hc_df    = _build_live_df(DEFAULT_SYMBOL, tf_mt5, 150, obs_cov, trans_cov)
+            _hc_df = _build_live_df(DEFAULT_SYMBOL, tf_mt5, 150, obs_cov, trans_cov)
+            # Attach gmm_vol_cluster so the LSTM scaler receives all 8 features
+            try:
+                _hc_gmm, _hc_gscaler = load_gmm_model(tf, broker)
+                _hc_clusters = compute_gmm_vol_cluster(
+                    _hc_df["volatility"].values,
+                    fitted_gmm=_hc_gmm, fitted_scaler=_hc_gscaler,
+                )
+                _hc_df["gmm_vol_cluster"] = _hc_clusters.astype(float)
+            except Exception:
+                _hc_df["gmm_vol_cluster"] = 0.0
             _hc_probs = lstm_classifier.predict_proba(_hc_df)
             _n_models = getattr(lstm_classifier, "n_models", 1)   # 1 for single, N for ensemble
             if _hc_probs is None:
@@ -1320,7 +1332,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                             _lstm_info["lstm_confidence"], _relaxed,
                         )
                 except Exception as _lstm_exc:
-                    logger.debug("LSTM ensemble failed: %s", _lstm_exc)
+                    logger.warning("LSTM ensemble failed: %s", _lstm_exc, exc_info=True)
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
             prob        = float(_probs[0])
             gmm_cluster = int(features_df["gmm_vol_cluster"].iloc[0]) if "gmm_vol_cluster" in features_df.columns else -1
