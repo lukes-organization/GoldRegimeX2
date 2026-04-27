@@ -1,6 +1,6 @@
 # Gold Regime X
 
-A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hidden Markov Models for regime detection, XGBoost for signal classification, and an LSTM ensemble for transition early-warning. Designed for live execution through MetaTrader 5 on both **Headway Cent** (micro) and **Standard** accounts, with full Telegram remote control, health monitoring, and automatic LSTM maintenance.
+A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hidden Markov Models for regime detection, XGBoost for signal classification, and a **TCN confidence scorer** for dynamic Z-Score threshold adjustment. Designed for live execution through MetaTrader 5 on both **Headway Cent** (micro) and **Standard** accounts, with full Telegram remote control, health monitoring, and automatic TCN maintenance.
 
 ---
 
@@ -16,19 +16,20 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 8. [Complete Workflow — Start to Live Trading](#complete-workflow--start-to-live-trading)
 9. [Command Reference](#command-reference)
 10. [Signal Logic](#signal-logic)
-11. [LSTM Regime Ensemble](#lstm-regime-ensemble)
-12. [Sensitivity Analysis](#sensitivity-analysis)
-13. [Tiered Z-Score Mode](#tiered-z-score-mode)
-14. [Risk Management](#risk-management)
-15. [Timeframe Configurations](#timeframe-configurations)
-16. [Performance Metrics & Scoring](#performance-metrics--scoring)
-17. [Optimizer Anti-Overfitting Rules](#optimizer-anti-overfitting-rules)
-18. [Telegram Remote Control](#telegram-remote-control)
-19. [Multi-TF Live Trading](#multi-tf-live-trading)
-20. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
-21. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
-22. [Troubleshooting](#troubleshooting)
-23. [Security Notes](#security-notes)
+11. [TCN Confidence Scorer](#tcn-confidence-scorer)
+12. [Automatic Data Updates & TCN Maintenance](#automatic-data-updates--tcn-maintenance)
+13. [Sensitivity Analysis](#sensitivity-analysis)
+14. [Tiered Z-Score Mode](#tiered-z-score-mode)
+15. [Risk Management](#risk-management)
+16. [Timeframe Configurations](#timeframe-configurations)
+17. [Performance Metrics & Scoring](#performance-metrics--scoring)
+18. [Optimizer Anti-Overfitting Rules](#optimizer-anti-overfitting-rules)
+19. [Telegram Remote Control](#telegram-remote-control)
+20. [Multi-TF Live Trading](#multi-tf-live-trading)
+21. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
+22. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
+23. [Troubleshooting](#troubleshooting)
+24. [Security Notes](#security-notes)
 
 ---
 
@@ -62,17 +63,19 @@ XGBoost Three-Model Volatility Ensemble
 Z-Score Signal Calibration
       │  IS mean/std computed per HMM state → stored in model pkl
       │  Signal fires when z = (prob − IS_mean) / IS_std crosses cutoff:
-      │    Bull  → BUY    z ≥ +2.5 (H1) / +2.0 (M15) / +2.8 (M5)
-      │    Bear  → SELL   z ≤ −2.5 (H1) / −2.0 (M15) / −2.8 (M5)
+      │    Bull  → BUY    z ≥ +2.5 (H1) / +2.0 (M15) / +2.5 (M5)
+      │    Bear  → SELL   z ≤ −2.5 (H1) / −2.0 (M15) / −2.5 (M5)
       │    Chop  → MR_BUY / MR_SELL at ±3.0–4.0σ depending on TF
       │
       ▼
-LSTM Ensemble (optional, 3 models by default)
-      │  Predicts HMM state from 100-bar feature sequences
-      │  Bidirectional Z-Score influence on the live bar:
-      │    transition_risk > 0.5  → Z tightened by +0.5 (LSTM disagrees)
-      │    agreement + conf > 0.85 → Z relaxed by −0.3, floor 1.0
-      │    collapsed / low-conf    → no influence, HMM-only
+TCN Confidence Scorer (optional, loads automatically)
+      │  4× dilated causal Conv1D → GlobalAveragePooling → Dense(32) → sigmoid
+      │  Scores the current signal bar from 100-bar context sequences
+      │  Outputs a confidence multiplier [0.7, 1.3]:
+      │    multiplier < 1.0  → effective_z relaxed  (clear, strong regime)
+      │    multiplier = 1.0  → no adjustment         (TCN not loaded)
+      │    multiplier > 1.0  → effective_z tightened (noisy / uncertain)
+      │  effective_z = base_z_cutoff × confidence_multiplier
       │
       ▼
 IS / OOS Backtest
@@ -101,7 +104,7 @@ The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoos
 | `src/processor.py` | Kalman filter, log returns, RSI, ATR, GMM vol cluster, per-TF config |
 | `src/engine_hmm.py` | GaussianHMM with k-means prior init; TF persistence boost |
 | `src/engine_xgb.py` | XGBoost ensemble; `compute_regime_stats()` for Z-Score calibration; ONNX export |
-| `src/engine_lstm.py` | **LSTM ensemble** — `LSTMRegimeClassifier`, `LSTMEnsemble`, temperature calibration, fine-tuning, staleness detection |
+| `src/engine_tcn.py` | **TCN confidence scorer** — `SignalConfidenceTCN`, dilated causal Conv1D, `load_tcn_classifier()`, `get_tcn_dir()` |
 | `src/signal_evaluator.py` | Z-Score signal engine — `evaluate_signal_fast()` (backtester) and `evaluate_signal()` (live, with MR safety gates); TF cutoffs via `_TF_CUTOFF_OVERRIDES`; optional tiered mode |
 | `src/sensitivity.py` | **Z-Score sensitivity analysis** — sweeps Bull/Bear cutoffs 1.5–3.0, outputs comparison table + CSV/JSON |
 | `src/backtester.py` | Vectorized NumPy backtest — IS/OOS split, Z-Score signals, broker costs, floating drawdown, MT5 equity curve, MR attribution |
@@ -110,10 +113,12 @@ The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoos
 | `src/visualizer.py` | 6-chart visual report: regime overlay, equity curve, features, transition matrix, dashboard, MT5 balance/equity |
 | `src/mt5_sync.py` | MT5 data downloader |
 | `src/validator.py` | Pre-live validation gate — Z-Score inference + Sharpe threshold + spread-payoff erosion warning |
-| `src/mt5_trader.py` | Live execution loop: bar detection, LSTM ensemble, bidirectional Z-Score adaptation, order placement |
+| `src/mt5_trader.py` | Live execution loop: bar detection, TCN confidence multiplier, dynamic Z-Score, order placement, hourly TCN maintenance |
 | `src/notifier.py` | Telegram message sender |
 | `src/auditor.py` | MT5 deal history report |
-| `src/guardian.py` | Multi-TF rolling health monitor + **daily LSTM staleness check + auto-retrain** |
+| `src/data_updater.py` | **Weekly MT5 data pull** — `WeeklyDataUpdater` appends fresh XAUUSD bars to raw CSVs every Sunday |
+| `src/tcn_maintenance.py` | **Hourly TCN staleness monitor** — `TCNMaintenanceScheduler`; auto-retrains stale models via background subprocess |
+| `src/guardian.py` | Multi-TF rolling health monitor + **daily TCN staleness check + auto-retrain** |
 | `src/remote_control.py` | Telegram long-polling bot for remote commands |
 | `src/data_consolidator.py` | USDCHF master file builder |
 | `main.py` | CLI entry point for all modes |
@@ -282,17 +287,17 @@ python main.py --mode report --tf H1 --broker headway_cent --balance 15
 python main.py --mode export --tf H1 --broker headway_cent
 ```
 
-### Phase 2 — Train the LSTM ensemble
+### Phase 2 — Train the TCN confidence scorer
 
-The LSTM must be trained **after** the HMM model exists — it learns to predict the HMM state labels.
+The TCN must be trained **after** the HMM+XGBoost model exists — it scores signal quality using the same processed features plus derived columns.
 
 ```bash
-# Train a 3-model ensemble (default). Takes ~15–30 min per model.
-python main.py --mode train_lstm --tf H1 --broker headway_cent \
-    --epochs 100 --ensemble_size 3 --temperature 1.5
+# Full training (first time — ~10–20 min):
+python main.py --mode train_tcn --tf H1 --broker headway_cent \
+    --epochs 100 --temperature 1.5
 ```
 
-The ensemble saves to `models/lstm/H1_headway_cent/`. Subsequent `--mode live` runs load it automatically.
+The model saves to `models/tcn/H1_headway_cent/`. Subsequent `--mode live` runs load it automatically. If no TCN model exists, the live bridge runs on base Z-Score cutoffs with no multiplier adjustment.
 
 ### Phase 3 — Validate before going live
 
@@ -341,11 +346,12 @@ Type `YES` when prompted. The live loop:
 1. Detects each newly completed bar (polls every 5 s)
 2. Fetches 200 bars for Kalman / HMM warm-up
 3. Runs Kalman → GMM → HMM → XGBoost inference
-4. Loads LSTM ensemble; applies bidirectional Z-Score adjustment
+4. Loads TCN; computes confidence multiplier → adjusts effective Z-Score cutoff
 5. Evaluates Z-Score signal with live MR safety gates
 6. Applies session limits, margin check, spread viability guard
 7. Places IOC market orders with ATR-based SL and staged TPs
 8. Logs closed P&L in real USD after every trade
+9. Every hour: runs TCN staleness check; every Sunday: appends fresh bars to raw CSVs
 
 > **Important:** Remove the GoldRegimeX.mq5 EA from any XAUUSD chart before starting the same-TF Python bridge — they share the same magic number.
 
@@ -360,16 +366,15 @@ python main.py --mode wfa           --tf H1 --broker headway_cent --balance 15
 python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --trials 400
 python main.py --mode train    --tf H1 --broker headway_cent --balance 15
 
-# Fine-tune LSTM on last 2 years (faster than full retrain):
-python main.py --mode train_lstm --tf H1 --broker headway_cent \
+# Fine-tune TCN on last 2 years (faster than full retrain):
+python main.py --mode train_tcn --tf H1 --broker headway_cent \
     --epochs 20 --fine_tune --recent_years 2
 
-# Or full LSTM retrain if fine-tune isn't improving results:
-python main.py --mode train_lstm --tf H1 --broker headway_cent \
-    --epochs 100 --ensemble_size 3
+# Or full TCN retrain if fine-tune isn't improving results:
+python main.py --mode train_tcn --tf H1 --broker headway_cent --epochs 100
 ```
 
-The [Guardian](#telegram-remote-control) auto-retrains the LSTM every 7 days while running.
+The [Guardian](#telegram-remote-control) auto-retrains the TCN every 7 days while running. The live bridge also checks staleness hourly without interrupting trading.
 
 ---
 
@@ -387,7 +392,7 @@ python main.py --mode <MODE> [OPTIONS]
 | `process` | Process raw CSV → features (Kalman, log returns, RSI, ATR, GMM cluster) |
 | `optimize` | Run / resume Optuna hyperparameter search (OOS Complex Criterion scoring) |
 | `train` | Train HMM + XGBoost; compute Z-Score regime stats; show IS/OOS breakdown |
-| `train_lstm` | Train LSTM ensemble (or single model); supports ensemble, fine-tune, temperature |
+| `train_tcn` | Train TCN confidence scorer; supports full training, fine-tune, temperature |
 | `sensitivity` | Z-Score sensitivity sweep (Bull/Bear cutoffs 1.5–3.0) on trained models |
 | `compare` | Side-by-side OOS comparison across TFs ranked by Complex Criterion |
 | `export` | Export XGBoost ensemble → ONNX for MQL5 EA |
@@ -397,7 +402,7 @@ python main.py --mode <MODE> [OPTIONS]
 | `demo` | Run live execution loop on MT5 demo account (no YES prompt) |
 | `live` | Run live execution loop on MT5 live account (requires YES confirmation) |
 | `audit` | Generate and Telegram-send daily MT5 deal report |
-| `guardian` | Continuous rolling Sharpe health monitor + daily LSTM auto-retrain |
+| `guardian` | Continuous rolling Sharpe health monitor + daily TCN auto-retrain |
 | `listen` | Start Telegram remote control bot (with nightly 23:55 summary) |
 
 ### All Options
@@ -415,11 +420,10 @@ python main.py --mode <MODE> [OPTIONS]
 | `--skip_stale_check` | flag | off | Bypass model-staleness gate on `live`/`demo` |
 | `--train_days` | int | TF default | WFA IS window in calendar days (H1=365, M15=180, M5=90) |
 | `--test_days` | int | TF default | WFA OOS step in calendar days (H1=90, M15=60, M5=30) |
-| `--epochs` | int | 100 | LSTM training epochs for `train_lstm` |
-| `--lstm_seq_len` | int | 100 | LSTM input sequence length in bars |
-| `--ensemble_size` | int | 3 | LSTM models in ensemble. `1` = single-model (legacy) |
-| `--temperature` | float | 1.5 | LSTM softmax temperature. >1.0 softens predictions; <1.0 sharpens |
-| `--fine_tune` | flag | off | Adapt existing LSTM to recent data instead of full retrain |
+| `--epochs` | int | 100 | TCN training epochs for `train_tcn` |
+| `--seq_len` | int | 100 | TCN input sequence length in bars |
+| `--temperature` | float | 1.5 | TCN sigmoid temperature. >1.0 softens confidence; <1.0 sharpens |
+| `--fine_tune` | flag | off | Adapt existing TCN to recent data instead of full retrain |
 | `--recent_years` | int | 2 | Years of recent data to use when `--fine_tune` is set |
 | `--n_jobs` | int | 1 | Parallel Optuna workers (advanced) |
 
@@ -434,7 +438,7 @@ python main.py --mode process        --tf H1
 python main.py --mode optimize       --tf H1 --broker headway_cent --balance 15 --trials 400
 python main.py --mode train          --tf H1 --broker headway_cent --balance 15
 python main.py --mode sensitivity    --tf H1 --broker headway_cent --balance 15
-python main.py --mode train_lstm     --tf H1 --broker headway_cent --epochs 100
+python main.py --mode train_tcn      --tf H1 --broker headway_cent --epochs 100
 python main.py --mode report         --tf H1 --broker headway_cent --balance 15
 python main.py --mode sync_validate  --tf H1 --broker headway_cent --balance 15 --period 6m
 python main.py --mode wfa            --tf H1 --broker headway_cent --balance 15
@@ -448,7 +452,7 @@ python main.py --mode process        --tf M15
 python main.py --mode optimize       --tf M15 --broker headway_cent --balance 15 --trials 600
 python main.py --mode train          --tf M15 --broker headway_cent --balance 15
 python main.py --mode sensitivity    --tf M15 --broker headway_cent --balance 15
-python main.py --mode train_lstm     --tf M15 --broker headway_cent --epochs 100
+python main.py --mode train_tcn      --tf M15 --broker headway_cent --epochs 100
 python main.py --mode report         --tf M15 --broker headway_cent --balance 15
 python main.py --mode sync_validate  --tf M15 --broker headway_cent --balance 15 --period 3m
 python main.py --mode demo           --tf M15 --broker headway_cent --balance 15
@@ -461,7 +465,7 @@ python main.py --mode process        --tf M5
 python main.py --mode optimize       --tf M5 --broker headway_cent --balance 15 --trials 1000
 python main.py --mode train          --tf M5 --broker headway_cent --balance 15
 python main.py --mode sensitivity    --tf M5 --broker headway_cent --balance 15
-python main.py --mode train_lstm     --tf M5 --broker headway_cent --epochs 100
+python main.py --mode train_tcn      --tf M5 --broker headway_cent --epochs 100
 python main.py --mode report         --tf M5 --broker headway_cent --balance 15
 python main.py --mode sync_validate  --tf M5 --broker headway_cent --balance 15 --period 3m
 python main.py --mode demo           --tf M5 --broker headway_cent --balance 15
@@ -486,13 +490,15 @@ z = (prob − IS_mean[hmm_state]) / IS_std[hmm_state]
 
 | State | Signal | H1 | M15 | M5 |
 |-------|--------|----|-----|-----|
-| Bull (0) | BUY | **+2.5σ** | **+2.0σ** | **+2.8σ** |
-| Bear (1) | SELL | **−2.5σ** | **−2.0σ** | **−2.8σ** |
-| Chop (2) | MR_BUY | −3.0σ | −3.0σ | −3.5σ |
-| Chop (2) | MR_SELL | +3.0σ | +3.0σ | +3.5σ |
-| Chop_High (3, n=4) | MR_SELL | +3.5σ | +3.5σ | +4.0σ |
+| Bull (0) | BUY | **+2.5σ** | **+2.0σ** | **+2.5σ** |
+| Bear (1) | SELL | **−2.5σ** | **−2.0σ** | **−2.5σ** |
+| Chop (2) | MR_BUY | −3.0σ | −3.0σ | −3.2σ |
+| Chop (2) | MR_SELL | +3.0σ | +3.0σ | +3.2σ |
+| Chop_High (3, n=4) | MR_SELL | +3.5σ | +3.5σ | +3.7σ |
 
 High-vol bars (`gmm_cluster == 2`) add **+0.3σ** to the Bull/Bear cutoffs (M5: **+0.4σ**). The live bridge logs `[MR WARNING]` when a Chop signal fires during elevated volatility.
+
+When the TCN is loaded the **effective** cutoff is `base_z × confidence_multiplier` — see [TCN Confidence Scorer](#tcn-confidence-scorer).
 
 #### Trade gate requirements
 
@@ -500,7 +506,7 @@ A trade fires when **all** of the following pass:
 
 | Gate | Requirement |
 |------|-------------|
-| Z-Score | Exceeds TF-specific cutoff for the current regime |
+| Z-Score | Exceeds effective TF cutoff (base × TCN multiplier) for the current regime |
 | HMM alignment | BUY only in Bull (0); SELL only in Bear (1); Chop → MR only |
 | ER filter | ATR / spread ≥ 1.25 |
 | Session limit | Under daily trade cap for this TF |
@@ -573,119 +579,143 @@ MR SL is 70% of the base ATR distance. M5 also uses a TP3 at 3.0× SL for growth
 
 ---
 
-## LSTM Regime Ensemble
+## TCN Confidence Scorer
 
-The LSTM ensemble watches 100-bar feature sequences to predict the HMM regime label **before** the HMM commits. It provides early transition warnings and adjusts Z-Score strictness on the current bar.
+The TCN watches the last 100 bars of market context and outputs a **confidence multiplier** that scales the Z-Score cutoff on the current signal bar. Unlike the old LSTM ensemble, the TCN never blocks trades outright — it only makes entry thresholds easier or harder.
 
 ### Architecture
 
 ```
 Input (100 bars, 8 features)
-  → LSTM(64, return_sequences=True) + Dropout(0.3)
-  → LSTM(32, return_sequences=False) + Dropout(0.3)
-  → Dense(16, relu) + Dropout(0.2)
-  → Dense(n_states, softmax)
+  → Conv1D(64, kernel=3, dilation=1, padding=causal, relu)  + Dropout(0.3)
+  → Conv1D(64, kernel=3, dilation=2, padding=causal, relu)  + Dropout(0.3)
+  → Conv1D(64, kernel=3, dilation=4, padding=causal, relu)  + Dropout(0.3)
+  → Conv1D(64, kernel=3, dilation=8, padding=causal, relu)
+  → GlobalAveragePooling1D
+  → Dense(32, relu) + Dropout(0.2)
+  → Dense(1, sigmoid)   ← raw confidence [0, 1]
+  → temperature calibration
+  → multiplier = 1.3 − (confidence × 0.6)   ← maps to [0.7, 1.3]
 ```
 
-Trained with `Adam(lr=0.001)`, `EarlyStopping(patience=15, monitor=val_accuracy)`.
+**Causal padding** ensures no future bar data leaks into the prediction. Each dilation doubles the receptive field without extra parameters.
 
 Input features: `log_return`, `volatility`, `rsi_normalized`, `atr_normalized`, `volume_ratio`, `bb_position`, `gmm_vol_cluster`, `dist_from_sma50`.
 
-### Ensemble design
+### Confidence multiplier mapping
 
-By default, **3 models** are trained with different random seeds (seeds 42, 49, 56). Predictions are averaged — when models disagree, the averaged probabilities naturally become more uniform, lowering the ensemble's confidence without needing any artificial threshold.
+| Raw confidence | Multiplier | Effect on Z-cutoff |
+|---------------|------------|-------------------|
+| 1.0 (very confident) | **0.70** | Cutoff × 0.70 — entry 30% easier |
+| 0.67 | **1.00** | No change |
+| 0.0 (very uncertain) | **1.30** | Cutoff × 1.30 — entry 30% harder |
+
+The effective Z-cutoff is always `≥ 1.0σ` regardless of multiplier.
 
 ### Temperature scaling
 
-Raw softmax outputs are calibrated via temperature scaling before any downstream logic:
+Raw sigmoid outputs are calibrated via temperature scaling before the multiplier mapping:
 
 ```
-log_probs = log(raw_probs + ε)
-calibrated = softmax(log_probs / T)
+logit    = log(raw_conf / (1 − raw_conf + ε))
+calibrated = sigmoid(logit / T)
 ```
 
 | Temperature T | Effect |
 |--------------|--------|
 | > 1.0 (default 1.5) | Softens distribution — model is more honest about uncertainty |
 | 1.0 | No change from raw output |
-| < 1.0 | Sharpens — increases the winning class probability |
+| < 1.0 | Sharpens — pushes confidence toward 0 or 1 |
 
-### Bidirectional Z-Score influence (live bridge)
+### Training targets
 
-| Condition | Effect |
-|-----------|--------|
-| `transition_risk > 0.5` (LSTM confident about a different state) | Z cutoff **+0.5** tighter |
-| `agreement = True` AND `confidence > 0.85` | Z cutoff **−0.3** relaxed (floor 1.0) |
-| Collapsed or low confidence | No influence — HMM-only |
+The TCN is trained on a **profit-based binary target**, not regime state labels:
 
-`transition_risk` is only non-zero when LSTM **disagrees with** HMM with confidence > 0.35. Agreement never produces transition risk regardless of confidence.
-
-### Collapse detection
-
-If `probs.max() − probs.min() < 0.02`, the output is considered near-uniform (collapsed). `predict_proba()` returns `None` and the live bridge disables LSTM for the session.
-
-Ensemble collapse: if more than half the member models are collapsed, the ensemble returns `None`.
-
-### Staleness & Auto-Retrain
-
-Each saved model stores a `trained_at` ISO timestamp in its metadata JSON. The `is_stale(max_age_days=7)` method returns `True` if the model is older than 7 days or has no recorded date.
-
-**Guardian auto-retrain** — while `--mode guardian` is running, it checks LSTM staleness once per day. If stale, it fires:
-
-```bash
-python main.py --mode train_lstm --tf <TF> --broker <broker> \
-    --epochs 50 --fine_tune --recent_years 2
-```
-
-as background subprocess and Telegrams the result.
+| Current HMM state | Next bar condition | Target |
+|-------------------|--------------------|--------|
+| Bull (0) | next log-return > 0 | 1 |
+| Bull (0) | next log-return ≤ 0 | 0 |
+| Bear (1) | next log-return < 0 | 1 |
+| Bear (1) | next log-return ≥ 0 | 0 |
+| Chop (2+) | `|next return|` < 0.003 | 1 |
+| Chop (2+) | `|next return|` ≥ 0.003 | 0 |
 
 ### Training commands
 
 ```bash
-# Full ensemble (first time — 3 models × ~15min = ~45 min total):
-python main.py --mode train_lstm --tf M15 --broker headway_cent \
-    --epochs 100 --ensemble_size 3 --temperature 1.5
+# Full training (first time — ~10–20 min):
+python main.py --mode train_tcn --tf H1 --broker headway_cent \
+    --epochs 100 --temperature 1.5
 
-# Fine-tune on last 2 years (recommended for weekly maintenance — ~10 min):
-python main.py --mode train_lstm --tf M15 --broker headway_cent \
+# Fine-tune on last 2 years (recommended for weekly maintenance — ~5 min):
+python main.py --mode train_tcn --tf H1 --broker headway_cent \
     --epochs 20 --fine_tune --recent_years 2
 
-# Single model (legacy / fast testing):
-python main.py --mode train_lstm --tf M15 --broker headway_cent \
-    --epochs 100 --ensemble_size 1
+# Custom sequence length:
+python main.py --mode train_tcn --tf H1 --broker headway_cent \
+    --epochs 100 --seq_len 50
 
-# Custom temperature (sharper predictions):
-python main.py --mode train_lstm --tf H1 --broker headway_cent \
+# Custom temperature (sharper multiplier distribution):
+python main.py --mode train_tcn --tf H1 --broker headway_cent \
     --epochs 100 --temperature 1.2
 ```
 
-### LSTM model files
+### TCN model files
 
 ```
-models/lstm/
+models/tcn/
 ├── H1_headway_cent/
-│   ├── ensemble_metadata.json   ← trained_at, n_models, temperature
-│   ├── model_0/
-│   │   ├── lstm_regime_classifier.keras
-│   │   ├── lstm_feature_scaler.pkl
-│   │   └── lstm_metadata.json
-│   ├── model_1/  …
-│   └── model_2/  …
+│   ├── tcn_confidence_model.keras
+│   ├── tcn_feature_scaler.pkl
+│   └── tcn_metadata.json        ← trained_at, seq_len, n_features, temperature
 ├── M15_headway_cent/  …
 └── M5_headway_cent/   …
 ```
 
-The `load_lstm_classifier()` helper tries `ensemble_metadata.json` before falling back to a single-model `lstm_regime_classifier.keras`. No code change is needed when upgrading from single to ensemble.
+The `load_tcn_classifier()` helper returns `None` silently if no model has been trained yet — the live bridge falls back to unmodified base Z-Score cutoffs.
 
-### Important: train LSTM after HMM, not before
+### Important: train TCN after HMM, not before
 
 ```bash
 # CORRECT order:
-python main.py --mode train    --tf H1 --broker headway_cent --balance 15   # HMM first
-python main.py --mode train_lstm --tf H1 --broker headway_cent              # LSTM second
+python main.py --mode train     --tf H1 --broker headway_cent --balance 15   # HMM first
+python main.py --mode train_tcn --tf H1 --broker headway_cent                # TCN second
 ```
 
-The LSTM learns to predict **HMM state labels**. If the HMM is re-optimised on new params, the state assignments may shift — retrain the LSTM afterward.
+The TCN learns from HMM regime labels. If the HMM is re-optimised on new params, state assignments may shift — retrain the TCN afterward.
+
+---
+
+## Automatic Data Updates & TCN Maintenance
+
+### Weekly Data Updater (`WeeklyDataUpdater`)
+
+`src/data_updater.py` runs automatically inside the live trading loop every **Sunday**. It:
+
+1. Fetches the last ~2 weeks of XAUUSD bars from MT5 for each active TF (H1: 336 bars, M15: 1344, M5: 4032)
+2. Deduplicates by timestamp and appends only new rows to the raw CSV training files
+3. Writes a `data/raw/.last_auto_update` marker so `TCNMaintenanceScheduler` can detect the refresh
+
+No manual action is required. The updater is a no-op on non-Sunday days and won't re-run within the same week.
+
+### Hourly TCN Maintenance (`TCNMaintenanceScheduler`)
+
+`src/tcn_maintenance.py` runs automatically inside the live loop **once per hour**. It:
+
+1. Reads `tcn_metadata.json` for each active TF — checks model age (no weights loaded; fast)
+2. If any model is **≥ 7 days old** or was never trained, launches a fine-tune subprocess:
+   ```bash
+   python main.py --mode train_tcn --tf <TF> --broker <broker> \
+       --epochs 20 --fine_tune --recent_years 2 --temperature 1.5
+   ```
+3. Also triggers a full retrain cycle when `WeeklyDataUpdater` marks a fresh data pull
+4. Uses a lock file (`models/tcn/.retrain_in_progress`) to prevent concurrent retrains
+
+A stale lock older than 2 hours is cleaned up automatically.
+
+### Guardian daily check
+
+When `--mode guardian` is running it also performs a **daily TCN staleness check** (independent of the live loop's hourly check). If any TF's model is stale, the guardian fires the same background retrain subprocess and sends a Telegram notification.
 
 ---
 
@@ -792,7 +822,7 @@ Minimum lot is always **0.01**. All lots rounded to 2 decimal places.
 | HMM `n_states` search space | `{2, 4}` only | 3–4 | 3–4 |
 | HMM persistence gate (training) | ≥ 0.65 | ≥ 0.65 | ≥ 0.65 |
 | IS/OOS split | 65% / 35% | 65% / 35% | **70% / 30%** |
-| Min OOS trades (hard floor) | 60 | 30 | 20 |
+| Min OOS trades (hard floor) | **120** | 30 | 20 |
 | Min OOS trades (penalty threshold) | 350 | 140 | 25 |
 | SL ATR multiplier | 1.5× | 2.0× | 2.0× |
 | TP1 multiplier (trend) | 0.8× SL | 1.0× SL | 1.5× SL |
@@ -803,6 +833,7 @@ Minimum lot is always **0.01**. All lots rounded to 2 decimal places.
 | DailyEquityGate loss | 5% | 5% | 5% |
 | DailyEquityGate profit lock | **20%** | **10%** | **10%** |
 | Model staleness gate | 14 days | 30 days | 30 days |
+| TCN staleness gate | 7 days | 7 days | 7 days |
 | M5 optimisation freshness gate | **120 h** | — | — |
 | Recommended `--trials` | 1000 | 600 | 400 |
 
@@ -879,7 +910,7 @@ Score = (Recovery Factor × 0.4) + (Profit Factor × 0.3) + (Sharpe Ratio × 0.3
 
 ```
 # Hard trade floors (trials below these return -50.0 immediately):
-MIN_OOS_TRADES_HARD = {"M5": 60, "M15": 30, "H1": 20}
+MIN_OOS_TRADES_HARD = {"M5": 120, "M15": 30, "H1": 20}
 
 # Soft trade floors (trials below these have score × 0.1):
 TF_MIN_OOS_TRADES   = {"M5": 350, "M15": 140, "H1": 25}
@@ -920,7 +951,7 @@ python main.py --mode guardian --tf M5,M15,H1 --period 3m \
 
 Every hour: validates rolling Sharpe for each TF — fires Telegram alert if below 0.6.
 
-**Daily LSTM check** (built into the guardian loop): reads `trained_at` from each LSTM model's metadata JSON (no weights loaded — fast). If any model is older than 7 days, fires auto-retrain as a background subprocess and Telegrams the result.
+**Daily TCN check** (built into the guardian loop): reads `trained_at` from each TCN model's metadata JSON (no weights loaded — fast). If any model is older than 7 days, fires auto-retrain as a background subprocess and Telegrams the result.
 
 ### Audit — On-demand deal report
 
@@ -1007,11 +1038,11 @@ python main.py --mode wfa --tf H1 --broker headway_cent --balance 15
 
 ### Model Staleness Gate
 
-| TF | Max model age |
-|----|--------------|
-| M5 | 14 days |
-| M15 | 30 days |
-| H1 | 30 days |
+| TF | Max HMM/XGB model age | Max TCN model age |
+|----|----------------------|-------------------|
+| M5 | 14 days | 7 days |
+| M15 | 30 days | 7 days |
+| H1 | 30 days | 7 days |
 
 M5 has an additional **5-day optimisation freshness gate**: `m5_meta_<broker>.json` must exist and be < 120 hours old before going live.
 
@@ -1029,14 +1060,16 @@ python main.py --mode wfa           --tf M5 --broker headway_cent --balance 15
 # If needed:
 python main.py --mode optimize      --tf M5 --broker headway_cent --balance 15 --trials 1000
 python main.py --mode train         --tf M5 --broker headway_cent --balance 15
-python main.py --mode train_lstm    --tf M5 --broker headway_cent --epochs 20 --fine_tune
+python main.py --mode train_tcn     --tf M5 --broker headway_cent --epochs 20 --fine_tune
 
 # Monthly (H1 / M15):
 python main.py --mode wfa       --tf H1 --broker headway_cent --balance 15
 python main.py --mode optimize  --tf H1 --broker headway_cent --balance 15 --trials 400
 python main.py --mode train     --tf H1 --broker headway_cent --balance 15
-python main.py --mode train_lstm --tf H1 --broker headway_cent --epochs 20 --fine_tune
+python main.py --mode train_tcn --tf H1 --broker headway_cent --epochs 20 --fine_tune
 ```
+
+The live bridge handles TCN fine-tuning automatically (every 7 days in background). Manual retraining above is only needed after a full HMM/XGBoost re-optimise.
 
 ---
 
@@ -1051,9 +1084,10 @@ python main.py --mode train_lstm --tf H1 --broker headway_cent --epochs 20 --fin
 | `ERROR: Degenerate HMM` during train | Stale params | Delete study DB, re-optimise, then train |
 | Validation FAIL every day | Model stale or data ends before sync window | Export fresh CSV from MT5, re-run full pipeline |
 | No signals firing | Z-Score cutoff not reached | Run `--mode sensitivity` to see trade count vs Z; lower cutoff or enable `--tiered` |
-| `[LSTM COLLAPSED]` warnings | LSTM trained on wrong HMM labels / undertrained | Retrain: `--mode train` then `--mode train_lstm` |
-| `[LSTM HEALTH] FAILED` at startup | Collapsed model loaded | Same fix as above |
-| `HIGH transition_risk=0.75` every bar | Old bug — fixed in current version | Ensure engine_lstm.py is up to date (transition_risk only fires on confident disagreement) |
+| TCN multiplier always ~1.3 (hardening) | TCN undertrained or wrong features | Retrain: `--mode train` then `--mode train_tcn --epochs 100` |
+| `[TCN HEALTH] FAILED` at startup | Corrupt model file | Delete `models/tcn/<TF>_<broker>/` and retrain |
+| `ValueError: Input shape (None, 100, 4)` | TCN trained without deriving features | Fixed in current version — retrain TCN |
+| `TCN auto-retrain triggered` in logs | Model ≥ 7 days old | Normal — background fine-tune fires automatically |
 | WFA shows many ❌ folds | Model curve-fits specific years | Loosen regularisation, increase trials, add more training data |
 | `Order failed: retcode=10006` | No broker connection | Check MT5 connection indicator |
 | `Order failed: retcode=10015` | Price moved past deviation | Will retry next bar; elevated deviation auto-applies on high-vol |
@@ -1102,12 +1136,11 @@ models/
 ├── study_headway_cent.db               ← Optuna trials (per-broker, never shared)
 ├── study_standard.db
 ├── m5_meta_headway_cent.json           ← M5 optimisation freshness gate
-└── lstm/
+└── tcn/
     ├── H1_headway_cent/
-    │   ├── ensemble_metadata.json      ← n_models, temperature, trained_at
-    │   ├── model_0/  lstm_regime_classifier.keras  lstm_feature_scaler.pkl  lstm_metadata.json
-    │   ├── model_1/  …
-    │   └── model_2/  …
+    │   ├── tcn_confidence_model.keras
+    │   ├── tcn_feature_scaler.pkl
+    │   └── tcn_metadata.json           ← trained_at, seq_len, n_features, temperature
     ├── M15_headway_cent/  …
     └── M5_headway_cent/   …
 ```
