@@ -726,7 +726,7 @@ def compute_live_features(
     atr_price   = atr_normalized * float(df["Close"].iloc[-1])
     # Return raw (pre-scaler) atr_normalized separately so the live ER filter
     # can compare it against spread_frac without using the scaled value.
-    # raw_df is the full live DataFrame (200 bars) passed to the LSTM classifier.
+    # raw_df is the full live DataFrame (200 bars) passed to the TCN confidence scorer.
     return features_df, current_state, atr_price, atr_normalized, df
 
 
@@ -972,18 +972,18 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     _eval_cfg = {"Z_CUTOFF_BULL": _z_cut, "Z_CUTOFF_BEAR": -_z_cut} if _z_cut else None
     signal_evaluator = SignalEvaluator(regime_stats, tf=tf, config=_eval_cfg)
 
-    # Load optional LSTM regime classifier — absent until --mode train_lstm is run
-    from src.engine_lstm import load_lstm_classifier as _load_lstm_clf
-    lstm_classifier = _load_lstm_clf(tf, broker)
-    if lstm_classifier is not None:
+    # Load optional TCN confidence scorer — absent until --mode train_tcn is run
+    from src.engine_tcn import load_tcn_classifier as _load_tcn_clf
+    tcn_classifier = _load_tcn_clf(tf, broker)
+    if tcn_classifier is not None:
         logger.info(
-            "LSTM regime classifier loaded [%s/%s] — n_states=%d.",
-            tf, broker, lstm_classifier.n_states,
+            "TCN confidence model loaded [%s/%s] — seq_len=%d  n_states=%d.",
+            tf, broker, tcn_classifier.seq_len, tcn_classifier.n_states,
         )
     else:
         logger.info(
-            "LSTM regime classifier not found [%s/%s] — running HMM-only. "
-            "Run --mode train_lstm to enable ensemble regime detection.",
+            "TCN confidence model not found [%s/%s] — static Z cutoffs active. "
+            "Run --mode train_tcn to enable dynamic Z-Score adjustment.",
             tf, broker,
         )
     if regime_stats:
@@ -1005,45 +1005,43 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     obs_cov   = obs_cov   if obs_cov   is not None else cfg_tf["obs_cov_default"]
     trans_cov = trans_cov if trans_cov is not None else cfg_tf["trans_cov_default"]
 
-    # ── LSTM startup health check ──────────────────────────────────────────
-    if lstm_classifier is not None:
-        try:
-            _hc_df = _build_live_df(DEFAULT_SYMBOL, tf_mt5, 150, obs_cov, trans_cov)
-            # Attach gmm_vol_cluster so the LSTM scaler receives all 8 features
+    # ── TCN startup health check ───────────────────────────────────────────
+    if tcn_classifier is not None:
+        _hc_ok, _hc_msg = tcn_classifier.health_check()
+        if not _hc_ok:
+            logger.warning(
+                "[TCN HEALTH] FAILED (%s) — using static Z cutoffs. "
+                "Retrain with --mode train_tcn.",
+                _hc_msg,
+            )
+            tcn_classifier = None
+        else:
+            # Quick multiplier probe on real warmup data
             try:
-                _hc_gmm, _hc_gscaler = load_gmm_model(tf, broker)
-                _hc_clusters = compute_gmm_vol_cluster(
-                    _hc_df["volatility"].values,
-                    fitted_gmm=_hc_gmm, fitted_scaler=_hc_gscaler,
-                )
-                _hc_df["gmm_vol_cluster"] = _hc_clusters.astype(float)
-            except Exception:
-                _hc_df["gmm_vol_cluster"] = 0.0
-            _hc_probs = lstm_classifier.predict_proba(_hc_df)
-            _n_models = getattr(lstm_classifier, "n_models", 1)   # 1 for single, N for ensemble
-            if _hc_probs is None:
-                logger.warning(
-                    "[LSTM HEALTH] FAILED — collapsed output on startup warmup data. "
-                    "Running HMM-only. Retrain with --mode train_lstm."
-                )
-                lstm_classifier = None
-            else:
-                _hc_max  = max(_hc_probs.values())
-                _hc_type = f"ensemble ({_n_models} models)" if _n_models > 1 else "single model"
-                if _hc_max < 0.30:
-                    logger.warning(
-                        "[LSTM HEALTH] LOW CONFIDENCE %.2f — %s. "
-                        "LSTM will have minimal influence. Consider retraining.",
-                        _hc_max, _hc_type,
+                _hc_df = _build_live_df(DEFAULT_SYMBOL, tf_mt5, 150, obs_cov, trans_cov)
+                try:
+                    _hc_gmm, _hc_gscaler = load_gmm_model(tf, broker)
+                    _hc_df["gmm_vol_cluster"] = compute_gmm_vol_cluster(
+                        _hc_df["volatility"].values,
+                        fitted_gmm=_hc_gmm, fitted_scaler=_hc_gscaler,
+                    ).astype(float)
+                except Exception:
+                    _hc_df["gmm_vol_cluster"] = 0.0
+                _hc_mult = tcn_classifier.predict_confidence(_hc_df)
+                if _hc_mult is not None:
+                    logger.info(
+                        "[TCN HEALTH] OK — multiplier=%.2f  (Z %.0f%% of base)",
+                        _hc_mult, _hc_mult * 100,
                     )
                 else:
-                    logger.info(
-                        "[LSTM HEALTH] OK — %s  max_conf=%.2f",
-                        _hc_type, _hc_max,
+                    logger.warning(
+                        "[TCN HEALTH] warmup probe returned None — "
+                        "using static Z cutoffs."
                     )
-        except Exception as _hc_exc:
-            logger.warning("[LSTM HEALTH] ERROR — %s — running HMM-only.", _hc_exc)
-            lstm_classifier = None
+                    tcn_classifier = None
+            except Exception as _hc_exc:
+                logger.warning("[TCN HEALTH] warmup probe error: %s", _hc_exc)
+                tcn_classifier = None
 
     # Session state (persists across bars within a day)
     last_bar_time = None
@@ -1270,69 +1268,56 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             )
             signal_tracker["atr_price"] = atr_price   # cache for between-bar ATR trail
 
-            # ── 4a. LSTM ensemble + transition risk ───────────────────────
-            # If the LSTM classifier is loaded, ensemble its prediction with
-            # the HMM state.  High transition_risk (>0.5) means the LSTM is
-            # confident the regime is changing — Z cutoffs are tightened to
-            # avoid entering signals into an unstable regime.
-            _lstm_ensemble_info = None
-            _active_evaluator   = signal_evaluator   # default: no LSTM adjustment
-            if lstm_classifier is not None:
+            # ── 4a. TCN dynamic Z-Score adjustment ────────────────────────
+            # If the TCN confidence model is loaded, compute a multiplier
+            # [0.7, 1.3] from the last 100 bars and apply it to the base
+            # Z-Score cutoff.  Confident regimes get easier entry;
+            # uncertain / noisy regimes require a stronger signal.
+            _active_evaluator = signal_evaluator   # default: no TCN adjustment
+            if tcn_classifier is not None:
                 try:
-                    _ens_state, _lstm_info = lstm_classifier.ensemble_predict(
-                        df_recent=live_df,
-                        hmm_state=hmm_state,
-                        lstm_weight=0.3,
-                    )
-                    _lstm_ensemble_info = _lstm_info
-                    if _lstm_info.get("lstm_status") == "COLLAPSED":
-                        logger.warning(
-                            "[LSTM] Collapsed output detected mid-session — "
-                            "disabling LSTM for the rest of this session. Retrain recommended."
+                    _tcn_mult = tcn_classifier.predict_confidence(live_df)
+                    if _tcn_mult is not None:
+                        _base_cut    = _z_cut if _z_cut else 2.5
+                        _eff_cut     = _base_cut * _tcn_mult
+                        from src.signal_evaluator import SignalEvaluator as _SE
+                        _active_evaluator = _SE(
+                            regime_stats, tf=tf,
+                            config={"Z_CUTOFF_BULL": _eff_cut, "Z_CUTOFF_BEAR": -_eff_cut},
                         )
-                        lstm_classifier = None
-                    elif not _lstm_info["agreement"]:
+                        _direction = "loosened" if _eff_cut < _base_cut else "tightened"
                         logger.info(
-                            "[LSTM] HMM=%d vs LSTM=%d (conf=%.2f, risk=%.2f) — %s",
-                            hmm_state,
-                            _lstm_info["lstm_state"],
-                            _lstm_info["lstm_confidence"],
-                            _lstm_info["transition_risk"],
-                            "TIGHTENING Z" if _lstm_info["transition_risk"] > 0.5 else "watching",
+                            "[TCN ADJUST] Z cutoff %s: %.2f → %.2f "
+                            "(multiplier=%.2f)",
+                            _direction, _base_cut, _eff_cut, _tcn_mult,
                         )
                     else:
-                        logger.debug(
-                            "[LSTM] HMM=%d LSTM=%d agree (conf=%.2f, risk=%.2f)",
-                            hmm_state, _lstm_info["lstm_state"],
-                            _lstm_info["lstm_confidence"], _lstm_info["transition_risk"],
-                        )
-                    if _lstm_info["transition_risk"] > 0.5:
-                        # TIGHTEN — regime instability detected
-                        from src.signal_evaluator import SignalEvaluator as _SE
-                        _base_cut = _z_cut if _z_cut else 2.5
-                        _active_evaluator = _SE(
-                            regime_stats, tf=tf,
-                            config={"Z_CUTOFF_BULL": _base_cut + 0.5, "Z_CUTOFF_BEAR": -(_base_cut + 0.5)},
-                        )
-                        logger.info(
-                            "LSTM: HIGH transition_risk=%.2f — Z tightened to ±%.1f",
-                            _lstm_info["transition_risk"], _base_cut + 0.5,
-                        )
-                    elif _lstm_info.get("agreement") and _lstm_info.get("lstm_confidence", 0.0) > 0.85:
-                        # RELAX — LSTM strongly agrees with HMM; lower bar for entry
-                        from src.signal_evaluator import SignalEvaluator as _SE
-                        _base_cut = _z_cut if _z_cut else 2.5
-                        _relaxed  = max(1.0, _base_cut - 0.3)
-                        _active_evaluator = _SE(
-                            regime_stats, tf=tf,
-                            config={"Z_CUTOFF_BULL": _relaxed, "Z_CUTOFF_BEAR": -_relaxed},
-                        )
-                        logger.info(
-                            "LSTM: strong agreement conf=%.2f — Z relaxed to ±%.1f",
-                            _lstm_info["lstm_confidence"], _relaxed,
-                        )
-                except Exception as _lstm_exc:
-                    logger.warning("LSTM ensemble failed: %s", _lstm_exc, exc_info=True)
+                        logger.debug("[TCN] predict_confidence returned None — using base Z.")
+                except Exception as _tcn_exc:
+                    logger.warning("TCN adjustment failed: %s", _tcn_exc, exc_info=True)
+
+            # ── 4b. Hourly maintenance: weekly data pull + TCN staleness ──
+            _now_hour = datetime.now(timezone.utc).replace(
+                minute=0, second=0, microsecond=0
+            )
+            if not hasattr(run_live_loop, "_last_maint_hour") or \
+                    run_live_loop._last_maint_hour != _now_hour:
+                run_live_loop._last_maint_hour = _now_hour
+                try:
+                    from src.data_updater import WeeklyDataUpdater
+                    _upd = WeeklyDataUpdater()
+                    if _upd.should_update():
+                        logger.info("Sunday detected — running weekly data update.")
+                        _upd.update_all_timeframes()
+                except Exception as _upd_exc:
+                    logger.debug("Weekly data updater: %s", _upd_exc)
+                try:
+                    from src.tcn_maintenance import TCNMaintenanceScheduler
+                    _maint = TCNMaintenanceScheduler(broker=broker, balance=account_size)
+                    if _maint.should_run_check():
+                        _maint.run_maintenance_cycle()
+                except Exception as _maint_exc:
+                    logger.debug("TCN maintenance check: %s", _maint_exc)
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
             prob        = float(_probs[0])
             gmm_cluster = int(features_df["gmm_vol_cluster"].iloc[0]) if "gmm_vol_cluster" in features_df.columns else -1
