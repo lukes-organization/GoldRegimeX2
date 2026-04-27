@@ -115,13 +115,17 @@ class TCNMaintenanceScheduler:
 
     def trigger_retraining(self, tf: str) -> bool:
         """Launch TCN fine-tune for *tf* as a non-blocking background process."""
+        # TF-specific epoch counts — H1 benefits from more epochs due to less data
+        tf_epochs = {"H1": 30, "M15": 20, "M5": 15}
+        epochs = tf_epochs.get(tf.upper(), 20)
+
         cmd = [
             sys.executable, "main.py",
             "--mode",         "train_tcn",
             "--tf",           tf.upper(),
             "--broker",       self.broker,
             "--balance",      str(self.balance),
-            "--epochs",       "20",
+            "--epochs",       str(epochs),
             "--fine_tune",
             "--recent_years", "2",
             "--temperature",  "1.5",

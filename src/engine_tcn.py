@@ -155,11 +155,11 @@ class SignalConfidenceTCN:
 
     def build_model(self):
         """TCN with dilated causal convolutions — no look-ahead."""
-        from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import (
+        from keras.models import Sequential
+        from keras.layers import (
             Conv1D, Dense, Dropout, GlobalAveragePooling1D, Input,
         )
-        from tensorflow.keras.optimizers import Adam
+        from keras.optimizers import Adam
 
         model = Sequential([
             Input(shape=(self.seq_len, self.n_features)),
@@ -189,34 +189,112 @@ class SignalConfidenceTCN:
         features_df: pd.DataFrame,
         hmm_states: pd.Series,
         returns_series: pd.Series,
+        forward_window: int = 5,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Build (X, y) training pairs.
+        """Build (X, y) training pairs using forward-window trade outcomes.
 
-        Target = 1 if the *next* bar's log-return direction matches the
-        *current* HMM regime:
-            Bull (0)  + positive next return → 1
-            Bear (1)  + negative next return → 1
-            Chop (2+) + |return| < 0.003    → 1
+        Target = 1 if a trade entered at the current bar (following the HMM
+        regime direction) would be profitable over the next *forward_window* bars.
+
+        Typical forward windows by TF:
+            H1:  5 bars  (~5 hours)
+            M15: 12 bars (~3 hours)
+            M5:  24 bars (~2 hours)
+
+        This produces a realistic, learnable target rather than single-bar
+        noise which has a ~50% accuracy ceiling.
         """
         feature_cols = [c for c in _INPUT_COLUMNS if c in features_df.columns]
-        X, y = [], []
+        if "Close" not in features_df.columns:
+            logger.warning(
+                "prepare_sequences: 'Close' column missing — "
+                "falling back to single-bar log-return targets."
+            )
+            # Fallback: original single-bar target
+            X, y = [], []
+            for i in range(len(features_df) - self.seq_len - 1):
+                seq           = features_df[feature_cols].iloc[i : i + self.seq_len].values
+                current_state = int(hmm_states.iloc[i + self.seq_len])
+                next_return   = float(returns_series.iloc[i + self.seq_len + 1])
+                if current_state == 0:
+                    target = 1 if next_return > 0 else 0
+                elif current_state == 1:
+                    target = 1 if next_return < 0 else 0
+                else:
+                    target = 1 if abs(next_return) < 0.003 else 0
+                X.append(seq)
+                y.append(target)
+            return np.array(X, dtype=np.float32), np.array(y, dtype=np.int32)
 
-        for i in range(len(features_df) - self.seq_len - 1):
-            seq            = features_df[feature_cols].iloc[i : i + self.seq_len].values
-            current_state  = int(hmm_states.iloc[i + self.seq_len])
-            next_return    = float(returns_series.iloc[i + self.seq_len + 1])
+        logger.info("Preparing sequences  forward_window=%d…", forward_window)
+        X: list = []
+        y: list = []
+        skipped_neutral = 0
+        skipped_edge    = 0
 
-            if current_state == 0:       # Bull
-                target = 1 if next_return > 0 else 0
-            elif current_state == 1:     # Bear
-                target = 1 if next_return < 0 else 0
-            else:                        # Chop
-                target = 1 if abs(next_return) < 0.003 else 0
+        close_arr = features_df["Close"].values
+        n = len(features_df)
+
+        for i in range(n - self.seq_len - forward_window):
+            seq_end       = i + self.seq_len
+            current_state = int(hmm_states.iloc[seq_end])
+
+            seq = features_df[feature_cols].iloc[i : seq_end].values
+            if np.any(np.isnan(seq)) or np.any(np.isinf(seq)):
+                skipped_edge += 1
+                continue
+
+            # Forward return from the bar where the trade decision is made
+            entry_price   = close_arr[seq_end]
+            exit_price    = close_arr[seq_end + forward_window]
+            if entry_price == 0:
+                skipped_edge += 1
+                continue
+            fwd_return = (exit_price - entry_price) / entry_price
+
+            if current_state == 0:       # Bull → long
+                target = 1 if fwd_return >  0.001 else 0
+            elif current_state == 1:     # Bear → short
+                target = 1 if fwd_return < -0.001 else 0
+            else:                        # Chop → mean-reversion
+                bb_pos = features_df["bb_position"].iloc[seq_end]
+                if bb_pos < 0.30:        # near lower band — expect bounce
+                    target = 1 if fwd_return >  0.0005 else 0
+                elif bb_pos > 0.70:      # near upper band — expect fade
+                    target = 1 if fwd_return < -0.0005 else 0
+                else:
+                    skipped_neutral += 1
+                    continue
 
             X.append(seq)
             y.append(target)
 
-        return np.array(X, dtype=np.float64), np.array(y, dtype=np.int32)
+        X_arr = np.array(X, dtype=np.float32)
+        y_arr = np.array(y, dtype=np.int32)
+
+        n_total = len(y_arr)
+        n_pos   = int(np.sum(y_arr == 1))
+        n_neg   = n_total - n_pos
+        ratio   = max(n_pos, n_neg) / max(min(n_pos, n_neg), 1)
+
+        logger.info(
+            "Sequences prepared: %d samples  "
+            "(skipped %d neutral, %d edge)",
+            n_total, skipped_neutral, skipped_edge,
+        )
+        logger.info(
+            "  Profitable: %d (%.1f%%)  Unprofitable: %d (%.1f%%)  "
+            "Ratio: %.2f:1",
+            n_pos, 100 * n_pos / max(n_total, 1),
+            n_neg, 100 * n_neg / max(n_total, 1),
+            ratio,
+        )
+        if ratio > 3.0:
+            logger.warning(
+                "Severe class imbalance (%.1f:1) — consider adjusting "
+                "forward_window", ratio
+            )
+        return X_arr, y_arr
 
     def train(
         self,
@@ -227,31 +305,69 @@ class SignalConfidenceTCN:
         batch_size: int         = 64,
         validation_split: float = 0.2,
     ):
-        """Full training from scratch."""
+        """Full training from scratch with forward-window trade outcome targets."""
         from sklearn.preprocessing import StandardScaler
-        from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+        from sklearn.utils.class_weight import compute_class_weight
+        from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
+        # Ensure derived feature columns exist before building sequences
         features_df = _add_derived_features(features_df)
-        logger.info("TCN training — %d bars", len(features_df))
 
-        X, y = self.prepare_sequences(features_df, hmm_states, returns_series)
+        # Auto-select forward window based on approximate TF (by data size)
+        n_bars = len(features_df)
+        if n_bars > 200_000:          # M5
+            forward_window = 24
+        elif n_bars > 80_000:         # M15
+            forward_window = 12
+        else:                         # H1
+            forward_window = 5
+
+        logger.info("TCN training — %d bars  forward_window=%d", n_bars, forward_window)
+
+        X, y = self.prepare_sequences(
+            features_df, hmm_states, returns_series,
+            forward_window=forward_window,
+        )
+
+        if len(X) < 1000:
+            logger.error(
+                "Insufficient training samples: %d — need at least 1000", len(X)
+            )
+            return None
+
         logger.info("Sequences: %d  shape: %s  positive_rate: %.1f%%",
                     len(X), X.shape, 100 * y.mean())
 
-        # Update n_features to match actual available columns (may be < 8 if
-        # some columns like 'Volume' or 'rsi' are absent from the training df)
+        # Update n_features to match actual available columns
         self.n_features = X.shape[-1]
 
         # Fit scaler on flattened feature matrix
         self.feature_scaler = StandardScaler()
-        X_flat   = X.reshape(-1, X.shape[-1])
+        X_flat   = X.reshape(-1, self.n_features)
         X_scaled = self.feature_scaler.fit_transform(X_flat).reshape(X.shape).astype(np.float32)
 
         self.model = self.build_model()
 
+        # Class weights to handle imbalanced profitable/unprofitable split
+        unique_classes = np.unique(y)
+        class_weights  = compute_class_weight("balanced", classes=unique_classes, y=y)
+        class_weight_dict = {int(c): float(w) for c, w in zip(unique_classes, class_weights)}
+        logger.info("Class weights: %s", class_weight_dict)
+
         callbacks = [
-            EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True),
-            ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6),
+            EarlyStopping(
+                monitor="val_accuracy",
+                patience=15,
+                restore_best_weights=True,
+                min_delta=0.005,
+            ),
+            ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6,
+                verbose=1,
+            ),
         ]
 
         history = self.model.fit(
@@ -259,18 +375,26 @@ class SignalConfidenceTCN:
             epochs=epochs,
             batch_size=batch_size,
             validation_split=validation_split,
+            class_weight=class_weight_dict,
             callbacks=callbacks,
             verbose=1,
         )
 
         self.trained_at = datetime.now(timezone.utc).isoformat()
 
-        val_acc  = max(history.history.get("val_accuracy", [0.5]))
-        baseline = max(float(y.mean()), 1.0 - float(y.mean()))
+        best_epoch    = int(np.argmax(history.history.get("val_accuracy", [0]))) + 1
+        best_val_acc  = float(max(history.history.get("val_accuracy",  [0.5])))
+        best_train_acc = float(history.history.get("accuracy", [0.5])[best_epoch - 1])
+        baseline       = float(max(y.mean(), 1.0 - y.mean()))
+
+        logger.info("TCN training complete:")
+        logger.info("  Best epoch:   %d", best_epoch)
+        logger.info("  Train acc:    %.4f (%.1f%%)", best_train_acc, best_train_acc * 100)
+        logger.info("  Val acc:      %.4f (%.1f%%)", best_val_acc,   best_val_acc   * 100)
+        logger.info("  Baseline:     %.4f (%.1f%%)", baseline,       baseline       * 100)
         logger.info(
-            "TCN training complete: val_acc=%.4f  baseline=%.4f  "
-            "improvement=%.1f%%",
-            val_acc, baseline, (val_acc / baseline - 1) * 100,
+            "  Improvement: %+.1f%% over baseline",
+            (best_val_acc / baseline - 1) * 100,
         )
 
         gc.collect()
@@ -285,9 +409,10 @@ class SignalConfidenceTCN:
         recent_years: int = 2,
     ):
         """Fine-tune on recent data at a reduced learning rate."""
+        from sklearn.utils.class_weight import compute_class_weight
+
         features_df = _add_derived_features(features_df)
         if recent_years:
-            # Approximate bars per year for common TFs
             bars_per_year = len(features_df) // max(
                 1,
                 int((features_df.index[-1] - features_df.index[0]).days / 365),
@@ -302,10 +427,21 @@ class SignalConfidenceTCN:
                     recent_years, len(features_df), features_df.index[0],
                 )
 
-        X, y     = self.prepare_sequences(features_df, hmm_states, returns_series)
+        n_bars = len(features_df)
+        forward_window = 24 if n_bars > 200_000 else (12 if n_bars > 80_000 else 5)
+
+        X, y = self.prepare_sequences(
+            features_df, hmm_states, returns_series,
+            forward_window=forward_window,
+        )
+
         X_scaled = self.feature_scaler.transform(
             X.reshape(-1, X.shape[-1])
         ).reshape(X.shape).astype(np.float32)
+
+        unique_classes    = np.unique(y)
+        class_weights     = compute_class_weight("balanced", classes=unique_classes, y=y)
+        class_weight_dict = {int(c): float(w) for c, w in zip(unique_classes, class_weights)}
 
         self.model.optimizer.learning_rate.assign(1e-4)
 
@@ -314,6 +450,7 @@ class SignalConfidenceTCN:
             epochs=epochs,
             batch_size=64,
             validation_split=0.2,
+            class_weight=class_weight_dict,
             verbose=1,
         )
 
@@ -409,7 +546,7 @@ class SignalConfidenceTCN:
 
     def load(self, directory: str) -> "SignalConfidenceTCN":
         """Load model, scaler, and metadata from *directory*."""
-        from tensorflow.keras.models import load_model as _load_keras
+        from keras.models import load_model as _load_keras
 
         model_path   = os.path.join(directory, "tcn_confidence_model.keras")
         scaler_path  = os.path.join(directory, "tcn_feature_scaler.pkl")

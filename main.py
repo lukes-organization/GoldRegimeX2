@@ -915,6 +915,16 @@ def cmd_train_tcn(args):
     n_states = int(df["hmm_state"].nunique())
     save_dir  = get_tcn_dir(tf, broker)
 
+    # TF-specific sequence lengths — CLI --seq_len overrides only if explicitly
+    # different from the default (100).  TF defaults give the best context window.
+    TF_SEQ_LENGTHS = {"H1": 50, "M15": 80, "M5": 100}
+    default_seq_len = TF_SEQ_LENGTHS.get(tf, 100)
+    seq_len = default_seq_len if seq_len == 100 else seq_len
+    if seq_len != default_seq_len:
+        logger.info("Using CLI --seq_len=%d (TF default was %d)", seq_len, default_seq_len)
+    else:
+        logger.info("Using TF-default seq_len=%d for %s", seq_len, tf)
+
     tcn = SignalConfidenceTCN(
         seq_len=seq_len,
         n_states=n_states,
@@ -941,7 +951,7 @@ def cmd_train_tcn(args):
     tcn.save(save_dir)
 
     # Quick inference test on last bar
-    recent_seq = df.iloc[-(seq_len + 10):]
+    recent_seq = df.iloc[-(tcn.seq_len + 10):]
     multiplier = tcn.predict_confidence(recent_seq)
     if multiplier is not None:
         logger.info(
