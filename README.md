@@ -1,6 +1,6 @@
 # Gold Regime X
 
-A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hidden Markov Models for regime detection, XGBoost for signal classification, and a **TCN confidence scorer** for dynamic Z-Score threshold adjustment. Designed for live execution through MetaTrader 5 on both **Headway Cent** (micro) and **Standard** accounts, with full Telegram remote control, health monitoring, and automatic TCN maintenance.
+A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hidden Markov Models for regime detection, XGBoost for signal classification, a **TCN confidence scorer** for dynamic RCEV threshold adjustment, and an **RCEV (Regime-Conditional Expected Value) scorer** that gates live trades on expected dollar profit calibrated from in-sample outcomes. Designed for live execution through MetaTrader 5 on both **Headway Cent** (micro) and **Standard** accounts, with full Telegram remote control, health monitoring, and automatic TCN maintenance.
 
 ---
 
@@ -15,7 +15,7 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 7. [Configuration](#configuration)
 8. [Complete Workflow — Start to Live Trading](#complete-workflow--start-to-live-trading)
 9. [Command Reference](#command-reference)
-10. [Signal Logic](#signal-logic)
+10. [Signal Logic — RCEV](#signal-logic--rcev)
 11. [TCN Confidence Scorer](#tcn-confidence-scorer)
 12. [Automatic Data Updates & TCN Maintenance](#automatic-data-updates--tcn-maintenance)
 13. [Sensitivity Analysis](#sensitivity-analysis)
@@ -60,22 +60,26 @@ XGBoost Three-Model Volatility Ensemble
       │  * optional: requires data/processed/USDCHF_master.csv
       │
       ▼
-Z-Score Signal Calibration
-      │  IS mean/std computed per HMM state → stored in model pkl
-      │  Signal fires when z = (prob − IS_mean) / IS_std crosses cutoff:
-      │    Bull  → BUY    z ≥ +2.5 (H1) / +2.0 (M15) / +2.5 (M5)
-      │    Bear  → SELL   z ≤ −2.5 (H1) / −2.0 (M15) / −2.5 (M5)
-      │    Chop  → MR_BUY / MR_SELL at ±3.0–4.0σ depending on TF
+Per-Regime XGBoost Classifiers (trained at --mode train)
+      │  3 binary classifiers: P(stay Bull), P(stay Bear), P(stay Chop)
+      │  Normalised → regime_probs = {Bull: f, Bear: f, Chop: f}
+      │
+      ▼
+RCEV Calibration (IS trade outcomes, bucketed by regime/prob/volatility)
+      │  expected_pnl = base_expected × condition_multiplier
+      │  condition_multiplier = session_quality × ATR_efficiency
+      │                       × regime_stability × (1/TCN_multiplier)
+      │  Saved to models/rcev_{TF}_{broker}.pkl at training time
       │
       ▼
 TCN Confidence Scorer (optional, loads automatically)
       │  4× dilated causal Conv1D → GlobalAveragePooling → Dense(32) → sigmoid
       │  Scores the current signal bar from 100-bar context sequences
       │  Outputs a confidence multiplier [0.7, 1.3]:
-      │    multiplier < 1.0  → effective_z relaxed  (clear, strong regime)
-      │    multiplier = 1.0  → no adjustment         (TCN not loaded)
-      │    multiplier > 1.0  → effective_z tightened (noisy / uncertain)
-      │  effective_z = base_z_cutoff × confidence_multiplier
+      │    multiplier < 1.0  → effective_threshold lowered  (clear, strong regime)
+      │    multiplier = 1.0  → no adjustment                 (TCN not loaded)
+      │    multiplier > 1.0  → effective_threshold raised    (noisy / uncertain)
+      │  effective_threshold = rcev_threshold × confidence_multiplier
       │
       ▼
 IS / OOS Backtest
@@ -85,6 +89,7 @@ IS / OOS Backtest
       ▼
 Complex Criterion Score  =  RF×0.4 + PF×0.3 + Sharpe×0.3
       │  (+return_consistency×0.5 bonus for M5/M15)
+      │  (Optimizer uses Z-Score internally — RCEV is live/validation only)
       │
       ▼
 Live Bridge  →  MT5 Market Orders
@@ -93,7 +98,7 @@ Live Bridge  →  MT5 Market Orders
       │  TF-specific magic numbers: H1=123456, M15=123457, M5=123458
 ```
 
-The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoost hyperparameters, scoring every trial on **OOS Complex Criterion only**. Signal thresholds are never part of the search space — they are derived automatically from the IS per-regime probability distribution at training time.
+The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoost hyperparameters, scoring every trial on **OOS Complex Criterion only** using the Z-Score signal path. RCEV is calibrated from IS data at training time and is the live/validation gate only — the optimizer is unchanged.
 
 ---
 
@@ -103,17 +108,18 @@ The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoos
 |------|---------|
 | `src/processor.py` | Kalman filter, log returns, RSI, ATR, GMM vol cluster, per-TF config |
 | `src/engine_hmm.py` | GaussianHMM with k-means prior init; TF persistence boost |
-| `src/engine_xgb.py` | XGBoost ensemble; `compute_regime_stats()` for Z-Score calibration; ONNX export |
-| `src/engine_tcn.py` | **TCN confidence scorer** — `SignalConfidenceTCN`, dilated causal Conv1D, `load_tcn_classifier()`, `get_tcn_dir()` |
-| `src/signal_evaluator.py` | Z-Score signal engine — `evaluate_signal_fast()` (backtester) and `evaluate_signal()` (live, with MR safety gates); TF cutoffs via `_TF_CUTOFF_OVERRIDES`; optional tiered mode |
-| `src/sensitivity.py` | **Z-Score sensitivity analysis** — sweeps Bull/Bear cutoffs 1.5–3.0, outputs comparison table + CSV/JSON |
-| `src/backtester.py` | Vectorized NumPy backtest — IS/OOS split, Z-Score signals, broker costs, floating drawdown, MT5 equity curve, MR attribution |
-| `src/optimizer.py` | Optuna study — Complex Criterion scoring, per-broker SQLite resume, RAM guard, Telegram heartbeat |
+| `src/engine_xgb.py` | XGBoost volatility ensemble; per-regime binary classifiers (`train_regime_classifiers`, `predict_regime_proba`); `compute_regime_stats()` for Z-Score calibration; ONNX export |
+| `src/engine_tcn.py` | **TCN confidence scorer** — `SignalConfidenceTCN`, dilated causal Conv1D, `load_tcn_classifier()`, `get_tcn_dir()`; outputs multiplier that scales RCEV threshold |
+| `src/rcev_scorer.py` | **RCEV scorer** — `RCEVScorer`; calibrates expected P&L lookup tables from IS trade outcomes; `score()` applies session quality, ATR efficiency, and TCN multiplier; saves/loads `models/rcev_{TF}_{broker}.pkl` |
+| `src/signal_evaluator.py` | Z-Score signal engine (`evaluate_signal_fast`, `evaluate_signal`) + **RCEV signal engine** (`evaluate_signal_rcev`) with tiered threshold reduction; TF cutoffs via `_TF_CUTOFF_OVERRIDES` |
+| `src/sensitivity.py` | Z-Score sensitivity analysis — sweeps Bull/Bear cutoffs 1.5–3.0, outputs comparison table + CSV/JSON |
+| `src/backtester.py` | Vectorized NumPy backtest — IS/OOS split, Z-Score signals, broker costs, floating drawdown, MT5 equity curve, MR attribution; `return_trades=True` exports per-trade records for RCEV calibration |
+| `src/optimizer.py` | Optuna study — Complex Criterion scoring (Z-Score path), per-broker SQLite resume, RAM guard, Telegram heartbeat |
 | `src/risk_manager.py` | AdaptiveRiskManager, CentConverter, DailyEquityGate, broker cost configs |
 | `src/visualizer.py` | 6-chart visual report: regime overlay, equity curve, features, transition matrix, dashboard, MT5 balance/equity |
 | `src/mt5_sync.py` | MT5 data downloader |
 | `src/validator.py` | Pre-live validation gate — Z-Score inference + Sharpe threshold + spread-payoff erosion warning |
-| `src/mt5_trader.py` | Live execution loop: bar detection, TCN confidence multiplier, dynamic Z-Score, order placement, hourly TCN maintenance |
+| `src/mt5_trader.py` | Live execution loop: bar detection, per-regime XGBoost inference, RCEV scoring, order placement, ATR trailing exits, M5 scalp recycling |
 | `src/notifier.py` | Telegram message sender |
 | `src/auditor.py` | MT5 deal history report |
 | `src/data_updater.py` | **Weekly MT5 data pull** — `WeeklyDataUpdater` appends fresh XAUUSD bars to raw CSVs every Sunday |
@@ -274,7 +280,8 @@ python main.py --mode process --tf H1
 python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --trials 400
 
 # 3. Train the final model with the best Optuna parameters
-#    Computes Z-Score regime stats (IS mean/std per state) and saves them in the pkl
+#    Trains HMM + XGBoost + per-regime classifiers
+#    Calibrates RCEV scorer from IS trade outcomes (saved to models/rcev_*.pkl)
 python main.py --mode train --tf H1 --broker headway_cent --balance 15
 
 # 4. (Optional) Run Z-Score sensitivity analysis to confirm the TF cutoff is optimal
@@ -345,11 +352,11 @@ Type `YES` when prompted. The live loop:
 
 1. Detects each newly completed bar (polls every 5 s)
 2. Fetches 200 bars for Kalman / HMM warm-up
-3. Runs Kalman → GMM → HMM → XGBoost inference
-4. Loads TCN; computes confidence multiplier → adjusts effective Z-Score cutoff
-5. Evaluates Z-Score signal with live MR safety gates
+3. Runs Kalman → GMM → HMM → XGBoost inference + per-regime probability distribution
+4. Loads TCN; computes confidence multiplier → scales RCEV threshold
+5. Evaluates RCEV score (or Z-Score if RCEV pkl absent) with live MR safety gates
 6. Applies session limits, margin check, spread viability guard
-7. Places IOC market orders with ATR-based SL and staged TPs
+7. Places IOC market orders with ATR-based SL and staged TPs (ATR multiples)
 8. Logs closed P&L in real USD after every trade
 9. Every hour: runs TCN staleness check; every Sunday: appends fresh bars to raw CSVs
 
@@ -391,7 +398,7 @@ python main.py --mode <MODE> [OPTIONS]
 | `consolidate` | Merge `*USDCHF*.csv` files in `data/raw/` into per-TF USDCHF masters |
 | `process` | Process raw CSV → features (Kalman, log returns, RSI, ATR, GMM cluster) |
 | `optimize` | Run / resume Optuna hyperparameter search (OOS Complex Criterion scoring) |
-| `train` | Train HMM + XGBoost; compute Z-Score regime stats; show IS/OOS breakdown |
+| `train` | Train HMM + XGBoost + per-regime classifiers; calibrate RCEV scorer; show IS/OOS breakdown |
 | `train_tcn` | Train TCN confidence scorer; supports full training, fine-tune, temperature |
 | `sensitivity` | Z-Score sensitivity sweep (Bull/Bear cutoffs 1.5–3.0) on trained models |
 | `compare` | Side-by-side OOS comparison across TFs ranked by Complex Criterion |
@@ -415,7 +422,8 @@ python main.py --mode <MODE> [OPTIONS]
 | `--trials` | int | 250 | Total Optuna trial target. Recommended: M5=1000, M15=600, H1=400 |
 | `--period` | str | `3m` | Lookback for MT5 sync: `3m`, `6m`, `12m` |
 | `--interval` | int | 3600 | Guardian check interval in seconds |
-| `--tiered` | flag | off | Enable tiered Z-Score mode (conviction-based cutoff reduction, floor 1.0) |
+| `--tiered` | flag | off | Enable tiered RCEV threshold mode (conviction-based reduction; minimum floor per TF) |
+| `--rcev_threshold` | float | TF default | RCEV minimum expected profit in USD. Defaults: H1=$0.50, M15=$0.35, M5=$0.20 |
 | `--profit_target` | float | 4.0 on M5 | Quick-profit close in USD per position. Pass `0` to disable on M5 |
 | `--skip_stale_check` | flag | off | Bypass model-staleness gate on `live`/`demo` |
 | `--train_days` | int | TF default | WFA IS window in calendar days (H1=365, M15=180, M5=90) |
@@ -474,31 +482,48 @@ python main.py --mode live           --tf M5 --broker headway_cent --balance 15
 
 ---
 
-## Signal Logic
+## Signal Logic — RCEV
 
-### Z-Score Signal Architecture
+### Regime-Conditional Expected Value (RCEV)
 
-Instead of fixed probability thresholds, every signal is calibrated relative to the **in-sample per-regime probability distribution**:
+The live signal gate is no longer a Z-Score threshold. Instead, every potential trade is scored by its **expected dollar profit** — calculated from historically-calibrated IS trade outcomes in the same market conditions.
 
 ```
-z = (prob − IS_mean[hmm_state]) / IS_std[hmm_state]
+expected_pnl = base_expected × condition_multiplier
+
+base_expected     ← IS mean P&L for this (regime, prob_bucket, vol_bucket) combination
+condition_multiplier = session_quality × ATR_efficiency × P(stay in regime) × (1 / TCN_mult)
 ```
 
-`IS_mean` and `IS_std` are computed once at training time and stored in the model pkl alongside the XGBoost ensemble.
+A trade fires when `expected_pnl ≥ rcev_threshold` AND the MR direction gates pass.
 
-#### TF-specific Z-Score cutoffs
+#### RCEV default thresholds
 
-| State | Signal | H1 | M15 | M5 |
-|-------|--------|----|-----|-----|
-| Bull (0) | BUY | **+2.5σ** | **+2.0σ** | **+2.5σ** |
-| Bear (1) | SELL | **−2.5σ** | **−2.0σ** | **−2.5σ** |
-| Chop (2) | MR_BUY | −3.0σ | −3.0σ | −3.2σ |
-| Chop (2) | MR_SELL | +3.0σ | +3.0σ | +3.2σ |
-| Chop_High (3, n=4) | MR_SELL | +3.5σ | +3.5σ | +3.7σ |
+| TF | Default threshold | Tiered floor (never go below) |
+|----|------------------|-------------------------------|
+| H1 | **$0.50** | $0.15 |
+| M15 | **$0.35** | $0.12 |
+| M5 | **$0.20** | $0.08 |
 
-High-vol bars (`gmm_cluster == 2`) add **+0.3σ** to the Bull/Bear cutoffs (M5: **+0.4σ**). The live bridge logs `[MR WARNING]` when a Chop signal fires during elevated volatility.
+Override at runtime: `--rcev_threshold 0.30`
 
-When the TCN is loaded the **effective** cutoff is `base_z × confidence_multiplier` — see [TCN Confidence Scorer](#tcn-confidence-scorer).
+#### Condition multiplier components
+
+| Component | Formula | Range |
+|-----------|---------|-------|
+| Session quality | UTC hour → lookup table (London/NY peaks = 1.0, Asia overnight = 0.3) | 0.3 – 1.0 |
+| ATR efficiency | `min(ATR / spread, 5.0) / 5.0 × 0.5 + 0.5` | 0.5 – 1.0 |
+| Regime stability | `HMM.transmat_[state, state]` — P(stay in current state) | ~0.65 – 0.99 |
+| TCN factor | `1.0 / max(tcn_multiplier, 0.7)` — high uncertainty → lower multiplier | ~0.77 – 1.43 |
+
+#### Calibration
+
+The RCEV lookup tables are built automatically at `--mode train` from IS trade outcomes bucketed by:
+- Regime (Bull / Bear / Chop)
+- XGBoost probability band (0–0.55, 0.55–0.65, 0.65–0.75, 0.75–0.85, 0.85–1.0)
+- Normalised ATR band (5 buckets)
+
+A minimum of 3 IS trades is required per bucket; otherwise the per-regime mean is used as a default. Saved to `models/rcev_{TF}_{broker}.pkl`.
 
 #### Trade gate requirements
 
@@ -506,14 +531,18 @@ A trade fires when **all** of the following pass:
 
 | Gate | Requirement |
 |------|-------------|
-| Z-Score | Exceeds effective TF cutoff (base × TCN multiplier) for the current regime |
-| HMM alignment | BUY only in Bull (0); SELL only in Bear (1); Chop → MR only |
-| ER filter | ATR / spread ≥ 1.25 |
+| RCEV | `expected_pnl ≥ effective_threshold` (threshold × TCN multiplier) |
+| Direction | BUY only in Bull (0); SELL only in Bear (1); Chop → MR only |
+| MR direction | MR_BUY: BB ≤ 0.35; MR_SELL: BB ≥ 0.65 |
 | Session limit | Under daily trade cap for this TF |
 | Margin check | Sufficient free margin for the lot size |
 | Spread viability | TP1 ≥ spread × ratio (1.5× cent / 3.0× standard) |
 | DailyEquityGate | Floating loss < 5% AND day gain < profit-lock threshold |
 | Global Guard | Fewer than 4 GRX positions open across all TFs |
+
+#### Graceful degradation
+
+If `models/rcev_{TF}_{broker}.pkl` does not exist (e.g. first boot before training), the live bridge automatically falls back to the Z-Score `evaluate_signal()` path. No crash, no `sys.exit`.
 
 ### Mean Reversion in Chop — Three Live Safety Gates
 
@@ -525,11 +554,24 @@ MR signals require three additional checks in the live bridge:
 | Transition probability | P(stay in state) ≥ 0.70 from HMM transmat | Low self-transition = breakout risk |
 | Bollinger Band confluence | MR_BUY: BB ≤ 0.35; MR_SELL: BB ≥ 0.65 | Only fade true extremes |
 
+### Tiered Threshold Mode
+
+Tiered mode dynamically reduces the RCEV threshold on bars where XGBoost has unusually high conviction, enabling trades that would otherwise miss the standard threshold.
+
+| `abs(prob − 0.50)` | Approximate prob range | Threshold reduction |
+|--------------------|------------------------|---------------------|
+| ≥ 0.10 | < 0.40 or > 0.60 | **× 0.60** |
+| ≥ 0.07 | < 0.43 or > 0.57 | **× 0.75** |
+| ≥ 0.04 | < 0.46 or > 0.54 | **× 0.85** |
+| < 0.04 | near 0.50 | no change |
+
+The effective threshold is always clamped to the TF tiered floor (H1=$0.15, M15=$0.12, M5=$0.08). Activate with `--tiered`.
+
 ### Logic Audit
 
 Every bar that does not fire a trade, the bridge logs a structured reason:
 
-`Low Z-Score` | `Chop Stability Gate` | `Transition Prob Gate` | `BB Confluence Gate` | `Directional Confirmation` | `Chop Suppressed` | `ER Filter` | `Daily Cap` | `Global Guard` | `Equity Gate`
+`Low RCEV` | `Chop Stability Gate` | `Transition Prob Gate` | `BB Confluence Gate` | `Directional Confirmation` | `Chop Suppressed` | `ER Filter` | `Daily Cap` | `Global Guard` | `Equity Gate`
 
 ### Spread Viability Guard
 
@@ -552,36 +594,50 @@ Every bar that does not fire a trade, the bridge logs a structured reason:
 
 Both gates reset at UTC midnight.
 
+### ATR Trailing Exits
+
+| Phase | Trigger | Action |
+|-------|---------|--------|
+| Phase 1 (break-even) | Floating P&L ≥ activation amount | SL → entry + 2×spread |
+| Phase 2 (trail) | Activated | Trailing SL at ATR × trail multiplier |
+
+**Activation amounts and trail multipliers by TF:**
+
+| TF | Activation P&L | Trail Multiplier |
+|----|----------------|-----------------|
+| H1 | **$1.50** | 2.5× ATR |
+| M15 | **$1.50** | 1.5× ATR |
+| M5 | **$1.00** | 1.5× ATR |
+
 ### Staged Take-Profits
 
 | Regime | TF | TP1 | TP2 (Runner) | SL ATR mult |
 |--------|----|-----|--------------|-------------|
-| Bull / Bear | M5 | 0.8× SL | 1.5× SL | 1.5× |
-| Bull / Bear | M15 | 1.0× SL | 2.0× SL | 2.0× |
-| Bull / Bear | H1 | 1.5× SL | 3.0× SL | 2.0× |
-| Chop (MR) | M5 | 0.5× SL | — | 1.5× × 0.70 |
-| Chop (MR) | M15 | 0.8× SL | — | 2.0× × 0.70 |
-| Chop (MR) | H1 | 1.0× SL | — | 2.0× × 0.70 |
-
-MR SL is 70% of the base ATR distance. M5 also uses a TP3 at 3.0× SL for growth-tier positions.
+| Bull / Bear | M5 | 0.8× ATR | 1.5× ATR | 1.5× |
+| Bull / Bear | M15 | 1.2× ATR | 2.5× ATR | 2.0× |
+| Bull / Bear | H1 | 1.5× ATR | 3.0× ATR | 2.0× |
+| Chop (MR) | M5 | 0.5× ATR | — | 1.05× |
+| Chop (MR) | M15 | 0.8× ATR | — | 1.4× |
+| Chop (MR) | H1 | 1.0× ATR | — | 1.4× |
 
 **Full profit protection chain (all TFs):**
 
 1. **Profit guard** — SL → entry + 2×spread when price reaches 70% of TP1 distance
 2. **Break-even** — runner SL → entry when TP1 fills
-3. **ATR trail** — activates when floating P&L ≥ $2.50; Phase 1: SL to BE+2×spread; Phase 2: trailing SL at ATR_MULTIPLIER × ATR (M5/M15: 1.5×, H1: 2.5×)
+3. **ATR trail** — activates when floating P&L ≥ TF activation amount
 
 **M5-only Hybrid Scalp Protection** (runs every 5 s between bars):
 
 4. **Fixed scalp target** — position closed when floating P&L ≥ $4.00
 5. **Trailing guard** — if peak P&L ≥ $2.00, close when P&L falls to ≤ 50% of peak
 6. **Chop-exit** — all positions closed at market if HMM shifts to Chop mid-trade
+7. **M5 recycle** — after scalp target close, re-entry is allowed on the same bar if regime unchanged and daily cap not hit
 
 ---
 
 ## TCN Confidence Scorer
 
-The TCN watches the last 100 bars of market context and outputs a **confidence multiplier** that scales the Z-Score cutoff on the current signal bar. Unlike the old LSTM ensemble, the TCN never blocks trades outright — it only makes entry thresholds easier or harder.
+The TCN watches the last 100 bars of market context and outputs a **confidence multiplier** that scales the RCEV threshold on the current signal bar. Unlike the old LSTM ensemble, the TCN never blocks trades outright — it only makes entry thresholds easier or harder.
 
 ### Architecture
 
@@ -604,13 +660,13 @@ Input features: `log_return`, `volatility`, `rsi_normalized`, `atr_normalized`, 
 
 ### Confidence multiplier mapping
 
-| Raw confidence | Multiplier | Effect on Z-cutoff |
-|---------------|------------|-------------------|
-| 1.0 (very confident) | **0.70** | Cutoff × 0.70 — entry 30% easier |
+| Raw confidence | Multiplier | Effect on RCEV threshold |
+|---------------|------------|--------------------------|
+| 1.0 (very confident) | **0.70** | Threshold × 0.70 — entry 30% easier |
 | 0.67 | **1.00** | No change |
-| 0.0 (very uncertain) | **1.30** | Cutoff × 1.30 — entry 30% harder |
+| 0.0 (very uncertain) | **1.30** | Threshold × 1.30 — entry 30% harder |
 
-The effective Z-cutoff is always `≥ 1.0σ` regardless of multiplier.
+The effective threshold is `rcev_threshold × tcn_multiplier`. If no RCEV calibration file exists, the TCN multiplier instead scales the Z-Score cutoff (same formula, different target).
 
 ### Temperature scaling
 
@@ -755,26 +811,15 @@ The JSON includes `current_z`, `best_z`, and `best_sharpe` for automated compari
 
 ---
 
-## Tiered Z-Score Mode
+## Tiered RCEV Mode
 
-Tiered mode dynamically reduces the Z cutoff on bars where XGBoost has unusually high conviction, enabling trades that would otherwise be gated out by the standard cutoff.
+Tiered mode dynamically reduces the RCEV threshold on bars where XGBoost has unusually high conviction. See [Tiered Threshold Mode](#tiered-threshold-mode) in the Signal Logic section for the full reduction table.
 
 ```bash
 python main.py --mode live --tf H1 --broker headway_cent --balance 15 --tiered
 ```
 
-#### Conviction → cutoff reduction table
-
-| `abs(prob − 0.50)` | Approximate prob range | Z cutoff reduction |
-|--------------------|------------------------|--------------------|
-| ≥ 0.10 | < 0.40 or > 0.60 | **−1.0σ** |
-| ≥ 0.07 | < 0.43 or > 0.57 | **−0.5σ** |
-| ≥ 0.04 | < 0.46 or > 0.54 | **−0.25σ** |
-| < 0.04 | near 0.50 | no change |
-
-The effective cutoff is always clamped to a minimum of **1.0σ**. MR (Chop) cutoffs are never modified by tiered mode — mean-reversion trades are not affected.
-
-**Note:** Tiered mode increases trade frequency. It is most useful on H1 where the standard Z cutoff is strict and there are few bars per day. Test on demo before enabling on live.
+**Note:** Tiered mode increases trade frequency. Test on demo before enabling on live.
 
 ```bash
 # Also applies to sensitivity analysis and report
@@ -1083,7 +1128,10 @@ The live bridge handles TCN fine-tuning automatically (every 7 days in backgroun
 | `WARNING: No Optuna study found` | Wrong broker or deleted DB | `--mode optimize` with matching `--broker` |
 | `ERROR: Degenerate HMM` during train | Stale params | Delete study DB, re-optimise, then train |
 | Validation FAIL every day | Model stale or data ends before sync window | Export fresh CSV from MT5, re-run full pipeline |
-| No signals firing | Z-Score cutoff not reached | Run `--mode sensitivity` to see trade count vs Z; lower cutoff or enable `--tiered` |
+| No signals firing (RCEV mode) | `rcev_*.pkl` absent or thresholds too high | Run `--mode train` to generate RCEV calibration; check logs for `[RCEV]` lines; try `--rcev_threshold 0.20` |
+| `[RCEV] No calibration data` for a regime | Regime had 0 IS trades | Normal for rare regimes; RCEV falls back to per-regime default expected P&L |
+| RCEV always falls back to Z-Score | `rcev_{tf}_{broker}.pkl` missing | Re-run `--mode train` — RCEV calibration runs automatically post-training |
+| No signals firing (Z-Score fallback) | Z-Score cutoff not reached | Run `--mode sensitivity` to see trade count vs Z; lower cutoff or enable `--tiered` |
 | TCN multiplier always ~1.3 (hardening) | TCN undertrained or wrong features | Retrain: `--mode train` then `--mode train_tcn --epochs 100` |
 | `[TCN HEALTH] FAILED` at startup | Corrupt model file | Delete `models/tcn/<TF>_<broker>/` and retrain |
 | `ValueError: Input shape (None, 100, 4)` | TCN trained without deriving features | Fixed in current version — retrain TCN |
@@ -1132,7 +1180,13 @@ models/
 ├── xgb_ensemble_H1_headway_cent.pkl    ← includes regime_stats (Z-Score calibration)
 ├── xgb_ensemble_M15_headway_cent.pkl
 ├── xgb_ensemble_M5_headway_cent.pkl
-├── xgb_model_H1_headway_cent.onnx      ← MQL5 EA uses this
+├── xgb_model_H1_headway_cent.onnx               ← MQL5 EA uses this
+├── xgb_ensemble_H1_headway_cent_regime_classifiers.pkl  ← per-regime XGBoost classifiers
+├── xgb_ensemble_M15_headway_cent_regime_classifiers.pkl
+├── xgb_ensemble_M5_headway_cent_regime_classifiers.pkl
+├── rcev_H1_headway_cent.pkl                     ← RCEV calibration (IS trade buckets)
+├── rcev_M15_headway_cent.pkl
+├── rcev_M5_headway_cent.pkl
 ├── study_headway_cent.db               ← Optuna trials (per-broker, never shared)
 ├── study_standard.db
 ├── m5_meta_headway_cent.json           ← M5 optimisation freshness gate

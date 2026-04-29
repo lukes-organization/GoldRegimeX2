@@ -413,6 +413,7 @@ def vectorized_backtest(
     regime_stats: dict = None,
     evaluator_config: dict = None,
     use_tiered: bool = False,
+    return_trades: bool = False,
 ):
     """Vectorized backtest with adaptive session limits and broker costs.
 
@@ -433,6 +434,10 @@ def vectorized_backtest(
                       provided, signals are generated via Z-Score calibration
                       (:func:`compute_signals_zscore`) instead of the legacy
                       fixed-threshold method.
+        return_trades: When True, add ``'trades_df'`` to the result — a
+                       DataFrame of IS-bar records used to calibrate the
+                       :class:`~src.rcev_scorer.RCEVScorer`.  Has no effect
+                       when ``split_idx`` is None (uses all bars).
     """
     log_returns = df["log_return"].values
     atr_norm    = df["atr_normalized"].values
@@ -565,6 +570,36 @@ def vectorized_backtest(
     result["equity_values"]     = _equity_arr
     result["balance_values"]    = _balance_arr
     result["deposit_load"]      = _deposit_load
+
+    # ── Per-trade records for RCEV calibration ────────────────────────────────
+    if return_trades:
+        _spread_val = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
+        _is_end = split_idx if split_idx is not None else len(signals)
+        _sig_is = signals[:_is_end]
+        _active_idx = np.where(_sig_is != 0)[0]
+        _gmm = (
+            df["gmm_vol_cluster"].values[:_is_end]
+            if "gmm_vol_cluster" in df.columns
+            else np.ones(_is_end, dtype=int)
+        )
+        trades_list = [
+            {
+                "bar_idx":         int(i),
+                "regime":          int(hmm_states[i]),
+                "signal":          int(_sig_is[i]),
+                "prob":            float(probabilities[i]),
+                "volatility":      float(atr_norm[i]),
+                "spread":          float(_spread_val),
+                "gmm_vol_cluster": int(_gmm[i]),
+                "pnl":             float(strategy_returns[i]),
+            }
+            for i in _active_idx
+        ]
+        _empty_cols = ["bar_idx", "regime", "signal", "prob", "volatility",
+                       "spread", "gmm_vol_cluster", "pnl"]
+        result["trades_df"] = (
+            pd.DataFrame(trades_list) if trades_list else pd.DataFrame(columns=_empty_cols)
+        )
 
     return result
 

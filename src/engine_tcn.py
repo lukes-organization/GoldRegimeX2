@@ -1,15 +1,18 @@
-"""Temporal Convolutional Network — dynamic Z-Score threshold adjustment.
+"""Temporal Convolutional Network — RCEV threshold adjustment.
 
-Replaces the LSTM ensemble architecture.  Instead of classifying regime state,
-the TCN directly scores how *confident* the current signal is based on the last
-100 bars of market context.  Confidence is expressed as a multiplier [0.7, 1.3]
-that scales the Z-Score cutoff in the live bridge:
+Scores confidence in the current market conditions from a sequence of recent
+feature bars.  Confidence is expressed as a multiplier [0.7, 1.3] that scales
+the RCEV threshold in the live bridge:
 
-    effective_cutoff = base_z_cutoff × confidence_multiplier
+    effective_threshold = rcev_threshold × confidence_multiplier
 
-    multiplier < 1.0  → relaxed entry (strong, clear regime)
-    multiplier = 1.0  → no adjustment (TCN not loaded)
-    multiplier > 1.0  → tightened entry (noisy / uncertain regime)
+    multiplier < 1.0  → lower RCEV threshold → more trades fire (strong regime)
+    multiplier = 1.0  → no adjustment (TCN not loaded or neutral conditions)
+    multiplier > 1.0  → higher RCEV threshold → fewer trades fire (noisy/uncertain)
+
+This replaces the previous Z-Score cutoff scaling role — the RCEV threshold is
+now the tunable gate, and the TCN adjusts how much expected profit is required
+to confirm a signal.
 
 Architecture:
     4 × dilated causal Conv1D layers (dilation 1, 2, 4, 8)

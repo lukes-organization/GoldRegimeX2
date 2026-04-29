@@ -39,9 +39,11 @@ from src.engine_hmm import load_model as load_hmm, predict_states, get_model_pat
 from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
     get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
+    load_regime_classifiers, predict_regime_proba,
 )
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
 from src.signal_evaluator import SignalEvaluator
+from src.rcev_scorer import RCEVScorer, get_rcev_path, RCEV_DEFAULT_THRESHOLDS
 
 logger = setup_logger(__name__)
 
@@ -68,13 +70,19 @@ MIN_SPREAD_RATIO = {"headway_cent": 1.5, "standard": 3.0}  # TP1 vs spread floor
 TF_ATR_MULTIPLIER  = {"M5": 1.5, "M15": 2.0, "H1": 2.0}
 
 # ── ATR-linked Hybrid Trailing Stop ──────────────────────────────────────────
-# PROFIT_ACTIVATION_USD: floating P&L threshold that triggers Phase 1 (move SL
-# to breakeven + 2× spread) and optional partial close.  Applies to all TFs.
-PROFIT_ACTIVATION_USD = 2.50
-
-# ATR trail multiplier per TF.  Phase 2 trails SL at current_price ∓ (mult × ATR).
-# Larger multiplier for H1 gives hourly swings room before the SL is touched.
-ATR_TRAIL_MULTIPLIER = {"M5": 1.5, "M15": 1.5, "H1": 2.5}
+# ATR_TRAIL_CONFIG: per-TF activation thresholds and trail multipliers.
+# activation_pnl: floating P&L that triggers Phase 1 (BE + 2×spread + partial).
+# trail_mult:     Phase 2 ATR trail distance multiplier (unchanged from original).
+# M5 scalp_target: close-at-profit target for between-bar scalp exit logic.
+ATR_TRAIL_CONFIG: dict = {
+    "H1":  {"activation_pnl": 1.50, "trail_mult": 2.5, "partial_close": True},
+    "M15": {"activation_pnl": 1.50, "trail_mult": 1.5, "partial_close": True},
+    "M5":  {"activation_pnl": 1.00, "trail_mult": 1.5, "partial_close": False,
+            "scalp_target": 4.00, "recycle": True},
+}
+# Legacy aliases (kept so old references still resolve — use ATR_TRAIL_CONFIG for new code)
+PROFIT_ACTIVATION_USD = 2.50          # superseded by ATR_TRAIL_CONFIG[tf]['activation_pnl']
+ATR_TRAIL_MULTIPLIER  = {"M5": 1.5, "M15": 1.5, "H1": 2.5}   # superseded by ATR_TRAIL_CONFIG
 
 # Minimum lot for partial close.  MT5 rejects close volumes below 0.01.
 # When a position is already at 0.01 lots the partial close is skipped and the
@@ -102,6 +110,63 @@ TF_TP_CONFIG = {
     "M15": {"trending": [1.0, 2.0], "chop": [0.8]},   # partial at 1:1, runner at 2:1
     "H1":  {"trending": [1.0, 2.0], "chop": [1.0]},   # same ratio as M15 — 3.0x was rarely filled
 }
+
+# ── Regime-aware TP/SL multipliers (all values are direct ATR multiples) ──────
+# Used by calculate_tp_sl() when RCEV signal mode is active.
+# sl_mult × ATR = stop-loss distance; tp1/tp2_mult × ATR = take-profit distances.
+TP_SL_CONFIG: dict = {
+    "H1":  {
+        "trend": {"tp1_mult": 1.5, "tp2_mult": 3.0, "sl_mult": 2.0},
+        "chop":  {"tp1_mult": 1.0, "tp2_mult": None, "sl_mult": 1.4},
+    },
+    "M15": {
+        "trend": {"tp1_mult": 1.2, "tp2_mult": 2.5, "sl_mult": 2.0},
+        "chop":  {"tp1_mult": 0.8, "tp2_mult": None, "sl_mult": 1.4},
+    },
+    "M5":  {
+        "trend": {"tp1_mult": 0.8, "tp2_mult": 1.5, "sl_mult": 1.5},
+        "chop":  {"tp1_mult": 0.5, "tp2_mult": None, "sl_mult": 1.05},
+    },
+}
+
+
+def calculate_tp_sl(
+    tf: str,
+    regime: int,
+    atr: float,
+    entry_price: float,
+    is_buy: bool,
+) -> tuple:
+    """Calculate regime-aware TP and SL price levels.
+
+    Args:
+        tf:          Timeframe string (H1, M15, M5).
+        regime:      HMM state (0=Bull, 1=Bear, 2/3=Chop).
+        atr:         Current ATR value in price units.
+        entry_price: Trade entry price.
+        is_buy:      True for BUY, False for SELL.
+
+    Returns:
+        ``(sl, tp1, tp2)`` — tp2 is None when not applicable.
+    """
+    cfg     = TP_SL_CONFIG.get(tf.upper(), TP_SL_CONFIG["H1"])
+    r_type  = "trend" if regime in (0, 1) else "chop"
+    params  = cfg[r_type]
+
+    sl_dist  = params["sl_mult"]  * atr
+    tp1_dist = params["tp1_mult"] * atr
+    tp2_mult = params["tp2_mult"]
+
+    if is_buy:
+        sl  = entry_price - sl_dist
+        tp1 = entry_price + tp1_dist
+        tp2 = (entry_price + tp2_mult * atr) if tp2_mult else None
+    else:
+        sl  = entry_price + sl_dist
+        tp1 = entry_price - tp1_dist
+        tp2 = (entry_price - tp2_mult * atr) if tp2_mult else None
+
+    return round(sl, 2), round(tp1, 2), (round(tp2, 2) if tp2 is not None else None)
 
 # Lazy MT5 timeframe map
 
@@ -883,6 +948,7 @@ def run_live_loop(
     account_size: float = None,
     profit_target: float = None,
     use_tiered: bool = False,
+    rcev_threshold: float = None,
 ) -> None:
     """Connect to MT5 and run the signal → order loop until interrupted.
 
@@ -1001,6 +1067,39 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             "Re-train to enable Z-Score calibration."
         )
 
+    # ── RCEV scorer (optional — Z-Score fallback when absent) ─────────────
+    _rcev_path = get_rcev_path(tf, broker)
+    rcev_scorer_live = RCEVScorer.from_file(_rcev_path, broker=broker)
+    _rcev_threshold  = (
+        rcev_threshold
+        if rcev_threshold is not None
+        else RCEV_DEFAULT_THRESHOLDS.get(tf.upper(), 0.50)
+    )
+    if rcev_scorer_live is not None:
+        logger.info(
+            "[RCEV] Scorer loaded [%s/%s] — threshold=$%.2f  "
+            "(pass --rcev_threshold to override during live).",
+            tf, broker, _rcev_threshold,
+        )
+    else:
+        logger.info(
+            "[RCEV] No calibration found [%s/%s] — Z-Score fallback active. "
+            "Run --mode train to enable RCEV.",
+            tf, broker,
+        )
+
+    # ── Per-regime XGBoost classifiers (optional) ─────────────────────────
+    _xgb_base_path  = get_ensemble_path(tf, broker)
+    regime_models_live = load_regime_classifiers(_xgb_base_path)
+    if regime_models_live is not None:
+        logger.info("[RCEV] Per-regime classifiers loaded [%s/%s].", tf, broker)
+    else:
+        logger.info(
+            "[RCEV] Per-regime classifiers not found [%s/%s] — "
+            "uniform 0.33/0.33/0.33 distribution used when RCEV is active.",
+            tf, broker,
+        )
+
     cfg_tf    = TF_CONFIG[tf.upper()]
     obs_cov   = obs_cov   if obs_cov   is not None else cfg_tf["obs_cov_default"]
     trans_cov = trans_cov if trans_cov is not None else cfg_tf["trans_cov_default"]
@@ -1080,11 +1179,13 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     # ATR-linked trailing stop applies to all TFs unconditionally.
     # The legacy profit_target CLI param is kept for backward compat but is no
     # longer used — the ATR trail supersedes the old fixed-exit logic.
-    _atr_mult_log = ATR_TRAIL_MULTIPLIER.get(tf.upper(), 1.5)
+    _trail_cfg     = ATR_TRAIL_CONFIG.get(tf.upper(), ATR_TRAIL_CONFIG["H1"])
+    _atr_mult_log  = _trail_cfg["trail_mult"]
+    _activ_pnl_log = _trail_cfg["activation_pnl"]
     logger.info(
         "ATR Trailing Stop — activation $%.2f | "
         "multiplier %.1fx ATR [%s] | partial close (lot>%.2f).",
-        PROFIT_ACTIVATION_USD, _atr_mult_log, tf.upper(), MIN_LOT_GUARD,
+        _activ_pnl_log, _atr_mult_log, tf.upper(), MIN_LOT_GUARD,
     )
 
     # Warn if the MQL5 EA (same magic number) already has open positions.
@@ -1199,12 +1300,36 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     time.sleep(POLL_INTERVAL_SEC)
                     continue
 
+                # ── M5 Quick Scalp Exit ────────────────────────────────────
+                # Close individual positions that reach the $4 scalp target.
+                # If regime hasn't changed and daily cap not hit, allow re-entry.
+                if tf.upper() == "M5" and signal_tracker["tickets"]:
+                    _scalp_target = ATR_TRAIL_CONFIG["M5"].get("scalp_target", 4.00)
+                    for _st in list(signal_tracker["tickets"]):
+                        _sp = mt5.positions_get(ticket=_st)
+                        if not _sp:
+                            continue
+                        _s_pnl = _sp[0].profit / _pnl_divisor
+                        if _s_pnl >= _scalp_target:
+                            _close_position(_st, mt5, comment="GRX_Fixed_Scalp_Target", magic=magic)
+                            logger.info(
+                                "[M5 SCALP] Position closed at target: ticket=%d  P&L=+$%.2f",
+                                _st, _s_pnl,
+                            )
+                            signal_tracker["tickets"] = [
+                                t for t in signal_tracker["tickets"] if t != _st
+                            ]
+                            peak_pnl_tracker.pop(_st, None)
+                            atr_state_tracker.pop(_st, None)
+
                 # ── ATR-linked Hybrid Trailing Stop ───────────────────────
                 # Phase 1 (one-time per ticket): when P&L >= PROFIT_ACTIVATION_USD,
                 #   move SL to breakeven+2×spread; optionally close 50% volume.
                 # Phase 2 (every poll): trail SL at price ∓ (ATR_mult × cached ATR).
                 if signal_tracker["tickets"]:
-                    _atr_mult  = ATR_TRAIL_MULTIPLIER.get(tf.upper(), 1.5)
+                    _trail_cfg_inner = ATR_TRAIL_CONFIG.get(tf.upper(), ATR_TRAIL_CONFIG["H1"])
+                    _atr_mult  = _trail_cfg_inner["trail_mult"]
+                    _activ_pnl = _trail_cfg_inner["activation_pnl"]
                     _atr_cache = signal_tracker.get("atr_price", 0.0)
                     _open_pos  = [
                         p for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
@@ -1220,7 +1345,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                              "current_sl": _pos.sl},
                         )
 
-                        if not _atr_st["activated"] and _cur >= PROFIT_ACTIVATION_USD:
+                        if not _atr_st["activated"] and _cur >= _activ_pnl:
                             # Phase 1: lock in break-even + 2× spread (one time)
                             _tick   = mt5.symbol_info_tick(DEFAULT_SYMBOL)
                             _spread = _tick.ask - _tick.bid
@@ -1278,36 +1403,6 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 feature_cols=feature_cols, mt5=mt5, tf=tf, broker=broker,
             )
             signal_tracker["atr_price"] = atr_price   # cache for between-bar ATR trail
-
-            # ── 4a. TCN dynamic Z-Score adjustment ────────────────────────
-            # If the TCN confidence model is loaded, compute a multiplier
-            # [0.7, 1.3] from the last 100 bars and apply it to the base
-            # Z-Score cutoff.  Confident regimes get easier entry;
-            # uncertain / noisy regimes require a stronger signal.
-            _active_evaluator = signal_evaluator   # default: no TCN adjustment
-            if tcn_classifier is not None:
-                try:
-                    _tcn_mult = tcn_classifier.predict_confidence(live_df)
-                    if _tcn_mult is not None:
-                        # Use the evaluator's already-configured TF-specific Z cutoff
-                        # as the base (respects _TF_CUTOFF_OVERRIDES + any Optuna tune).
-                        _base_cut = signal_evaluator.config["Z_CUTOFF_BULL"]
-                        _eff_cut     = _base_cut * _tcn_mult
-                        from src.signal_evaluator import SignalEvaluator as _SE
-                        _active_evaluator = _SE(
-                            regime_stats, tf=tf,
-                            config={"Z_CUTOFF_BULL": _eff_cut, "Z_CUTOFF_BEAR": -_eff_cut},
-                        )
-                        _direction = "loosened" if _eff_cut < _base_cut else "tightened"
-                        logger.info(
-                            "[TCN ADJUST] Z cutoff %s: %.2f → %.2f "
-                            "(multiplier=%.2f)",
-                            _direction, _base_cut, _eff_cut, _tcn_mult,
-                        )
-                    else:
-                        logger.debug("[TCN] predict_confidence returned None — using base Z.")
-                except Exception as _tcn_exc:
-                    logger.warning("TCN adjustment failed: %s", _tcn_exc, exc_info=True)
 
             # ── 4b. Hourly maintenance: weekly data pull + TCN staleness ──
             _now_hour = datetime.now(timezone.utc).replace(
@@ -1431,49 +1526,101 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── 9. Signal routing — adaptive Z-Score evaluation ──────────
-            # Updates regime stability and evaluates via SignalEvaluator when
-            # regime_stats are available; falls back to fixed-threshold logic
-            # for models trained before Z-Score calibration was added.
+            # ── 9. Signal routing — RCEV or Z-Score evaluation ───────────
+            # RCEV path: when calibration file is present and per-regime
+            #   classifiers are loaded, use evaluate_signal_rcev().
+            # Z-Score fallback: use evaluate_signal() (existing logic).
             _stability  = _update_regime_stability(regime_stability_tracker, hmm_state)
             _t_prob     = _get_transition_prob(model_hmm, hmm_state)
             _bb_pos     = _calculate_bb_position(np.array(close_prices_cache))
             _gmc        = gmm_cluster if gmm_cluster >= 0 else 1
-            _sig_eval   = _active_evaluator.evaluate_signal(
-                prob_buy=prob,
-                hmm_state=hmm_state,
-                gmm_cluster=_gmc,
-                stability=_stability,
-                bb_position=_bb_pos,
-                transition_prob=_t_prob,
-                use_tiered=use_tiered,
-            )
-            _sig_str = _sig_eval["signal"]
+
+            # Regime stability from HMM transmat diagonal P(stay in state)
+            _regime_stability = float(model_hmm.transmat_[hmm_state, hmm_state])
+            if not (0.0 < _regime_stability <= 1.0):
+                _regime_stability = 0.70
+
+            # Per-regime XGBoost probabilities (uniform fallback if not loaded)
+            _regime_probs = predict_regime_proba(regime_models_live, features_df)
+
+            # TCN multiplier
+            _tcn_mult_val = 1.0
+            if tcn_classifier is not None:
+                try:
+                    _tcn_r = tcn_classifier.predict_confidence(live_df)
+                    if _tcn_r is not None:
+                        _tcn_mult_val = float(_tcn_r)
+                except Exception:
+                    pass
+
+            if rcev_scorer_live is not None:
+                _sig_eval = signal_evaluator.evaluate_signal_rcev(
+                    rcev             = rcev_scorer_live,
+                    regime_probs     = _regime_probs,
+                    hmm_state        = hmm_state,
+                    volatility       = float(raw_atr_norm),
+                    spread           = BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0.0004),
+                    atr              = float(atr_price),
+                    hour             = datetime.now(timezone.utc).hour,
+                    bb_position      = _bb_pos,
+                    tcn_multiplier   = _tcn_mult_val,
+                    rcev_threshold   = _rcev_threshold,
+                    tiered           = use_tiered,
+                    regime_stability = _regime_stability,
+                    tf               = tf,
+                )
+                _sig_str = _sig_eval.get("signal", "WAIT")
+            else:
+                # Z-Score fallback path (existing logic)
+                _active_evaluator = signal_evaluator
+                if tcn_classifier is not None:
+                    try:
+                        _tcn_mult2 = tcn_classifier.predict_confidence(live_df)
+                        if _tcn_mult2 is not None:
+                            _base_cut = signal_evaluator.config["Z_CUTOFF_BULL"]
+                            _eff_cut  = _base_cut * _tcn_mult2
+                            from src.signal_evaluator import SignalEvaluator as _SE
+                            _active_evaluator = _SE(
+                                regime_stats, tf=tf,
+                                config={"Z_CUTOFF_BULL": _eff_cut, "Z_CUTOFF_BEAR": -_eff_cut},
+                            )
+                    except Exception:
+                        pass
+                _sig_eval = _active_evaluator.evaluate_signal(
+                    prob_buy=prob,
+                    hmm_state=hmm_state,
+                    gmm_cluster=_gmc,
+                    stability=_stability,
+                    bb_position=_bb_pos,
+                    transition_prob=_t_prob,
+                    use_tiered=use_tiered,
+                )
+                _sig_str = _sig_eval.get("signal")
 
             if _sig_str == "BUY":
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
                 signal_type = "trend"
-                logger.info(
-                    "[SIGNAL] BUY (trend) | z=%.2f | %s",
-                    _sig_eval["confidence"], _sig_eval["reason"],
-                )
+                _conf_str = (f"RCEV=${_sig_eval.get('expected_pnl', 0):.2f}"
+                             if rcev_scorer_live else f"z={_sig_eval.get('confidence', 0):.2f}")
+                logger.info("[SIGNAL] BUY (trend) | %s | %s",
+                            _conf_str, _sig_eval.get("reason", ""))
             elif _sig_str == "SELL":
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
                 signal_type = "trend"
-                logger.info(
-                    "[SIGNAL] SELL (trend) | z=%.2f | %s",
-                    _sig_eval["confidence"], _sig_eval["reason"],
-                )
+                _conf_str = (f"RCEV=${_sig_eval.get('expected_pnl', 0):.2f}"
+                             if rcev_scorer_live else f"z={_sig_eval.get('confidence', 0):.2f}")
+                logger.info("[SIGNAL] SELL (trend) | %s | %s",
+                            _conf_str, _sig_eval.get("reason", ""))
             elif _sig_str == "MR_BUY":
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
                 signal_type = "mean_reversion"
-                logger.info(
-                    "[SIGNAL] MR_BUY | z=%.2f | %s",
-                    _sig_eval["confidence"], _sig_eval["reason"],
-                )
+                _conf_str = (f"RCEV=${_sig_eval.get('expected_pnl', 0):.2f}"
+                             if rcev_scorer_live else f"z={_sig_eval.get('confidence', 0):.2f}")
+                logger.info("[SIGNAL] MR_BUY | %s | %s",
+                            _conf_str, _sig_eval.get("reason", ""))
                 if gmm_cluster == 2:
                     logger.warning(
                         "[MR WARNING] High-vol environment (GMM cluster=2) — "
@@ -1483,28 +1630,38 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
                 signal_type = "mean_reversion"
-                logger.info(
-                    "[SIGNAL] MR_SELL | z=%.2f | %s",
-                    _sig_eval["confidence"], _sig_eval["reason"],
-                )
+                _conf_str = (f"RCEV=${_sig_eval.get('expected_pnl', 0):.2f}"
+                             if rcev_scorer_live else f"z={_sig_eval.get('confidence', 0):.2f}")
+                logger.info("[SIGNAL] MR_SELL | %s | %s",
+                            _conf_str, _sig_eval.get("reason", ""))
                 if gmm_cluster == 2:
                     logger.warning(
                         "[MR WARNING] High-vol environment (GMM cluster=2) — "
                         "MR has lower edge in breakout conditions."
                     )
             else:
-                # ── Logic Audit — Z-Score diagnostic ─────────────────────
+                # ── Logic Audit ───────────────────────────────────────────
                 regime_desc = ("BULL" if hmm_state == BULL_STATE
                                else "BEAR" if hmm_state == BEAR_STATE
                                else "CHOP")
-                _z = _sig_eval["confidence"]
-                logger.info(
-                    "[LOGIC AUDIT] %s Regime | state=%d  z=%.2f  "
-                    "bars=%d  P(stay)=%.2f  BB=%.2f | %s",
-                    regime_desc, hmm_state, _z,
-                    _stability["consecutive_bars"], _t_prob, _bb_pos,
-                    _sig_eval["reason"],
-                )
+                if rcev_scorer_live:
+                    logger.info(
+                        "[LOGIC AUDIT] %s Regime | state=%d  RCEV=$%.2f<$%.2f  "
+                        "bars=%d  P(stay)=%.2f  BB=%.2f  regime_probs=%s",
+                        regime_desc, hmm_state,
+                        _sig_eval.get("expected_pnl", 0), _sig_eval.get("threshold", _rcev_threshold),
+                        _stability["consecutive_bars"], _regime_stability, _bb_pos,
+                        {k: f"{v:.2f}" for k, v in _regime_probs.items()},
+                    )
+                else:
+                    _z = _sig_eval.get("confidence", 0)
+                    logger.info(
+                        "[LOGIC AUDIT] %s Regime | state=%d  z=%.2f  "
+                        "bars=%d  P(stay)=%.2f  BB=%.2f | %s",
+                        regime_desc, hmm_state, _z,
+                        _stability["consecutive_bars"], _t_prob, _bb_pos,
+                        _sig_eval.get("reason", ""),
+                    )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 

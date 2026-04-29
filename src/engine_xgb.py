@@ -517,3 +517,167 @@ def export_onnx_ensemble(
         export_onnx(model, n_features=n_features, path=path)
         paths[bucket] = path
     return paths
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-regime XGBoost classifiers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_regime_classifiers(
+    X: pd.DataFrame,
+    hmm_states: np.ndarray,
+    train_ratio: float = 0.70,
+    **xgb_kwargs,
+) -> dict:
+    """Train 3 binary XGBoost classifiers for regime-conditional probability.
+
+    Each classifier predicts whether the NEXT bar will be in regime r:
+    - Classifier 0 (Bull):  y=1 if next_state == 0
+    - Classifier 1 (Bear):  y=1 if next_state == 1
+    - Classifier 2 (Chop):  y=1 if next_state IN {2, 3}  (4-state models)
+                                 or next_state == 2         (3-state models)
+
+    The three raw "stay" probabilities are later normalized to a distribution
+    via :func:`predict_regime_proba`.
+
+    Args:
+        X:           Feature DataFrame (output of ``prepare_features``).
+        hmm_states:  HMM state labels aligned row-for-row with X.
+        train_ratio: IS fraction for fitting (default 0.70 = H1 ratio).
+        **xgb_kwargs: Forwarded to XGBClassifier (max_depth, learning_rate…).
+
+    Returns:
+        ``{0: xgb_model, 1: xgb_model, 2: xgb_model}``
+    """
+    states = np.asarray(hmm_states, dtype=int)
+    n_unique = len(np.unique(states))
+    next_states = np.roll(states, -1)   # next-bar state; last entry is invalid
+
+    # Drop last row — no valid next_state
+    X_fit = X.iloc[:-1]
+    next_s = next_states[:-1]
+
+    split_idx = int(len(X_fit) * train_ratio)
+    X_is = X_fit.iloc[:split_idx]
+    ns_is = next_s[:split_idx]
+
+    default_xgb = dict(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0,
+    )
+    default_xgb.update(xgb_kwargs)
+
+    regime_models: dict = {}
+    regime_names = {0: "Bull", 1: "Bear", 2: "Chop"}
+
+    for regime_id, regime_name in regime_names.items():
+        if regime_id == 2:
+            if n_unique == 4:
+                y_is = ((ns_is == 2) | (ns_is == 3)).astype(int)
+            else:
+                y_is = (ns_is == 2).astype(int)
+        else:
+            y_is = (ns_is == regime_id).astype(int)
+
+        pos_ratio = y_is.mean()
+        if pos_ratio <= 0 or pos_ratio >= 1:
+            logger.warning(
+                "Regime classifier [%s]: degenerate class ratio=%.3f — using scale_pos_weight=1",
+                regime_name, pos_ratio,
+            )
+            scale_pos_weight = 1.0
+        else:
+            scale_pos_weight = (1.0 - pos_ratio) / pos_ratio
+
+        params = {**default_xgb, "scale_pos_weight": scale_pos_weight}
+        model = xgb.XGBClassifier(**params)
+        model.fit(X_is, y_is)
+
+        # Quick validation accuracy on held-out OOS fraction
+        if split_idx < len(X_fit):
+            X_oos = X_fit.iloc[split_idx:]
+            ns_oos = next_s[split_idx:]
+            if regime_id == 2:
+                y_oos = ((ns_oos == 2) | (ns_oos == 3)).astype(int) if n_unique == 4 else (ns_oos == 2).astype(int)
+            else:
+                y_oos = (ns_oos == regime_id).astype(int)
+            baseline = max(float(y_oos.mean()), 1.0 - float(y_oos.mean()))
+            val_acc = float(accuracy_score(y_oos, model.predict(X_oos)))
+            logger.info(
+                "  Regime classifier [%s]: val_acc=%.3f  baseline=%.3f  improvement=%.1f%%",
+                regime_name, val_acc, baseline, (val_acc / baseline - 1) * 100,
+            )
+
+        regime_models[regime_id] = model
+
+    logger.info("Per-regime XGBoost classifiers trained (n_unique_states=%d)", n_unique)
+    return regime_models
+
+
+def predict_regime_proba(
+    regime_models: dict | None,
+    X_row,
+) -> dict:
+    """Return normalised Bull/Bear/Chop probability distribution for one bar.
+
+    Args:
+        regime_models: ``{0: xgb, 1: xgb, 2: xgb}`` from :func:`train_regime_classifiers`,
+                       or ``None`` for a uniform fallback.
+        X_row:         Single-row feature input — DataFrame row, Series, or 1-D array.
+
+    Returns:
+        ``{'Bull': float, 'Bear': float, 'Chop': float}``  (values sum to 1.0)
+    """
+    if not regime_models:
+        return {"Bull": 0.333, "Bear": 0.333, "Chop": 0.333}
+
+    # Reshape to 2-D for predict_proba
+    if hasattr(X_row, "values"):
+        arr = X_row.values.reshape(1, -1)
+    else:
+        arr = np.asarray(X_row, dtype=float).reshape(1, -1)
+
+    raw: dict = {}
+    for regime_id, model in regime_models.items():
+        proba = model.predict_proba(arr)[0]
+        raw[regime_id] = float(proba[1]) if len(proba) > 1 else float(proba[0])
+
+    total = sum(raw.values())
+    if total <= 0:
+        return {"Bull": 0.333, "Bear": 0.333, "Chop": 0.333}
+
+    return {
+        "Bull": raw[0] / total,
+        "Bear": raw[1] / total,
+        "Chop": raw[2] / total,
+    }
+
+
+def save_regime_classifiers(regime_models: dict, base_path: Path) -> None:
+    """Save per-regime classifiers alongside the ensemble pkl.
+
+    File: ``{base_path stem}_regime_classifiers.pkl``
+    """
+    base_path = Path(base_path)
+    out_path = base_path.parent / (base_path.stem + "_regime_classifiers.pkl")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(regime_models, out_path)
+    logger.info("Regime classifiers saved to %s", out_path)
+
+
+def load_regime_classifiers(base_path: Path) -> dict | None:
+    """Load per-regime classifiers if they exist, else return None."""
+    base_path = Path(base_path)
+    pkl_path = base_path.parent / (base_path.stem + "_regime_classifiers.pkl")
+    if not pkl_path.exists():
+        return None
+    regime_models = joblib.load(pkl_path)
+    logger.info("Regime classifiers loaded from %s", pkl_path)
+    return regime_models

@@ -22,7 +22,9 @@ from src.engine_xgb import (
     train_xgb_ensemble, get_predictions_ensemble,
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
     get_ensemble_path, TF_TRAIN_RATIO, compute_regime_stats,
+    train_regime_classifiers, save_regime_classifiers,
 )
+from src.rcev_scorer import RCEVScorer, get_rcev_path, RCEV_DEFAULT_THRESHOLDS
 from src.optimizer import run_optimization, get_best_params, _score_result as _calc_score
 from src.backtester import vectorized_backtest, format_payout
 from src.visualizer import generate_full_report
@@ -416,6 +418,40 @@ def cmd_train(args):
     save_hmm(model_hmm, hmm_model_path(tf, broker))
     save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf, broker))
 
+    # ── Per-regime XGBoost classifiers ────────────────────────────────────────
+    _train_ratio = TF_TRAIN_RATIO.get(tf.upper(), 0.70)
+    try:
+        regime_models = train_regime_classifiers(X, states_aligned, train_ratio=_train_ratio)
+        save_regime_classifiers(regime_models, get_ensemble_path(tf, broker))
+        logger.info("[Train] Per-regime classifiers trained and saved for %s/%s", tf, broker)
+    except Exception as exc:
+        logger.warning("[Train] Per-regime classifier training failed: %s", exc)
+        regime_models = None
+
+    # ── RCEV calibration ──────────────────────────────────────────────────────
+    try:
+        split_idx = metrics.get("split_idx")
+        is_result = vectorized_backtest(
+            df_aligned, probabilities, states_aligned,
+            split_idx=split_idx,
+            account_size=balance,
+            broker=broker,
+            tf=tf,
+            regime_stats=metrics["regime_stats"],
+            return_trades=True,
+        )
+        trades_df = is_result.get("trades_df")
+        if trades_df is not None and not trades_df.empty:
+            rcev = RCEVScorer(broker=broker)
+            rcev.calibrate(trades_df)
+            rcev.save(get_rcev_path(tf, broker))
+            logger.info("[Train] RCEV calibrated from %d IS trades and saved.", len(trades_df))
+            print(f"RCEV calibrated: {len(trades_df)} IS trades → {get_rcev_path(tf, broker)}")
+        else:
+            logger.warning("[Train] No IS trades returned — RCEV calibration skipped.")
+    except Exception as exc:
+        logger.warning("[Train] RCEV calibration failed: %s", exc)
+
     arm = AdaptiveRiskManager(balance, broker=broker)
     print(f"\n=== Training Results [{tf}] ===")
     print(f"Broker: {broker} | Balance: ${balance:.0f} | Tier: {'small' if arm.is_small_account else 'growth'}")
@@ -637,7 +673,8 @@ def cmd_demo(args):
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
                   profit_target=getattr(args, "profit_target", None),
-                  use_tiered=getattr(args, "tiered", False))
+                  use_tiered=getattr(args, "tiered", False),
+                  rcev_threshold=getattr(args, "rcev_threshold", None))
 
 
 def cmd_live(args):
@@ -670,7 +707,8 @@ def cmd_live(args):
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
                   profit_target=getattr(args, "profit_target", None),
-                  use_tiered=getattr(args, "tiered", False))
+                  use_tiered=getattr(args, "tiered", False),
+                  rcev_threshold=getattr(args, "rcev_threshold", None))
 
 
 def cmd_report(args):
@@ -1082,6 +1120,10 @@ def main():
     parser.add_argument("--tiered", action="store_true",
                         help="Enable tiered Z-Score override: strong XGBoost conviction reduces the Z "
                              "cutoff floor (min 1.0). Used with --mode sensitivity and --mode live/demo.")
+    parser.add_argument("--rcev_threshold", type=float, default=None,
+                        help="RCEV minimum expected profit threshold in USD. "
+                             "Defaults: H1=$0.50, M15=$0.35, M5=$0.20. "
+                             "Example: --rcev_threshold 0.30 to lower the bar for more signals.")
     parser.add_argument("--profit_target",  type=float, default=None,
                         help="Quick-profit close threshold in USD.  M5 defaults to 4.0; "
                              "other TFs disabled unless set.  Pass 0 to disable on M5.")

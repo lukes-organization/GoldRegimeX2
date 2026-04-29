@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional, Tuple
 
+from src.rcev_scorer import RCEV_DEFAULT_THRESHOLDS, RCEV_TIERED_FLOORS, RCEVScorer
+
 logger = logging.getLogger(__name__)
 
 # ── Default Z-Score configuration ─────────────────────────────────────────────
@@ -529,3 +531,127 @@ class SignalEvaluator:
             logger.error("[BUG] evaluate_signal: MR signal %s in state %d", _sig, hmm_state)
 
         return result
+
+    # ── RCEV-based live evaluation ────────────────────────────────────────────
+
+    def evaluate_signal_rcev(
+        self,
+        rcev:              RCEVScorer,
+        regime_probs:      Dict[str, float],
+        hmm_state:         int,
+        volatility:        float,
+        spread:            float,
+        atr:               float,
+        hour:              int,
+        bb_position:       float = 0.5,
+        tcn_multiplier:    float = 1.0,
+        rcev_threshold:    float = 0.50,
+        tiered:            bool  = False,
+        regime_stability:  float = 0.70,
+        tf:                str   = "H1",
+    ) -> Dict[str, Any]:
+        """Evaluate a potential trade using RCEV expected-profit scoring.
+
+        Replaces :meth:`evaluate_signal` for live and sync-validate paths when
+        an :class:`~src.rcev_scorer.RCEVScorer` calibration file is available.
+
+        Args:
+            rcev:             Pre-loaded, calibrated :class:`~src.rcev_scorer.RCEVScorer`.
+            regime_probs:     Normalised regime-probability dict from
+                              :func:`~src.engine_xgb.predict_regime_proba`:
+                              ``{'Bull': float, 'Bear': float, 'Chop': float}``.
+            hmm_state:        Current HMM regime (0=Bull, 1=Bear, 2/3=Chop).
+            volatility:       Current ATR normalised value.
+            spread:           Current spread (price-fraction).
+            atr:              Raw ATR value.
+            hour:             UTC hour (0–23).
+            bb_position:      Bollinger Band position (0=lower, 1=upper).
+                              Used for MR direction in Chop states.
+            tcn_multiplier:   TCN confidence output [0.7, 1.3].
+            rcev_threshold:   Minimum expected profit to fire a trade ($).
+                              Defaults to ``RCEV_DEFAULT_THRESHOLDS[tf]`` when 0.
+            tiered:           Reduce threshold on high-conviction bars
+                              (see conviction table in README).
+            regime_stability: P(stay in current state) from HMM transmat diagonal.
+                              Caller extracts via ``hmm_model.transmat_[state, state]``.
+            tf:               Timeframe string — used for tiered threshold floor lookup.
+
+        Returns:
+            ``{'signal', 'expected_pnl', 'threshold', 'should_trade',
+               'win_rate', 'components', 'regime_probs'}``
+
+            ``signal`` is one of ``'BUY' | 'SELL' | 'MR_BUY' | 'MR_SELL' | 'WAIT'``.
+        """
+        # Effective threshold (use TF default when caller passes 0 or leaves None)
+        if not rcev_threshold:
+            rcev_threshold = RCEV_DEFAULT_THRESHOLDS.get(tf.upper(), 0.50)
+
+        # Map hmm_state to 3-class regime_id for RCEV
+        regime_id   = 2 if hmm_state in (2, 3) else int(hmm_state)
+        regime_name = {0: "Bull", 1: "Bear"}.get(regime_id, "Chop")
+        xgb_prob    = regime_probs.get(regime_name, 0.333)
+
+        # Determine signal type before scoring (needed for MR direction)
+        if hmm_state == 0:
+            signal_type = "BUY"
+        elif hmm_state == 1:
+            signal_type = "SELL"
+        else:
+            # Chop: MR direction from Bollinger Band position
+            if bb_position < self.config.get("MR_BB_LOWER_THRESHOLD", 0.35):
+                signal_type = "MR_BUY"
+            elif bb_position > self.config.get("MR_BB_UPPER_THRESHOLD", 0.65):
+                signal_type = "MR_SELL"
+            else:
+                signal_type = "NEUTRAL"
+
+        # Score the trade
+        score_result = rcev.score(
+            regime_id        = regime_id,
+            xgb_prob         = xgb_prob,
+            volatility       = volatility,
+            spread           = spread,
+            atr              = atr,
+            hour             = hour,
+            tcn_multiplier   = tcn_multiplier,
+            regime_stability = regime_stability,
+        )
+
+        expected_pnl = score_result["expected_pnl"]
+
+        # MR trades carry lower edge — apply 80% scalar on expected value
+        if signal_type in ("MR_BUY", "MR_SELL"):
+            expected_pnl = expected_pnl * 0.80
+            score_result["expected_pnl"] = round(expected_pnl, 4)
+        elif signal_type == "NEUTRAL":
+            expected_pnl = 0.0
+            score_result["expected_pnl"] = 0.0
+
+        # Tiered threshold reduction based on XGBoost conviction
+        if tiered:
+            extremity = abs(xgb_prob - 0.50)
+            tf_floor  = RCEV_TIERED_FLOORS.get(tf.upper(), 0.10)
+            if extremity >= 0.10:
+                effective_threshold = max(rcev_threshold * 0.60, tf_floor)
+            elif extremity >= 0.07:
+                effective_threshold = max(rcev_threshold * 0.75, tf_floor)
+            elif extremity >= 0.04:
+                effective_threshold = max(rcev_threshold * 0.85, tf_floor)
+            else:
+                effective_threshold = rcev_threshold
+        else:
+            effective_threshold = rcev_threshold
+
+        should_trade = (signal_type not in ("NEUTRAL", "WAIT")) and (
+            expected_pnl >= effective_threshold
+        )
+
+        return {
+            "signal":       signal_type if should_trade else "WAIT",
+            "expected_pnl": expected_pnl,
+            "threshold":    effective_threshold,
+            "should_trade": should_trade,
+            "win_rate":     score_result.get("win_rate", 0.0),
+            "components":   score_result,
+            "regime_probs": regime_probs,
+        }
