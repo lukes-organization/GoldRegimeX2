@@ -39,11 +39,9 @@ from src.engine_hmm import load_model as load_hmm, predict_states, get_model_pat
 from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
     get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
-    load_regime_classifiers, predict_regime_proba,
 )
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
-from src.signal_evaluator import SignalEvaluator
-from src.rcev_scorer import RCEVScorer, get_rcev_path, RCEV_DEFAULT_THRESHOLDS
+from src.signal_engine import SignalEngine
 
 logger = setup_logger(__name__)
 
@@ -112,7 +110,6 @@ TF_TP_CONFIG = {
 }
 
 # ── Regime-aware TP/SL multipliers (all values are direct ATR multiples) ──────
-# Used by calculate_tp_sl() when RCEV signal mode is active.
 # sl_mult × ATR = stop-loss distance; tp1/tp2_mult × ATR = take-profit distances.
 TP_SL_CONFIG: dict = {
     "H1":  {
@@ -948,7 +945,6 @@ def run_live_loop(
     account_size: float = None,
     profit_target: float = None,
     use_tiered: bool = False,
-    rcev_threshold: float = None,
 ) -> None:
     """Connect to MT5 and run the signal → order loop until interrupted.
 
@@ -961,11 +957,8 @@ def run_live_loop(
         account_size:  USD balance used for lot-sizing.  If None, reads from MT5
                        and normalises for cent accounts automatically.
         profit_target: Close early when floating P&L reaches this USD amount.
-                       Defaults to PROFIT_ACTIVATION_USD for all TFs (legacy param,
-                       other TFs.  Pass 0 to disable on M5 explicitly.
-        use_tiered:    When True, pass tiered Z-Score override to SignalEvaluator
-                       so strong XGBoost conviction can reduce the Z cutoff
-                       (floor 1.0).  MR signals are unaffected.
+                       Defaults to PROFIT_ACTIVATION_USD for all TFs (legacy param).
+        use_tiered:    Legacy param — retained for backward compat, unused.
     """
     import MetaTrader5 as mt5
     from src.mt5_sync import connect_mt5, disconnect_mt5
@@ -1020,10 +1013,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     except FileNotFoundError:
         raise FileNotFoundError("XGB ensemble model not found. Run --mode train first.")
 
-    # Load regime statistics and build the adaptive signal evaluator
-    regime_stats = xgb_meta.get("regime_stats", {})
-
-    # Resolve Kalman params and Z-cutoff from Optuna study or TF defaults
+    # Resolve Kalman params from Optuna study or TF defaults
     try:
         from src.optimizer import get_best_params
         params    = get_best_params(balance=account_size, broker=broker, tf=tf)
@@ -1033,10 +1023,6 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         params    = {}
         obs_cov   = None
         trans_cov = None
-
-    _z_cut = params.get("z_cutoff_bull")
-    _eval_cfg = {"Z_CUTOFF_BULL": _z_cut, "Z_CUTOFF_BEAR": -_z_cut} if _z_cut else None
-    signal_evaluator = SignalEvaluator(regime_stats, tf=tf, config=_eval_cfg)
 
     # Load optional TCN confidence scorer — absent until --mode train_tcn is run
     from src.engine_tcn import load_tcn_classifier as _load_tcn_clf
@@ -1048,55 +1034,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         )
     else:
         logger.info(
-            "TCN confidence model not found [%s/%s] — static Z cutoffs active. "
-            "Run --mode train_tcn to enable dynamic Z-Score adjustment.",
-            tf, broker,
-        )
-    if regime_stats:
-        logger.info(
-            "Z-Score signal mode: regime stats loaded for %d states", len(regime_stats)
-        )
-        for _s, _st in regime_stats.items():
-            logger.info(
-                "  State %d: mean=%.4f  std=%.4f  n=%d",
-                _s, _st["mean"], _st["std"], _st["count"],
-            )
-    else:
-        logger.warning(
-            "No regime_stats found in model — fixed-threshold fallback active. "
-            "Re-train to enable Z-Score calibration."
-        )
-
-    # ── RCEV scorer (optional — Z-Score fallback when absent) ─────────────
-    _rcev_path = get_rcev_path(tf, broker)
-    rcev_scorer_live = RCEVScorer.from_file(_rcev_path, broker=broker)
-    _rcev_threshold  = (
-        rcev_threshold
-        if rcev_threshold is not None
-        else RCEV_DEFAULT_THRESHOLDS.get(tf.upper(), 0.50)
-    )
-    if rcev_scorer_live is not None:
-        logger.info(
-            "[RCEV] Scorer loaded [%s/%s] — threshold=$%.2f  "
-            "(pass --rcev_threshold to override during live).",
-            tf, broker, _rcev_threshold,
-        )
-    else:
-        logger.info(
-            "[RCEV] No calibration found [%s/%s] — Z-Score fallback active. "
-            "Run --mode train to enable RCEV.",
-            tf, broker,
-        )
-
-    # ── Per-regime XGBoost classifiers (optional) ─────────────────────────
-    _xgb_base_path  = get_ensemble_path(tf, broker)
-    regime_models_live = load_regime_classifiers(_xgb_base_path)
-    if regime_models_live is not None:
-        logger.info("[RCEV] Per-regime classifiers loaded [%s/%s].", tf, broker)
-    else:
-        logger.info(
-            "[RCEV] Per-regime classifiers not found [%s/%s] — "
-            "uniform 0.33/0.33/0.33 distribution used when RCEV is active.",
+            "TCN confidence model not found [%s/%s] — "
+            "Run --mode train_tcn to enable TCN confidence scoring.",
             tf, broker,
         )
 
@@ -1109,7 +1048,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         _hc_ok, _hc_msg = tcn_classifier.health_check()
         if not _hc_ok:
             logger.warning(
-                "[TCN HEALTH] FAILED (%s) — using static Z cutoffs. "
+                "[TCN HEALTH] FAILED (%s) — TCN disabled. "
                 "Retrain with --mode train_tcn.",
                 _hc_msg,
             )
@@ -1129,13 +1068,12 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 _hc_mult = tcn_classifier.predict_confidence(_hc_df)
                 if _hc_mult is not None:
                     logger.info(
-                        "[TCN HEALTH] OK — multiplier=%.2f  (Z %.0f%% of base)",
-                        _hc_mult, _hc_mult * 100,
+                        "[TCN HEALTH] OK — multiplier=%.2f.",
+                        _hc_mult,
                     )
                 else:
                     logger.warning(
-                        "[TCN HEALTH] warmup probe returned None — "
-                        "using static Z cutoffs."
+                        "[TCN HEALTH] warmup probe returned None — TCN disabled."
                     )
                     tcn_classifier = None
             except Exception as _hc_exc:
@@ -1160,13 +1098,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     equity_gate = DailyEquityGate(tf=tf)
     equity_gate.reset_day(account_size)
 
-    # Regime stability tracker for adaptive Z-Score gating
-    regime_stability_tracker: dict = {
-        "current_state":    None,
-        "consecutive_bars": 0,
-        "previous_state":   None,
-        "exited_from_state": None,
-    }
+    # SignalEngine — stateful per-bar regime confirmation engine
+    signal_engine = SignalEngine(tf=tf)
     # Rolling close-price cache for Bollinger Band confluence filter (live only)
     close_prices_cache: list = []
 
@@ -1254,6 +1187,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                         ]
                         if not signal_tracker["tickets"]:
                             signal_tracker["tp1_hit"] = False
+                            signal_engine.on_trade_closed()
 
                 # ── Daily equity protection gate ──────────────────────────
                 _pnl_divisor = 100 if broker == "headway_cent" else 1
@@ -1491,8 +1425,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     logger.info("MR position(s) closed: Chop ended, regime broke out to state %d.", hmm_state)
                     active = []
                 signal_tracker["tickets"] = active
-
-            # ── 7. Skip new signals if equity gate is locked ─────────────
+                if not active:
+                    signal_engine.on_trade_closed()
             if equity_gate.locked:
                 logger.info(
                     "Equity gate locked — no new signal (state=%s).",
@@ -1526,22 +1460,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── 9. Signal routing — RCEV or Z-Score evaluation ───────────
-            # RCEV path: when calibration file is present and per-regime
-            #   classifiers are loaded, use evaluate_signal_rcev().
-            # Z-Score fallback: use evaluate_signal() (existing logic).
-            _stability  = _update_regime_stability(regime_stability_tracker, hmm_state)
-            _t_prob     = _get_transition_prob(model_hmm, hmm_state)
-            _bb_pos     = _calculate_bb_position(np.array(close_prices_cache))
-            _gmc        = gmm_cluster if gmm_cluster >= 0 else 1
-
-            # Regime stability from HMM transmat diagonal P(stay in state)
-            _regime_stability = float(model_hmm.transmat_[hmm_state, hmm_state])
-            if not (0.0 < _regime_stability <= 1.0):
-                _regime_stability = 0.70
-
-            # Per-regime XGBoost probabilities (uniform fallback if not loaded)
-            _regime_probs = predict_regime_proba(regime_models_live, features_df)
+            # ── 9. Signal routing — regime-confirmation engine ────────────
+            _bb_pos = _calculate_bb_position(np.array(close_prices_cache))
+            _gmc    = gmm_cluster if gmm_cluster >= 0 else 1
 
             # TCN multiplier
             _tcn_mult_val = 1.0
@@ -1553,74 +1474,47 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 except Exception:
                     pass
 
-            if rcev_scorer_live is not None:
-                _sig_eval = signal_evaluator.evaluate_signal_rcev(
-                    rcev             = rcev_scorer_live,
-                    regime_probs     = _regime_probs,
-                    hmm_state        = hmm_state,
-                    volatility       = float(raw_atr_norm),
-                    spread           = BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0.0004),
-                    atr              = float(atr_price),
-                    hour             = datetime.now(timezone.utc).hour,
-                    bb_position      = _bb_pos,
-                    tcn_multiplier   = _tcn_mult_val,
-                    rcev_threshold   = _rcev_threshold,
-                    tiered           = use_tiered,
-                    regime_stability = _regime_stability,
-                    tf               = tf,
+            regime_info = signal_engine.update_regime(hmm_state, model_hmm.transmat_)
+            entry = signal_engine.should_enter(
+                regime_info, prob, _gmc,
+                bb_position=_bb_pos if hmm_state >= CHOP_STATE else None,
+                tcn_multiplier=_tcn_mult_val,
+            )
+
+            if entry is None:
+                regime_desc = ("BULL" if hmm_state == BULL_STATE
+                               else "BEAR" if hmm_state == BEAR_STATE
+                               else "CHOP")
+                logger.info(
+                    "[LOGIC AUDIT] %s | state=%d  prob=%.3f  bars=%d  P(stay)=%.2f  BB=%.2f  tcn=%.2f",
+                    regime_desc, hmm_state, prob,
+                    regime_info["bars_in_regime"], regime_info["stability"],
+                    _bb_pos, _tcn_mult_val,
                 )
-                _sig_str = _sig_eval.get("signal", "WAIT")
-            else:
-                # Z-Score fallback path (existing logic)
-                _active_evaluator = signal_evaluator
-                if tcn_classifier is not None:
-                    try:
-                        _tcn_mult2 = tcn_classifier.predict_confidence(live_df)
-                        if _tcn_mult2 is not None:
-                            _base_cut = signal_evaluator.config["Z_CUTOFF_BULL"]
-                            _eff_cut  = _base_cut * _tcn_mult2
-                            from src.signal_evaluator import SignalEvaluator as _SE
-                            _active_evaluator = _SE(
-                                regime_stats, tf=tf,
-                                config={"Z_CUTOFF_BULL": _eff_cut, "Z_CUTOFF_BEAR": -_eff_cut},
-                            )
-                    except Exception:
-                        pass
-                _sig_eval = _active_evaluator.evaluate_signal(
-                    prob_buy=prob,
-                    hmm_state=hmm_state,
-                    gmm_cluster=_gmc,
-                    stability=_stability,
-                    bb_position=_bb_pos,
-                    transition_prob=_t_prob,
-                    use_tiered=use_tiered,
-                )
-                _sig_str = _sig_eval.get("signal")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            _sig_str    = entry["signal"]
+            _size_mult  = entry["size_multiplier"]
 
             if _sig_str == "BUY":
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
                 signal_type = "trend"
-                _conf_str = (f"RCEV=${_sig_eval.get('expected_pnl', 0):.2f}"
-                             if rcev_scorer_live else f"z={_sig_eval.get('confidence', 0):.2f}")
-                logger.info("[SIGNAL] BUY (trend) | %s | %s",
-                            _conf_str, _sig_eval.get("reason", ""))
+                logger.info("[SIGNAL] BUY (trend) | prob=%.3f | bars=%d | P(stay)=%.2f",
+                            prob, regime_info["bars_in_regime"], regime_info["stability"])
             elif _sig_str == "SELL":
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
                 signal_type = "trend"
-                _conf_str = (f"RCEV=${_sig_eval.get('expected_pnl', 0):.2f}"
-                             if rcev_scorer_live else f"z={_sig_eval.get('confidence', 0):.2f}")
-                logger.info("[SIGNAL] SELL (trend) | %s | %s",
-                            _conf_str, _sig_eval.get("reason", ""))
+                logger.info("[SIGNAL] SELL (trend) | prob=%.3f | bars=%d | P(stay)=%.2f",
+                            prob, regime_info["bars_in_regime"], regime_info["stability"])
             elif _sig_str == "MR_BUY":
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
                 signal_type = "mean_reversion"
-                _conf_str = (f"RCEV=${_sig_eval.get('expected_pnl', 0):.2f}"
-                             if rcev_scorer_live else f"z={_sig_eval.get('confidence', 0):.2f}")
-                logger.info("[SIGNAL] MR_BUY | %s | %s",
-                            _conf_str, _sig_eval.get("reason", ""))
+                logger.info("[SIGNAL] MR_BUY | prob=%.3f | BB=%.2f | bars=%d",
+                            prob, _bb_pos, regime_info["bars_in_regime"])
                 if gmm_cluster == 2:
                     logger.warning(
                         "[MR WARNING] High-vol environment (GMM cluster=2) — "
@@ -1630,38 +1524,14 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
                 signal_type = "mean_reversion"
-                _conf_str = (f"RCEV=${_sig_eval.get('expected_pnl', 0):.2f}"
-                             if rcev_scorer_live else f"z={_sig_eval.get('confidence', 0):.2f}")
-                logger.info("[SIGNAL] MR_SELL | %s | %s",
-                            _conf_str, _sig_eval.get("reason", ""))
+                logger.info("[SIGNAL] MR_SELL | prob=%.3f | BB=%.2f | bars=%d",
+                            prob, _bb_pos, regime_info["bars_in_regime"])
                 if gmm_cluster == 2:
                     logger.warning(
                         "[MR WARNING] High-vol environment (GMM cluster=2) — "
                         "MR has lower edge in breakout conditions."
                     )
             else:
-                # ── Logic Audit ───────────────────────────────────────────
-                regime_desc = ("BULL" if hmm_state == BULL_STATE
-                               else "BEAR" if hmm_state == BEAR_STATE
-                               else "CHOP")
-                if rcev_scorer_live:
-                    logger.info(
-                        "[LOGIC AUDIT] %s Regime | state=%d  RCEV=$%.2f<$%.2f  "
-                        "bars=%d  P(stay)=%.2f  BB=%.2f  regime_probs=%s",
-                        regime_desc, hmm_state,
-                        _sig_eval.get("expected_pnl", 0), _sig_eval.get("threshold", _rcev_threshold),
-                        _stability["consecutive_bars"], _regime_stability, _bb_pos,
-                        {k: f"{v:.2f}" for k, v in _regime_probs.items()},
-                    )
-                else:
-                    _z = _sig_eval.get("confidence", 0)
-                    logger.info(
-                        "[LOGIC AUDIT] %s Regime | state=%d  z=%.2f  "
-                        "bars=%d  P(stay)=%.2f  BB=%.2f | %s",
-                        regime_desc, hmm_state, _z,
-                        _stability["consecutive_bars"], _t_prob, _bb_pos,
-                        _sig_eval.get("reason", ""),
-                    )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
@@ -1739,8 +1609,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                               "signal_type": signal_type}
             peak_pnl_tracker = {}
             logger.info(
-                "SIGNAL %s | state=%d | z=%.2f | lots=%s | sl=%.2f | tp=%s | dev=%d",
-                direction, hmm_state, _sig_eval["confidence"],
+                "SIGNAL %s | state=%d | prob=%.3f | size=%.2f | lots=%s | sl=%.2f | tp=%s | dev=%d",
+                direction, hmm_state, prob, _size_mult,
                 "+".join(f"{l:.2f}" for l in forced_lots[:pos_per_trade]),
                 sl_price, "/".join(f"{t:.2f}" for t in tp_levels), deviation,
             )
@@ -1770,6 +1640,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
 
             # Send one Telegram message per signal summarising all filled positions
             if signal_tracker["tickets"]:
+                signal_engine.on_trade_entered(hmm_state)
                 _emoji  = "🟢" if direction == "BUY" else "🔴"
                 _tag    = "📐 MEAN REVERSION" if signal_type == "mean_reversion" else "📈 TREND"
                 _tp_str = " / ".join(f"{t:.2f}" for t in tp_levels)

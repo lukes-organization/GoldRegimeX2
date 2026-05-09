@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
 from src.logger import setup_logger
-from src.risk_manager import BROKER_CONFIGS, AdaptiveRiskManager
-from src.signal_evaluator import SignalEvaluator
+from src.risk_manager import BROKER_CONFIGS
 
 logger = setup_logger(__name__)
 
@@ -400,6 +399,137 @@ def _mr_attribution(
     }
 
 
+def _compute_bb_positions(close: np.ndarray, window: int = 20) -> np.ndarray:
+    """Normalised position within rolling high-low band (0=at low, 1=at high)."""
+    out = np.full(len(close), 0.5)
+    for i in range(window, len(close)):
+        w = close[i - window : i + 1]
+        lo, hi = w.min(), w.max()
+        out[i] = (close[i] - lo) / (hi - lo + 1e-9)
+    return out
+
+
+def _run_bar_loop(
+    df_aligned: "pd.DataFrame",
+    probabilities: np.ndarray,
+    states: np.ndarray,
+    hmm_transmat,
+    tf: str,
+    broker: str,
+    account_size: float,
+    split_idx,
+    return_trades: bool,
+) -> tuple:
+    """Bar-by-bar SignalEngine loop — replaces vectorised signal generation.
+
+    Returns: (signals, strategy_returns, gross_returns, costs_arr, sizes_arr, trades)
+    """
+    from src.signal_engine import SignalEngine
+
+    n = len(df_aligned)
+    engine = SignalEngine(tf=tf)
+
+    signals          = np.zeros(n, dtype=np.int8)
+    strategy_returns = np.zeros(n, dtype=np.float64)
+    gross_returns    = np.zeros(n, dtype=np.float64)
+    costs_arr        = np.zeros(n, dtype=np.float64)
+    sizes_arr        = np.zeros(n, dtype=np.float64)
+    trades           = [] if return_trades else None
+
+    # Close prices for BB position calculation (case-insensitive column lookup)
+    close_col = next(
+        (c for c in ("Close", "close") if c in df_aligned.columns), None
+    )
+    close = df_aligned[close_col].values if close_col else None
+    bb_pos = _compute_bb_positions(close, window=20) if close is not None else np.full(n, 0.5)
+
+    gmm_col = (
+        df_aligned["gmm_vol_cluster"].values
+        if "gmm_vol_cluster" in df_aligned.columns
+        else np.zeros(n, dtype=int)
+    )
+
+    log_returns = df_aligned["log_return"].values
+    atr_norm    = df_aligned["atr_normalized"].values
+
+    _broker_cfg = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"])
+    spread_cost = (
+        _broker_cfg.get("spread_frac", 0.0004)
+        + _broker_cfg.get("commission_frac", 0.0)
+    )
+
+    in_trade     = False
+    direction    = 0
+    size_mult    = 1.0
+    cum_return   = 0.0
+    max_fav_pnl  = 0.0
+    bars_in_trade = 0
+    trade_entry_i = 0
+
+    for i in range(n):
+        regime_info = engine.update_regime(int(states[i]), hmm_transmat)
+
+        if in_trade:
+            bars_in_trade += 1
+            bar_gross = direction * log_returns[i] * size_mult
+            gross_returns[i] = bar_gross
+            cum_return += direction * log_returns[i]
+            cur_pnl = cum_return * account_size
+            max_fav_pnl = max(max_fav_pnl, cur_pnl)
+            signals[i]  = direction
+            sizes_arr[i] = size_mult
+
+            exit_now, _ = engine.should_exit(
+                regime_info, cur_pnl, max_fav_pnl, bars_in_trade
+            )
+            if exit_now:
+                costs_arr[i]        = spread_cost * size_mult
+                strategy_returns[i] = bar_gross - spread_cost * size_mult
+
+                if return_trades:
+                    _is_end = split_idx if split_idx is not None else n
+                    if trade_entry_i < _is_end:
+                        trades.append({
+                            "bar_idx":         trade_entry_i,
+                            "regime":          int(states[trade_entry_i]),
+                            "signal":          direction,
+                            "prob":            float(probabilities[trade_entry_i]),
+                            "volatility":      float(atr_norm[trade_entry_i]),
+                            "spread":          spread_cost,
+                            "gmm_vol_cluster": int(gmm_col[trade_entry_i]),
+                            "pnl":             cur_pnl,
+                        })
+
+                in_trade      = False
+                engine.on_trade_closed()
+                cum_return    = 0.0
+                max_fav_pnl   = 0.0
+                bars_in_trade = 0
+            else:
+                strategy_returns[i] = bar_gross
+
+        else:
+            bb_position = float(bb_pos[i]) if states[i] >= 2 else None
+            entry = engine.should_enter(
+                regime_info,
+                float(probabilities[i]),
+                int(gmm_col[i]),
+                bb_position,
+            )
+            if entry:
+                direction  = 1 if entry["signal"] in ("BUY", "MR_BUY") else -1
+                size_mult  = entry["size_multiplier"]
+                in_trade   = True
+                signals[i] = direction
+                sizes_arr[i] = size_mult
+                trade_entry_i = i
+                engine.on_trade_entered(int(states[i]))
+                costs_arr[i]        = spread_cost * size_mult
+                strategy_returns[i] = -spread_cost * size_mult
+
+    return signals, strategy_returns, gross_returns, costs_arr, sizes_arr, trades
+
+
 def vectorized_backtest(
     df,
     probabilities,
@@ -414,6 +544,7 @@ def vectorized_backtest(
     evaluator_config: dict = None,
     use_tiered: bool = False,
     return_trades: bool = False,
+    hmm_transmat=None,
 ):
     """Vectorized backtest with adaptive session limits and broker costs.
 
@@ -436,54 +567,26 @@ def vectorized_backtest(
                       fixed-threshold method.
         return_trades: When True, add ``'trades_df'`` to the result — a
                        DataFrame of IS-bar records used to calibrate the
-                       :class:`~src.rcev_scorer.RCEVScorer`.  Has no effect
-                       when ``split_idx`` is None (uses all bars).
+        return_trades: When True, add ``'trades_df'`` to the result — a
+                       DataFrame of IS-bar records used for RCEV calibration.
+                       Has no effect when ``split_idx`` is None.
+        hmm_transmat:  HMM transition matrix — passed to SignalEngine for
+                       persistence-collapse exit detection.
     """
     log_returns = df["log_return"].values
     atr_norm    = df["atr_normalized"].values
 
-    # ── Signal generation ─────────────────────────────────────────────────
-    if regime_stats:
-        gmm_clusters = (
-            df["gmm_vol_cluster"].values
-            if "gmm_vol_cluster" in df.columns
-            else None
-        )
-        raw_signals = compute_signals_zscore(
-            probabilities, hmm_states, regime_stats, gmm_clusters, tf=tf,
-            evaluator_config=evaluator_config,
-            use_tiered=use_tiered,
-        )
-    else:
-        buy_th = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
-        raw_signals = compute_signals(
-            probabilities, hmm_states,
-            threshold=buy_th,
-            short_threshold=short_threshold,  # None → symmetric default inside
-        )
+    # ── Signal generation via bar-by-bar SignalEngine ─────────────────────────
+    # prob_threshold / short_threshold / regime_stats / evaluator_config /
+    # use_tiered are retained in the signature for backward compatibility with
+    # existing callers (cmd_report, validator) but are no longer used.
+    signals, strategy_returns, gross_returns, costs, sizes, _trades = _run_bar_loop(
+        df, probabilities, hmm_states, hmm_transmat,
+        tf=tf, broker=broker, account_size=account_size,
+        split_idx=split_idx, return_trades=return_trades,
+    )
 
-    # Spread-Aware Adaptive Filter: suppress signals where ATR / spread is below
-    # the TF-specific minimum efficiency threshold.
-    # M5: 7.0× — ensures MR trades only fire when volatility comfortably exceeds
-    #     the spread, filtering expensive noise in quiet night sessions.
-    # H1/M15: 1.25× — allows standard market conditions while blocking dead sessions.
     _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
-    _min_eff     = TF_MIN_EFFICIENCY.get(tf.upper(), 1.25)
-    _er_mask     = (atr_norm / _spread_frac) >= _min_eff
-    signals = np.where(_er_mask, raw_signals, 0)
-
-    # Determine pos_per_trade from the adaptive risk manager
-    arm           = AdaptiveRiskManager(account_size, broker=broker)
-    base_limits   = arm.get_trade_limits(tf=tf)
-    pos_per_trade = base_limits["pos_per_trade"]
-
-    sizes = compute_position_sizes(signals, atr_norm, pos_per_trade=pos_per_trade)
-
-    next_returns     = np.roll(log_returns, -1)
-    next_returns[-1] = 0.0
-    gross_returns    = sizes * next_returns
-    costs            = compute_trade_costs(signals, broker=broker)
-    strategy_returns = gross_returns - costs
 
     result = _compute_metrics(strategy_returns, signals, tf=tf)
     result["floating_max_drawdown"] = _compute_floating_drawdown(
@@ -497,7 +600,7 @@ def vectorized_backtest(
         "account_size":  account_size,
         "broker":        broker,
         "tf":            tf,
-        "pos_per_trade": pos_per_trade,
+        "pos_per_trade": 1,
     })
     # Full-period MR attribution
     result.update(_mr_attribution(signals, hmm_states, strategy_returns))
@@ -552,11 +655,9 @@ def vectorized_backtest(
         )
 
     logger.info(
-        "%s: account=$%.2f | tier=%s | pos_per_trade=%d | costs=%.4f/trade",
+        "%s: account=$%.2f | costs=%.4f/trade",
         broker,
         account_size,
-        "small" if arm.is_small_account else "growth",
-        pos_per_trade,
         BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0)
         + BROKER_CONFIGS.get(broker, {}).get("commission_frac", 0),
     )
@@ -571,34 +672,12 @@ def vectorized_backtest(
     result["balance_values"]    = _balance_arr
     result["deposit_load"]      = _deposit_load
 
-    # ── Per-trade records for RCEV calibration ────────────────────────────────
-    if return_trades:
-        _spread_val = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
-        _is_end = split_idx if split_idx is not None else len(signals)
-        _sig_is = signals[:_is_end]
-        _active_idx = np.where(_sig_is != 0)[0]
-        _gmm = (
-            df["gmm_vol_cluster"].values[:_is_end]
-            if "gmm_vol_cluster" in df.columns
-            else np.ones(_is_end, dtype=int)
-        )
-        trades_list = [
-            {
-                "bar_idx":         int(i),
-                "regime":          int(hmm_states[i]),
-                "signal":          int(_sig_is[i]),
-                "prob":            float(probabilities[i]),
-                "volatility":      float(atr_norm[i]),
-                "spread":          float(_spread_val),
-                "gmm_vol_cluster": int(_gmm[i]),
-                "pnl":             float(strategy_returns[i]),
-            }
-            for i in _active_idx
-        ]
+    # ── Per-trade records (collected by _run_bar_loop when return_trades=True) ──
+    if return_trades and _trades is not None:
         _empty_cols = ["bar_idx", "regime", "signal", "prob", "volatility",
                        "spread", "gmm_vol_cluster", "pnl"]
         result["trades_df"] = (
-            pd.DataFrame(trades_list) if trades_list else pd.DataFrame(columns=_empty_cols)
+            pd.DataFrame(_trades) if _trades else pd.DataFrame(columns=_empty_cols)
         )
 
     return result

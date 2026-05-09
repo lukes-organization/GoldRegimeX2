@@ -22,9 +22,7 @@ from src.engine_xgb import (
     train_xgb_ensemble, get_predictions_ensemble,
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
     get_ensemble_path, TF_TRAIN_RATIO, compute_regime_stats,
-    train_regime_classifiers, save_regime_classifiers,
 )
-from src.rcev_scorer import RCEVScorer, get_rcev_path, RCEV_DEFAULT_THRESHOLDS
 from src.optimizer import run_optimization, get_best_params, _score_result as _calc_score
 from src.backtester import vectorized_backtest, format_payout
 from src.visualizer import generate_full_report
@@ -360,7 +358,8 @@ def cmd_optimize(args):
     for tf in tfs:
         reconfigure_for_tf(tf)
         logger.info("Optimizing [%s] broker=%s balance=$%.0f trials=%d", tf, broker, balance, args.trials)
-        study = run_optimization(n_trials=args.trials, balance=balance, broker=broker, tf=tf, n_jobs=args.n_jobs)
+        study = run_optimization(n_trials=args.trials, balance=balance, broker=broker, tf=tf, n_jobs=args.n_jobs,
+                                  split_method=getattr(args, "split_method", "static"))
         print(f"\n=== Best Result [{tf}] ===")
         print(f"Score:         {study.best_value:.3f}")
         print(f"Broker:        {broker}")
@@ -395,7 +394,7 @@ def cmd_train(args):
         logger.warning("No Optuna study found for tf=%s broker=%s — using defaults", tf, broker)
         params = {}
 
-    result, model_hmm, state_map, models_ensemble, thresholds, metrics, *_ = _train_for_tf(tf, balance, broker, params)
+    result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities = _train_for_tf(tf, balance, broker, params)
 
     # Guard: refuse to save a degenerate HMM — identical state means + near-zero persistence
     # indicate the Kalman/HMM params were bad (usually because Optuna params weren't loaded).
@@ -417,40 +416,6 @@ def cmd_train(args):
 
     save_hmm(model_hmm, hmm_model_path(tf, broker))
     save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf, broker))
-
-    # ── Per-regime XGBoost classifiers ────────────────────────────────────────
-    _train_ratio = TF_TRAIN_RATIO.get(tf.upper(), 0.70)
-    try:
-        regime_models = train_regime_classifiers(X, states_aligned, train_ratio=_train_ratio)
-        save_regime_classifiers(regime_models, get_ensemble_path(tf, broker))
-        logger.info("[Train] Per-regime classifiers trained and saved for %s/%s", tf, broker)
-    except Exception as exc:
-        logger.warning("[Train] Per-regime classifier training failed: %s", exc)
-        regime_models = None
-
-    # ── RCEV calibration ──────────────────────────────────────────────────────
-    try:
-        split_idx = metrics.get("split_idx")
-        is_result = vectorized_backtest(
-            df_aligned, probabilities, states_aligned,
-            split_idx=split_idx,
-            account_size=balance,
-            broker=broker,
-            tf=tf,
-            regime_stats=metrics["regime_stats"],
-            return_trades=True,
-        )
-        trades_df = is_result.get("trades_df")
-        if trades_df is not None and not trades_df.empty:
-            rcev = RCEVScorer(broker=broker)
-            rcev.calibrate(trades_df)
-            rcev.save(get_rcev_path(tf, broker))
-            logger.info("[Train] RCEV calibrated from %d IS trades and saved.", len(trades_df))
-            print(f"RCEV calibrated: {len(trades_df)} IS trades → {get_rcev_path(tf, broker)}")
-        else:
-            logger.warning("[Train] No IS trades returned — RCEV calibration skipped.")
-    except Exception as exc:
-        logger.warning("[Train] RCEV calibration failed: %s", exc)
 
     arm = AdaptiveRiskManager(balance, broker=broker)
     print(f"\n=== Training Results [{tf}] ===")
@@ -672,12 +637,7 @@ def cmd_demo(args):
         tf, args.broker, balance,
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
-                  profit_target=getattr(args, "profit_target", None),
-                  use_tiered=getattr(args, "tiered", False),
-                  rcev_threshold=getattr(args, "rcev_threshold", None))
-
-
-def cmd_live(args):
+                  profit_target=getattr(args, "profit_target", None))
     """Connect to MT5 live account and start the live signal execution loop."""
     from src.mt5_trader import run_live_loop
 
@@ -706,9 +666,7 @@ def cmd_live(args):
         tf, args.broker, balance,
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
-                  profit_target=getattr(args, "profit_target", None),
-                  use_tiered=getattr(args, "tiered", False),
-                  rcev_threshold=getattr(args, "rcev_threshold", None))
+                  profit_target=getattr(args, "profit_target", None))
 
 
 def cmd_report(args):
@@ -1086,7 +1044,6 @@ def cmd_sensitivity(args):
         states_aligned=states_aligned,
         split_idx=split_idx,
         regime_stats=metrics["regime_stats"],
-        use_tiered=getattr(args, "tiered", False),
     )
 
 
@@ -1103,6 +1060,9 @@ def main():
     parser.add_argument("--n_jobs",   type=int,   default=1,
                         help="Parallel Optuna trial workers (default 1). "
                              "See optimizer.py for caveats with n_jobs>1.")
+    parser.add_argument("--split_method", choices=["static", "purged_ts"], default="static",
+                        help="Optimizer cross-validation method: 'static' (IS/OOS split) or "
+                             "'purged_ts' (3-fold purged time-series CV across macro regimes).")
     parser.add_argument("--interval", type=int,   default=3600,
                         help="Guardian check interval in seconds (default 3600 = 1h).")
     parser.add_argument("--min_cap", type=float, default=15.0,
@@ -1117,13 +1077,6 @@ def main():
                         help="Lookback window for MT5 sync, e.g. '3m' '6m' '12m'.")
     parser.add_argument("--yes", action="store_true",
                         help="Skip the interactive live-account confirmation (used when launched as a subprocess).")
-    parser.add_argument("--tiered", action="store_true",
-                        help="Enable tiered Z-Score override: strong XGBoost conviction reduces the Z "
-                             "cutoff floor (min 1.0). Used with --mode sensitivity and --mode live/demo.")
-    parser.add_argument("--rcev_threshold", type=float, default=None,
-                        help="RCEV minimum expected profit threshold in USD. "
-                             "Defaults: H1=$0.50, M15=$0.35, M5=$0.20. "
-                             "Example: --rcev_threshold 0.30 to lower the bar for more signals.")
     parser.add_argument("--profit_target",  type=float, default=None,
                         help="Quick-profit close threshold in USD.  M5 defaults to 4.0; "
                              "other TFs disabled unless set.  Pass 0 to disable on M5.")

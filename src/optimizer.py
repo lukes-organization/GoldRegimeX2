@@ -20,9 +20,9 @@ import time
 import optuna
 
 from src.processor import process_pipeline
-from src.engine_hmm import fit_hmm
+from src.engine_hmm import fit_hmm, predict_states
 from src.engine_xgb import (
-    prepare_features, train_xgb_ensemble, get_predictions_ensemble, compute_regime_stats,
+    prepare_features, train_xgb_ensemble, get_predictions_ensemble,
 )
 from src.backtester import vectorized_backtest, format_payout
 from src.risk_manager import SMALL_ACCOUNT_THRESHOLD
@@ -54,9 +54,148 @@ RAM_PAUSE_SEC   = 30     # seconds to sleep when RAM is low
 # TF-specific progressive penalty thresholds — trades below these earn score × 0.1
 TF_MIN_OOS_TRADES = {"H1": 25, "M15": 140, "M5": 350}
 
+# ── Purged 3-Fold Time-Series CV ──────────────────────────────────────────────
+# Three non-overlapping macro-regime windows.  Each fold's IS ends before the
+# OOS begins so there is zero overlap — "purged" in the CV sense.
+PURGED_TS_CONFIG = [
+    {"is_end": "2019-12-31", "oos_start": "2020-01-01", "oos_end": "2021-12-31"},  # COVID crash + recovery
+    {"is_end": "2021-12-31", "oos_start": "2022-01-01", "oos_end": "2023-12-31"},  # Fed rate hike cycle
+    {"is_end": "2023-12-31", "oos_start": "2024-01-01", "oos_end": None},          # Recent (latest available)
+]
+# Fewer trials because each trial runs 3× as many fits.
+PURGED_TS_TRIALS = {"H1": 200, "M15": 250, "M5": 333}
+# Sequential folds to avoid XGBoost core contention when parallelism is on.
+INTERNAL_N_JOBS = 1
+
 
 def _get_tier(balance: float) -> str:
     return "small" if balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
+
+
+def compute_purged_ts_score(
+    df_full,
+    balance: float,
+    broker: str,
+    tf: str,
+    n_states: int,
+    xgb_kwargs: dict,
+) -> float:
+    """3-fold purged time-series cross-validation score.
+
+    Each fold trains on a distinct macro-regime IS window and evaluates on the
+    subsequent OOS window — no overlap.  Returns the mean fold score adjusted
+    by a Walk-Forward Efficiency (WFE) multiplier that penalises models whose
+    recent-fold performance decays below the first fold.
+    """
+    fold_scores = []
+    fold_models = []  # store (model_is,) for each fold to avoid re-fitting
+
+    for fold in PURGED_TS_CONFIG:
+        is_end = fold["is_end"]
+        oos_start = fold["oos_start"]
+        oos_end = fold["oos_end"]
+
+        df_is = df_full[df_full.index <= is_end]
+        if oos_end is not None:
+            df_oos = df_full[(df_full.index > oos_start) & (df_full.index <= oos_end)]
+        else:
+            df_oos = df_full[df_full.index > oos_start]
+
+        if len(df_is) < 1000 or len(df_oos) < 100:
+            fold_scores.append(None)
+            continue
+
+        try:
+            # Fit HMM on IS — OOS uses IS scaler via predict_states()
+            model_is, is_states, _ = fit_hmm(df_is, n_states=n_states, tf=tf)
+
+            # HMM quality guard (same as make_objective)
+            _min_persist = min(model_is.transmat_[i, i] for i in range(n_states))
+            if _min_persist < 0.65:
+                fold_scores.append(None)
+                continue
+
+            oos_states = predict_states(model_is, df_oos)
+
+            # Prepare features — IS scaler reused for OOS to prevent leakage
+            X_is, y_is, df_is_aligned, scaler_is = prepare_features(
+                df_is, is_states, tf=tf
+            )
+            X_oos, _y_oos, df_oos_aligned, _ = prepare_features(
+                df_oos, oos_states, feature_scaler=scaler_is, tf=tf
+            )
+
+            # Train on 100% of IS fold — the OOS fold is the separate test set
+            models_ens, thresholds, _ = train_xgb_ensemble(
+                X_is, y_is, train_ratio=1.0, **xgb_kwargs
+            )
+            _, probs_oos = get_predictions_ensemble(models_ens, thresholds, X_oos)
+
+            # Aligned OOS states from the df prepared by prepare_features
+            oos_states_aligned = df_oos_aligned["hmm_state"].values
+
+            # Backtest the OOS fold — split_idx=None triggers internal 80/20 split
+            # which gives oos_ prefixed metrics for the last 20% of the fold window
+            fold_result = vectorized_backtest(
+                df_oos_aligned,
+                probs_oos,
+                oos_states_aligned,
+                split_idx=None,
+                account_size=balance,
+                broker=broker,
+                tf=tf,
+                hmm_transmat=model_is.transmat_,
+            )
+
+            fold_n = fold_result.get("oos_n_trades", 0)
+            _hard_floor = max(MIN_OOS_TRADES_HARD.get(tf.upper(), 10) // 3, 5)
+            if fold_n < _hard_floor:
+                fold_scores.append(None)
+                continue
+
+            rf = min(fold_result.get("oos_recovery_factor", 0.0), 5.0)
+            pf = min(fold_result.get("oos_profit_factor", 0.0), 3.0)
+            sharpe = fold_result.get("oos_sharpe_ratio", 0.0)
+            fold_scores.append(float(rf * 0.4 + pf * 0.3 + sharpe * 0.3))
+
+        except Exception as exc:
+            logger.warning("Purged TS fold (%s→%s) failed: %s", is_end, oos_end or "latest", exc)
+            fold_scores.append(None)
+
+    valid_scores = [s for s in fold_scores if s is not None]
+    if len(valid_scores) < 2:
+        return -50.0
+
+    mean_score = float(sum(valid_scores) / len(valid_scores))
+
+    # Walk-Forward Efficiency: recent fold performance relative to first fold.
+    # Rewards models that hold up in the most recent macro-regime.
+    first = fold_scores[0]
+    last = next((s for s in reversed(fold_scores) if s is not None), None)
+    if first is not None and first > 0.01 and last is not None:
+        wfe = last / first
+    else:
+        wfe = 0.5  # neutral when first fold is zero or absent
+
+    if wfe >= 0.60:
+        wfe_mult = 1.10
+    elif wfe >= 0.40:
+        wfe_mult = 1.00
+    elif wfe >= 0.20:
+        wfe_mult = 0.80
+    else:
+        return -50.0
+
+    # Consistency bonus: all valid folds positive
+    if all(s > 0 for s in valid_scores):
+        mean_score *= 1.05
+
+    logger.info(
+        "Purged TS folds: %s  WFE=%.2f (×%.2f)  mean_score=%.3f",
+        [f"{s:.3f}" if s is not None else "skip" for s in fold_scores],
+        wfe, wfe_mult, mean_score * wfe_mult,
+    )
+    return mean_score * wfe_mult
 
 
 def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = "H1") -> float:
@@ -93,7 +232,8 @@ def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = 
     return score
 
 
-def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
+def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1",
+                   split_method: str = "static"):
     """Return an Optuna objective function for the given account / TF context."""
     tier = _get_tier(balance)
 
@@ -177,6 +317,25 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             df = process_pipeline(
                 obs_cov=obs_cov, trans_cov=trans_cov, save=False, tf=tf
             )
+
+            # ── Purged 3-Fold TS path ─────────────────────────────────────────
+            if split_method == "purged_ts":
+                _xgb_kw = dict(
+                    max_depth=max_depth, learning_rate=learning_rate,
+                    n_estimators=n_estimators, subsample=subsample,
+                    colsample_bytree=colsample_bytree,
+                    min_child_weight=min_child_weight,
+                    gamma=gamma, reg_alpha=reg_alpha,
+                )
+                score = compute_purged_ts_score(
+                    df, balance, broker, tf, n_states, _xgb_kw,
+                )
+                logger.info(
+                    "Trial %d [%s/%s purged_ts]: score=%.3f",
+                    trial.number, tf, broker, score,
+                )
+                return score
+
             _hmm, states, _ = fit_hmm(df, n_states=n_states, tf=tf)
 
             # ── HMM quality gate ─────────────────────────────────────────────
@@ -230,19 +389,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             split_idx = metrics.get("split_idx")
             X_is      = X.iloc[:split_idx] if split_idx else X
             states_aligned = states[df.index.isin(df_aligned.index)]
-            hmm_states_is  = states_aligned[:len(X_is)]
-            regime_stats   = compute_regime_stats(models, thresholds, X_is, hmm_states_is)
-            metrics["regime_stats"] = regime_stats
 
-            _eval_cfg = None   # Z cutoffs use hardcoded TF defaults from signal_evaluator.py
             result = vectorized_backtest(
                 df_aligned, probabilities, states_aligned,
                 split_idx=split_idx,
                 account_size=balance,
                 broker=broker,
                 tf=tf,
-                regime_stats=regime_stats,
-                evaluator_config=_eval_cfg,
+                hmm_transmat=_hmm.transmat_,
             )
 
             # Score on OOS only to prevent IS data leakage
@@ -464,6 +618,7 @@ def run_optimization(
     broker: str     = "standard",
     tf: str         = "H1",
     n_jobs: int     = 1,
+    split_method: str = "static",
 ) -> optuna.Study:
     """Run (or resume) an Optuna study and return it when complete.
 
@@ -487,6 +642,12 @@ def run_optimization(
     tier = _get_tier(balance)
     name = _study_name(broker=broker, tier=tier, tf=tf)
     storage = _study_db(broker)
+
+    # Purged TS uses fewer trials (3× cost per trial) and forces sequential folds
+    if split_method == "purged_ts":
+        if n_trials == 250:  # caller used default — apply TF-specific purged default
+            n_trials = PURGED_TS_TRIALS.get(tf.upper(), 200)
+        n_jobs = INTERNAL_N_JOBS
 
     os.makedirs("models", exist_ok=True)
 
@@ -528,7 +689,7 @@ def run_optimization(
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     study.optimize(
-        make_objective(balance=balance, broker=broker, tf=tf),
+        make_objective(balance=balance, broker=broker, tf=tf, split_method=split_method),
         n_trials=remaining,
         n_jobs=n_jobs,
         show_progress_bar=(n_jobs == 1),   # tqdm bar misleads with threads
