@@ -12,6 +12,13 @@ import numpy as np
 MIN_CONFIRMATION_BARS = {"H1": 2, "M15": 2, "M5": 2}
 MIN_CHOP_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 2}
 
+# Minimum consecutive bars in a NEW (different) regime before regime-reversal
+# exit fires.  Mirrors the entry confirmation logic so single-bar regime blips
+# (e.g. one Chop bar interrupting a Bull trend) don't cause premature exits.
+# Without this, the engine enters after 2 confirmation bars, then exits on the
+# FIRST bar of any regime change → 1-bar trades → spread dominates → WR ~25%.
+MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 3}
+
 # XGBoost probability threshold for trend and MR entries
 ENTRY_PROB    = {"H1": 0.58, "M15": 0.55, "M5": 0.52}
 MR_ENTRY_PROB = {"H1": 0.55, "M15": 0.52, "M5": 0.50}
@@ -57,6 +64,7 @@ class SignalEngine:
         self.in_trade: bool = False
         self.entry_regime: int | None = None
         self.bars_in_trade: int = 0
+        self._reversal_bars: int = 0   # consecutive bars in non-entry regime
 
     # ── Core API ──────────────────────────────────────────────────────────────
 
@@ -78,6 +86,14 @@ class SignalEngine:
                 stability = 0.70
         else:
             stability = 0.70
+
+        # Track consecutive bars in a non-entry regime for exit confirmation.
+        # Reset to zero when we return to the entry regime (blip resolved).
+        if self.in_trade and self.entry_regime is not None:
+            if new_state != self.entry_regime:
+                self._reversal_bars += 1
+            else:
+                self._reversal_bars = 0
 
         return {
             "state": new_state,
@@ -148,9 +164,12 @@ class SignalEngine:
         """
         state = regime_info["state"]
 
-        # Regime reversal — regime has shifted away from the entry regime
+        # Regime reversal — require MIN_EXIT_CONFIRM_BARS consecutive bars in the
+        # new regime before exiting.  Single-bar blips (e.g. one Chop bar in a Bull
+        # trend) reset _reversal_bars and keep the trade alive.
         if self.entry_regime is not None and state != self.entry_regime:
-            return True, "regime_reversal"
+            if self._reversal_bars >= MIN_EXIT_CONFIRM_BARS.get(self.tf, 2):
+                return True, "regime_reversal"
 
         # Persistence collapse — regime is no longer stable
         if regime_info["stability"] < PERSISTENCE_MIN.get(self.tf, 0.55):
@@ -173,12 +192,14 @@ class SignalEngine:
         self.in_trade = True
         self.entry_regime = regime_state
         self.bars_in_trade = 0
+        self._reversal_bars = 0
 
     def on_trade_closed(self) -> None:
         """Call after a trade is fully closed."""
         self.in_trade = False
         self.entry_regime = None
         self.bars_in_trade = 0
+        self._reversal_bars = 0
 
     def reset(self) -> None:
         """Full state reset — use between independent backtest runs."""
@@ -187,3 +208,4 @@ class SignalEngine:
         self.in_trade = False
         self.entry_regime = None
         self.bars_in_trade = 0
+        self._reversal_bars = 0

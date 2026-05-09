@@ -156,7 +156,16 @@ def compute_purged_ts_score(
             rf = min(fold_result.get("recovery_factor", 0.0), 5.0)
             pf = min(fold_result.get("profit_factor", 1.0), 3.0)
             sharpe = fold_result.get("sharpe_ratio", 0.0)
-            fold_scores.append(float(rf * 0.4 + pf * 0.3 + sharpe * 0.3))
+            wr = fold_result.get("win_rate", 0.0)
+            logger.info(
+                "  Fold %s→%s: n=%d WR=%.1f%% Sharpe=%.3f RF=%.2f PF=%.2f",
+                is_end, oos_end or "latest", fold_n, wr * 100, sharpe, rf, pf,
+            )
+            # Cap at 2.0 — prevents a single anomalous period (e.g. COVID bull run)
+            # from dominating the cross-fold average.  Raw formula can hit 2.2+
+            # when one period has exceptional RF + PF + Sharpe simultaneously.
+            fold_score = min(float(rf * 0.4 + pf * 0.3 + sharpe * 0.3), 2.0)
+            fold_scores.append(fold_score)
 
         except Exception as exc:
             logger.warning("Purged TS fold (%s→%s) failed: %s", is_end, oos_end or "latest", exc)
@@ -166,7 +175,24 @@ def compute_purged_ts_score(
     if len(valid_scores) < 2:
         return -50.0
 
-    mean_score = float(sum(valid_scores) / len(valid_scores))
+    # Hard reject if any evaluated fold is negative — a robust strategy must not
+    # lose money in any of the three tested macro-regime periods.
+    if any(s < 0.0 for s in valid_scores):
+        logger.warning(
+            "Purged TS: %d fold(s) negative — rejecting (folds: %s)",
+            sum(1 for s in valid_scores if s < 0.0),
+            [f"{s:.3f}" for s in valid_scores],
+        )
+        return -50.0
+
+    # Variance-penalised mean: subtract half the population std from the mean.
+    # A strategy that aces one anomalous period (e.g. COVID bull run) but is
+    # mediocre in others scores lower than one that performs consistently across
+    # all three folds.  This prevents single-period outliers from winning the study.
+    _n_v   = len(valid_scores)
+    _mean_v = sum(valid_scores) / _n_v
+    _std_v  = (sum((s - _mean_v) ** 2 for s in valid_scores) / _n_v) ** 0.5
+    mean_score = float(_mean_v - 0.5 * _std_v)
 
     # Walk-Forward Efficiency: recent fold performance relative to first fold.
     # Rewards models that hold up in the most recent macro-regime.
@@ -186,8 +212,10 @@ def compute_purged_ts_score(
     else:
         return -50.0
 
-    # Consistency bonus: all valid folds positive
-    if all(s > 0 for s in valid_scores):
+    # Consistency bonus: all folds show meaningful positive performance (> 0.30).
+    # Threshold raised from > 0.0 — ensures a single barely-passing fold doesn't
+    # silently collect the bonus when the other folds are carrying the strategy.
+    if all(s > 0.30 for s in valid_scores):
         mean_score *= 1.05
 
     logger.info(
