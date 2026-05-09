@@ -103,10 +103,9 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
     )
     X, y, df_aligned, feature_scaler = prepare_features(df, states, tf=tf)
     save_feature_scaler(feature_scaler, tf=tf, broker=broker)
-    _train_ratio = TF_TRAIN_RATIO.get(tf.upper(), 0.70)
     models_ensemble, thresholds, metrics = train_xgb_ensemble(
         X, y,
-        train_ratio=_train_ratio,
+        train_ratio=1.0,  # full-data training — CPCV validation happened in optimize step
         max_depth=params.get("max_depth", 4),
         learning_rate=params.get("learning_rate", 0.1),
         n_estimators=params.get("n_estimators", 200),
@@ -118,21 +117,13 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
     )
     _, probabilities = get_predictions_ensemble(models_ensemble, thresholds, X)
     states_aligned = states[df.index.isin(df_aligned.index)]
-    split_idx = metrics.get("split_idx")
-    # Compute IS regime statistics for Z-Score signal calibration
-    _X_is = X.iloc[:split_idx] if split_idx else X
-    _hs_is = states_aligned[:len(_X_is)]
-    metrics["regime_stats"] = compute_regime_stats(models_ensemble, thresholds, _X_is, _hs_is)
-    _z = params.get("z_cutoff_bull")
-    _eval_cfg = {"Z_CUTOFF_BULL": _z, "Z_CUTOFF_BEAR": -_z} if _z else None
+    metrics["regime_stats"] = compute_regime_stats(models_ensemble, thresholds, X, states_aligned)
     result = vectorized_backtest(
         df_aligned, probabilities, states_aligned,
-        split_idx=split_idx,
+        split_idx=None,   # full-data model — no IS/OOS split; CPCV scores used for validation
         account_size=balance,
         broker=broker,
         tf=tf,
-        regime_stats=metrics["regime_stats"],
-        evaluator_config=_eval_cfg,
     )
     return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
 
@@ -358,8 +349,7 @@ def cmd_optimize(args):
     for tf in tfs:
         reconfigure_for_tf(tf)
         logger.info("Optimizing [%s] broker=%s balance=$%.0f trials=%d", tf, broker, balance, args.trials)
-        study = run_optimization(n_trials=args.trials, balance=balance, broker=broker, tf=tf, n_jobs=args.n_jobs,
-                                  split_method=getattr(args, "split_method", "static"))
+        study = run_optimization(n_trials=args.trials, balance=balance, broker=broker, tf=tf, n_jobs=args.n_jobs)
         print(f"\n=== Best Result [{tf}] ===")
         print(f"Score:         {study.best_value:.3f}")
         print(f"Broker:        {broker}")
@@ -418,42 +408,24 @@ def cmd_train(args):
     save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf, broker))
 
     arm = AdaptiveRiskManager(balance, broker=broker)
+    cpcv_score = None
+    try:
+        from src.optimizer import get_best_params as _gbp
+        _study = __import__("optuna").load_study(
+            study_name=None,
+            storage=f"sqlite:///models/study_{broker}.db",
+        )
+        cpcv_score = _study.best_value
+    except Exception:
+        pass
+
     print(f"\n=== Training Results [{tf}] ===")
     print(f"Broker: {broker} | Balance: ${balance:.0f} | Tier: {'small' if arm.is_small_account else 'growth'}")
-    print(f"Sharpe: {result['sharpe_ratio']:.3f} | MaxDD: {result['max_drawdown']*100:.1f}% "
-          f"| WR: {result['win_rate']*100:.1f}% | Trades: {result['n_trades']}")
-    if "oos_sharpe_ratio" in result:
-        def _fmt_block(label, r, prefix):
-            fdd    = r.get(f"{prefix}floating_max_drawdown", r.get(f"{prefix}max_drawdown", 0.0))
-            r_dict = {
-                "total_return":          r.get(f"{prefix}total_return", 0.0),
-                "floating_max_drawdown": fdd,
-                "sharpe_ratio":          r.get(f"{prefix}sharpe_ratio", 0.0),
-                "profit_factor":         r.get(f"{prefix}profit_factor", 1.0),
-            }
-            score   = _calc_score(r_dict)
-            rf      = r.get(f"{prefix}recovery_factor", 0.0)
-            pf      = r.get(f"{prefix}profit_factor", 1.0)
-            payoff  = r.get(f"{prefix}expected_payoff", 0.0) * balance
-            eff     = r.get(f"{prefix}avg_efficiency", 0.0)
-            cost_e  = r.get(f"{prefix}cost_efficiency", 0.0)
-            payout_str = format_payout(r.get(f"{prefix}total_return", 0.0), balance, broker)
-            print(
-                f"  [{tf} {label}] Score: {score:.2f} | RF: {rf:.2f} | PF: {pf:.2f}"
-                f" | Payoff: ${payoff:.4f} | MaxDD: {fdd*100:.1f}% (Floating)"
-                f" | WR: {r.get(f'{prefix}win_rate', 0.0)*100:.1f}% | Trades: {r.get(f'{prefix}n_trades', 0)}"
-            )
-            print(
-                f"  [{tf} {label}] Efficiency: {eff:.2f}x ATR/Spread"
-                f" | CostEff: {cost_e*100:.1f}%"
-                f" | Total Payout: {payout_str}"
-            )
-            if cost_e < 0.50:
-                print(f"  ⚠️  WARNING: Broker is consuming >{(1-cost_e)*100:.0f}% of gross profit via spread/commission.")
-        print(f"\n--- In-Sample ---")
-        _fmt_block("IS",  result, "is_")
-        print(f"--- Out-of-Sample ---")
-        _fmt_block("OOS", result, "oos_")
+    print(f"Full-data model trained on 100% of available bars (CPCV validation via optimize step).")
+    print(f"Full-period Sharpe: {result['sharpe_ratio']:.3f} | MaxDD: {result['max_drawdown']*100:.1f}%"
+          f" | WR: {result['win_rate']*100:.1f}% | Trades: {result['n_trades']}")
+    if cpcv_score is not None:
+        print(f"CPCV Validation Score (best trial): {cpcv_score:.3f}")
     print(f"\nModels saved. Run --mode export to generate ONNX.")
 
 
@@ -1063,9 +1035,6 @@ def main():
     parser.add_argument("--n_jobs",   type=int,   default=1,
                         help="Parallel Optuna trial workers (default 1). "
                              "See optimizer.py for caveats with n_jobs>1.")
-    parser.add_argument("--split_method", choices=["static", "purged_ts"], default="static",
-                        help="Optimizer cross-validation method: 'static' (IS/OOS split) or "
-                             "'purged_ts' (3-fold purged time-series CV across macro regimes).")
     parser.add_argument("--interval", type=int,   default=3600,
                         help="Guardian check interval in seconds (default 3600 = 1h).")
     parser.add_argument("--min_cap", type=float, default=15.0,

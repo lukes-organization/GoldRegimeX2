@@ -16,7 +16,9 @@ Key design decisions:
 import gc
 import os
 import time
+from itertools import combinations
 
+import numpy as np
 import optuna
 
 from src.processor import process_pipeline
@@ -54,25 +56,70 @@ RAM_PAUSE_SEC   = 30     # seconds to sleep when RAM is low
 # TF-specific progressive penalty thresholds — trades below these earn score × 0.1
 TF_MIN_OOS_TRADES = {"H1": 25, "M15": 140, "M5": 350}
 
-# ── Purged 3-Fold Time-Series CV ──────────────────────────────────────────────
-# Three non-overlapping macro-regime windows.  Each fold's IS ends before the
-# OOS begins so there is zero overlap — "purged" in the CV sense.
-PURGED_TS_CONFIG = [
-    {"is_end": "2019-12-31", "oos_start": "2020-01-01", "oos_end": "2021-12-31"},  # COVID crash + recovery
-    {"is_end": "2021-12-31", "oos_start": "2022-01-01", "oos_end": "2023-12-31"},  # Fed rate hike cycle
-    {"is_end": "2023-12-31", "oos_start": "2024-01-01", "oos_end": None},          # Recent (latest available)
-]
-# Fewer trials because each trial runs 3× as many fits.
-PURGED_TS_TRIALS = {"H1": 200, "M15": 250, "M5": 333}
-# Sequential folds to avoid XGBoost core contention when parallelism is on.
-INTERNAL_N_JOBS = 1
+# ── Combinatorial Purged Cross-Validation (CPCV) ─────────────────────────────
+# Data is split into N_BLOCKS equal chronological blocks. Every combination of
+# K_TEST blocks is held out as the test set (train on remaining N-K blocks).
+# C(6,2) = 15 paths — provides broad coverage across all market regimes without
+# hardcoding specific dates.  Purge gap at each train/test boundary removes
+# max_hold_bars to prevent feature look-ahead bias (Kalman/ATR lookbacks).
+CPCV_N_BLOCKS  = 6
+CPCV_K_TEST    = 2
+# Fewer trials than static because each trial runs 15 full HMM+XGB fits.
+CPCV_TRIALS    = {"H1": 80, "M15": 120, "M5": 200}
+# Purge gap at each train/test boundary — matches MAX_HOLD_BARS in signal_engine
+CPCV_PURGE_BARS = {"H1": 24, "M15": 32, "M5": 48}
+# Minimum trades per CPCV path for the result to count; paths below this are
+# penalised so Optuna steers toward configs that trade actively in all regimes.
+MIN_TRADES_PER_PATH = {"H1": 30, "M15": 60, "M5": 100}
+
+
+class CPCVSplitter:
+    """Generate train/test boolean mask pairs via Combinatorial Purged CV.
+
+    Splits the timeline into ``n_blocks`` equal chronological blocks and
+    yields all C(n_blocks, k_test) = 15 (for 6/2) train/test mask pairs.
+    A ``purge_bars``-wide gap is carved out of the training mask at every
+    train↔test boundary to prevent feature look-ahead leakage from Kalman
+    filter and ATR smoothing lookbacks.
+
+    Usage::
+        splitter = CPCVSplitter(n=len(df), purge_bars=24)
+        for train_mask, test_mask in splitter.split():
+            # train_mask, test_mask: bool arrays of length n
+    """
+
+    def __init__(self, n: int, n_blocks: int = CPCV_N_BLOCKS,
+                 k_test: int = CPCV_K_TEST, purge_bars: int = 24):
+        self.n         = n
+        self.n_blocks  = n_blocks
+        self.k_test    = k_test
+        self.purge_bars = purge_bars
+        self._blocks   = np.array_split(np.arange(n), n_blocks)
+
+    def split(self):
+        """Yield (train_mask, test_mask) for all C(n_blocks, k_test) combos."""
+        for test_combo in combinations(range(self.n_blocks), self.k_test):
+            train_mask = np.ones(self.n, dtype=bool)
+            test_mask  = np.zeros(self.n, dtype=bool)
+
+            for blk_idx in test_combo:
+                blk = self._blocks[blk_idx]
+                test_mask[blk] = True
+                # Carve purge gap from training set at both boundaries of the block
+                start, end = int(blk[0]), int(blk[-1])
+                lo = max(0, start - self.purge_bars)
+                hi = min(self.n, end + 1 + self.purge_bars)
+                train_mask[lo:hi] = False
+
+            train_mask[test_mask] = False  # test bars are never in training
+            yield train_mask, test_mask
 
 
 def _get_tier(balance: float) -> str:
     return "small" if balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
 
 
-def compute_purged_ts_score(
+def compute_cpcv_score(
     df_full,
     balance: float,
     broker: str,
@@ -80,150 +127,155 @@ def compute_purged_ts_score(
     n_states: int,
     xgb_kwargs: dict,
 ) -> float:
-    """3-fold purged time-series cross-validation score.
+    """Combinatorial Purged Cross-Validation score — 15 paths, C(6,2).
 
-    Each fold trains on a distinct macro-regime IS window and evaluates on the
-    subsequent OOS window — no overlap.  Returns the mean fold score adjusted
-    by a Walk-Forward Efficiency (WFE) multiplier that penalises models whose
-    recent-fold performance decays below the first fold.
+    For each of the 15 train/test mask pairs produced by CPCVSplitter:
+      1. Fit HMM on concatenated training bars (non-contiguous; jump at
+         block boundaries is an accepted approximation).
+      2. Predict states on ALL bars using the IS model.
+      3. Prepare features; scaler fitted on training bars only.
+      4. Train XGB on training bars (train_ratio=1.0 within the masked set).
+      5. Run bar-by-bar backtest with test_mask — entries only in test bars,
+         force-close at test block boundaries.
+      6. Collect path score = RF×0.4 + PF×0.3 + Sharpe×0.3 (capped at 2.0).
+
+    Aggregation:
+      - Need ≥ 8 valid paths (of 15) else return -50.0.
+      - Trade penalty: total_trades < MIN_TRADES_PER_PATH × n_valid_paths → -50.0.
+      - Final score = variance-penalised median of valid path scores.
+      - Consistency bonus ×1.05 when all valid paths score > 0.30.
     """
-    fold_scores = []
-    fold_models = []  # store (model_is,) for each fold to avoid re-fitting
+    purge = CPCV_PURGE_BARS.get(tf.upper(), 24)
+    splitter = CPCVSplitter(n=len(df_full), purge_bars=purge)
 
-    for fold in PURGED_TS_CONFIG:
-        is_end = fold["is_end"]
-        oos_start = fold["oos_start"]
-        oos_end = fold["oos_end"]
+    path_scores: list = []
+    total_trades: int = 0
 
-        df_is = df_full[df_full.index <= is_end]
-        if oos_end is not None:
-            df_oos = df_full[(df_full.index > oos_start) & (df_full.index <= oos_end)]
-        else:
-            df_oos = df_full[df_full.index > oos_start]
-
-        if len(df_is) < 1000 or len(df_oos) < 100:
-            fold_scores.append(None)
-            continue
-
+    # Predict states on the FULL dataset using a single IS HMM fitted on all data
+    # once per trial — expensive but necessary to have coherent state labels.
+    # Each path then filters to its training rows for XGB, and uses test_mask
+    # for evaluation.  The HMM IS fitted PER PATH so the model only sees
+    # training bars during fit.
+    for path_idx, (train_mask, test_mask) in enumerate(splitter.split()):
         try:
-            # Fit HMM on IS — OOS uses IS scaler via predict_states()
-            model_is, is_states, _ = fit_hmm(df_is, n_states=n_states, tf=tf)
-
-            # HMM quality guard (same as make_objective)
-            _min_persist = min(model_is.transmat_[i, i] for i in range(n_states))
-            if _min_persist < 0.65:
-                fold_scores.append(None)
+            df_train = df_full.iloc[train_mask]
+            if len(df_train) < 500:
+                path_scores.append(None)
                 continue
 
-            oos_states = predict_states(model_is, df_oos)
+            # Fit HMM on training blocks (concatenated; block-boundary jumps
+            # are a standard approximation in CPCV for time-series).
+            model_path, train_states, _ = fit_hmm(df_train, n_states=n_states, tf=tf)
 
-            # Prepare features — IS scaler reused for OOS to prevent leakage
-            X_is, y_is, df_is_aligned, scaler_is = prepare_features(
-                df_is, is_states, tf=tf
-            )
-            X_oos, _y_oos, df_oos_aligned, _ = prepare_features(
-                df_oos, oos_states, feature_scaler=scaler_is, tf=tf
+            _min_persist = min(model_path.transmat_[i, i] for i in range(n_states))
+            if _min_persist < 0.65:
+                path_scores.append(None)
+                continue
+
+            # Predict states on ALL bars using this path's IS model
+            all_states = predict_states(model_path, df_full)
+
+            # Feature preparation — scaler fitted on training rows only
+            X_train_raw, y_train_raw, df_train_aligned, scaler = prepare_features(
+                df_train, train_states, tf=tf
             )
 
-            # Train on 100% of IS fold — the OOS fold is the separate test set
+            # Apply scaler to ALL data (aligned to full df)
+            X_all, y_all, df_all_aligned, _ = prepare_features(
+                df_full, all_states, feature_scaler=scaler, tf=tf
+            )
+
+            # Align train_mask and test_mask to the rows kept after prepare_features
+            _kept = df_full.index.isin(df_all_aligned.index)
+            train_mask_al = train_mask[_kept]
+            test_mask_al  = test_mask[_kept]
+
+            if train_mask_al.sum() < 100:
+                path_scores.append(None)
+                continue
+
+            # Train XGB on training-block rows of the aligned feature matrix
+            X_tr = X_all.iloc[train_mask_al]
+            y_tr = y_all.iloc[train_mask_al]
             models_ens, thresholds, _ = train_xgb_ensemble(
-                X_is, y_is, train_ratio=1.0, **xgb_kwargs
+                X_tr, y_tr, train_ratio=1.0, **xgb_kwargs
             )
-            _, probs_oos = get_predictions_ensemble(models_ens, thresholds, X_oos)
 
-            # Aligned OOS states from the df prepared by prepare_features
-            oos_states_aligned = df_oos_aligned["hmm_state"].values
+            # Predictions on ALL aligned bars
+            _, probs_all = get_predictions_ensemble(models_ens, thresholds, X_all)
+            states_all_al = df_all_aligned["hmm_state"].values
 
-            # Backtest the OOS fold — split_idx=None triggers internal 80/20 split
-            # which gives oos_ prefixed metrics for the last 20% of the fold window
-            fold_result = vectorized_backtest(
-                df_oos_aligned,
-                probs_oos,
-                oos_states_aligned,
+            # Backtest with test_mask — only test-block bars are evaluated
+            path_result = vectorized_backtest(
+                df_all_aligned, probs_all, states_all_al,
                 split_idx=None,
                 account_size=balance,
                 broker=broker,
                 tf=tf,
-                hmm_transmat=model_is.transmat_,
+                hmm_transmat=model_path.transmat_,
+                test_mask=test_mask_al,
             )
 
-            fold_n = fold_result.get("n_trades", 0)
-            _hard_floor = max(MIN_OOS_TRADES_HARD.get(tf.upper(), 10) // 3, 5)
-            if fold_n < _hard_floor:
-                fold_scores.append(None)
-                continue
+            path_n  = path_result.get("n_trades", 0)
+            total_trades += path_n
 
-            rf = min(fold_result.get("recovery_factor", 0.0), 5.0)
-            pf = min(fold_result.get("profit_factor", 1.0), 3.0)
-            sharpe = fold_result.get("sharpe_ratio", 0.0)
-            wr = fold_result.get("win_rate", 0.0)
-            logger.info(
-                "  Fold %s→%s: n=%d WR=%.1f%% Sharpe=%.3f RF=%.2f PF=%.2f",
-                is_end, oos_end or "latest", fold_n, wr * 100, sharpe, rf, pf,
+            rf     = min(path_result.get("recovery_factor", 0.0), 5.0)
+            pf     = min(path_result.get("profit_factor", 1.0), 3.0)
+            sharpe = path_result.get("sharpe_ratio", 0.0)
+            wr     = path_result.get("win_rate", 0.0)
+            logger.debug(
+                "  CPCV path %d/%d: n=%d WR=%.1f%% Sharpe=%.3f RF=%.2f PF=%.2f",
+                path_idx + 1, _n_paths_total(), path_n, wr * 100, sharpe, rf, pf,
             )
-            # Cap at 2.0 — prevents a single anomalous period (e.g. COVID bull run)
-            # from dominating the cross-fold average.  Raw formula can hit 2.2+
-            # when one period has exceptional RF + PF + Sharpe simultaneously.
-            fold_score = min(float(rf * 0.4 + pf * 0.3 + sharpe * 0.3), 2.0)
-            fold_scores.append(fold_score)
+            path_score = min(float(rf * 0.4 + pf * 0.3 + sharpe * 0.3), 2.0)
+            path_scores.append(path_score)
 
         except Exception as exc:
-            logger.warning("Purged TS fold (%s→%s) failed: %s", is_end, oos_end or "latest", exc)
-            fold_scores.append(None)
+            logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
+            path_scores.append(None)
 
-    valid_scores = [s for s in fold_scores if s is not None]
-    if len(valid_scores) < 2:
+    valid_scores = [s for s in path_scores if s is not None]
+    n_valid = len(valid_scores)
+
+    if n_valid < 8:
+        logger.warning("CPCV: only %d/%d valid paths — rejecting.", n_valid, len(path_scores))
         return -50.0
 
-    # Hard reject if any evaluated fold is negative — a robust strategy must not
-    # lose money in any of the three tested macro-regime periods.
-    if any(s < 0.0 for s in valid_scores):
+    # Hard trade-count floor across all valid paths
+    _min_total = MIN_TRADES_PER_PATH.get(tf.upper(), 30) * n_valid
+    if total_trades < _min_total:
         logger.warning(
-            "Purged TS: %d fold(s) negative — rejecting (folds: %s)",
-            sum(1 for s in valid_scores if s < 0.0),
-            [f"{s:.3f}" for s in valid_scores],
+            "CPCV: total_trades=%d < min=%d (%d paths) — rejecting.",
+            total_trades, _min_total, n_valid,
         )
         return -50.0
 
-    # Variance-penalised mean: subtract half the population std from the mean.
-    # A strategy that aces one anomalous period (e.g. COVID bull run) but is
-    # mediocre in others scores lower than one that performs consistently across
-    # all three folds.  This prevents single-period outliers from winning the study.
-    _n_v   = len(valid_scores)
-    _mean_v = sum(valid_scores) / _n_v
-    _std_v  = (sum((s - _mean_v) ** 2 for s in valid_scores) / _n_v) ** 0.5
-    mean_score = float(_mean_v - 0.5 * _std_v)
+    # Variance-penalised median (more robust to single-path outliers than mean)
+    _med   = float(np.median(valid_scores))
+    _std   = float(np.std(valid_scores))
+    score  = _med - 0.5 * _std
 
-    # Walk-Forward Efficiency: recent fold performance relative to first fold.
-    # Rewards models that hold up in the most recent macro-regime.
-    first = fold_scores[0]
-    last = next((s for s in reversed(fold_scores) if s is not None), None)
-    if first is not None and first > 0.01 and last is not None:
-        wfe = last / first
-    else:
-        wfe = 0.5  # neutral when first fold is zero or absent
+    # Trade-frequency penalty (progressive, not binary) — steers Optuna toward
+    # configs that trade actively across all regimes.
+    _ideal_total = MIN_TRADES_PER_PATH.get(tf.upper(), 30) * 2 * n_valid
+    trade_penalty = min(1.0, total_trades / max(_ideal_total, 1))
+    score *= trade_penalty
 
-    if wfe >= 0.60:
-        wfe_mult = 1.10
-    elif wfe >= 0.40:
-        wfe_mult = 1.00
-    elif wfe >= 0.20:
-        wfe_mult = 0.80
-    else:
-        return -50.0
-
-    # Consistency bonus: all folds show meaningful positive performance (> 0.30).
-    # Threshold raised from > 0.0 — ensures a single barely-passing fold doesn't
-    # silently collect the bonus when the other folds are carrying the strategy.
+    # Consistency bonus when every valid path is meaningfully positive
     if all(s > 0.30 for s in valid_scores):
-        mean_score *= 1.05
+        score *= 1.05
 
     logger.info(
-        "Purged TS folds: %s  WFE=%.2f (×%.2f)  mean_score=%.3f",
-        [f"{s:.3f}" if s is not None else "skip" for s in fold_scores],
-        wfe, wfe_mult, mean_score * wfe_mult,
+        "CPCV [%s]: %d/%d paths valid | trades=%d | median=%.3f std=%.3f | score=%.3f",
+        tf, n_valid, len(path_scores), total_trades, _med, _std, score,
     )
-    return mean_score * wfe_mult
+    return score
+
+
+def _n_paths_total() -> int:
+    """C(CPCV_N_BLOCKS, CPCV_K_TEST) — total number of CPCV paths."""
+    from math import comb
+    return comb(CPCV_N_BLOCKS, CPCV_K_TEST)
 
 
 def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = "H1") -> float:
@@ -260,8 +312,7 @@ def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = 
     return score
 
 
-def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1",
-                   split_method: str = "static"):
+def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
     """Return an Optuna objective function for the given account / TF context."""
     tier = _get_tier(balance)
 
@@ -346,201 +397,20 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 obs_cov=obs_cov, trans_cov=trans_cov, save=False, tf=tf
             )
 
-            # ── Purged 3-Fold TS path ─────────────────────────────────────────
-            if split_method == "purged_ts":
-                _xgb_kw = dict(
-                    max_depth=max_depth, learning_rate=learning_rate,
-                    n_estimators=n_estimators, subsample=subsample,
-                    colsample_bytree=colsample_bytree,
-                    min_child_weight=min_child_weight,
-                    gamma=gamma, reg_alpha=reg_alpha,
-                )
-                score = compute_purged_ts_score(
-                    df, balance, broker, tf, n_states, _xgb_kw,
-                )
-                logger.info(
-                    "Trial %d [%s/%s purged_ts]: score=%.3f",
-                    trial.number, tf, broker, score,
-                )
-                return score
-
-            _hmm, states, _ = fit_hmm(df, n_states=n_states, tf=tf)
-
-            # ── HMM quality gate ─────────────────────────────────────────────
-            # Reject trials where any state has low self-transition probability.
-            # Persistence < 0.65 means the state flips very frequently (e.g.
-            # Bull↔Chop oscillating with identical means, 49K+ transitions).
-            # Threshold relaxed from 0.72 → 0.65 so the HMM can react faster
-            # to new directional data while still blocking degenerate configs.
-            _min_persist = min(_hmm.transmat_[i, i] for i in range(n_states))
-            if _min_persist < 0.65:
-                logger.warning(
-                    "Trial %d: degenerate HMM (min state persistence=%.4f < 0.65) "
-                    "— penalising.",
-                    trial.number, _min_persist,
-                )
-                return -100.0
-
-            # Spike-catcher Bull guard: one state with vol >> all others passes
-            # the persistence check (self-transition=0.9500 > 0.80) but captures
-            # only extreme outlier bars, leaving the other states mislabelled.
-            # Pattern: max_vol/median_vol > 10 (e.g. 0.030731 / 0.000480 = 64).
-            _vols = sorted(
-                _hmm.covars_[i][0, 0] ** 0.5 for i in range(n_states)
-            )
-            _vol_ratio = _vols[-1] / _vols[len(_vols) // 2]  # max / median
-            if _vol_ratio > 10:
-                logger.warning(
-                    "Trial %d: degenerate HMM (max/median vol ratio=%.1f > 10) "
-                    "— spike-catcher state detected, penalising.",
-                    trial.number, _vol_ratio,
-                )
-                return -100.0
-
-            X, y, df_aligned, _    = prepare_features(df, states, tf=tf)
-            _train_ratio = {"H1": 0.70, "M15": 0.65, "M5": 0.65}.get(tf.upper(), 0.70)
-            models, thresholds, metrics = train_xgb_ensemble(
-                X, y,
-                train_ratio=_train_ratio,
-                max_depth=max_depth,
-                learning_rate=learning_rate,
-                n_estimators=n_estimators,
-                subsample=subsample,
+            # ── CPCV: 15-path combinatorial purged cross-validation ────────────
+            _xgb_kw = dict(
+                max_depth=max_depth, learning_rate=learning_rate,
+                n_estimators=n_estimators, subsample=subsample,
                 colsample_bytree=colsample_bytree,
                 min_child_weight=min_child_weight,
-                gamma=gamma,
-                reg_alpha=reg_alpha,
+                gamma=gamma, reg_alpha=reg_alpha,
             )
-            _, probabilities = get_predictions_ensemble(models, thresholds, X)
-
-            # Compute IS regime statistics for Z-Score signal calibration
-            split_idx = metrics.get("split_idx")
-            X_is      = X.iloc[:split_idx] if split_idx else X
-            states_aligned = states[df.index.isin(df_aligned.index)]
-
-            result = vectorized_backtest(
-                df_aligned, probabilities, states_aligned,
-                split_idx=split_idx,
-                account_size=balance,
-                broker=broker,
-                tf=tf,
-                hmm_transmat=_hmm.transmat_,
-            )
-
-            # Score on OOS only to prevent IS data leakage
-            if split_idx and "oos_sharpe_ratio" in result:
-                oos_n   = result.get("oos_n_trades", 0)
-                oos_fdd = result.get("oos_floating_max_drawdown",
-                                     result.get("oos_max_drawdown", 0.0))
-
-                # Absolute hard floor — statistically meaningless trials with too few
-                # OOS trades produce artefact RF/PF ratios (e.g. 8 trades → RF=20)
-                # that permanently bias the surrogate toward "tiny trade" configs.
-                # Return -50.0 (not -10.0) so these trials are clearly dead in the
-                # surrogate's landscape rather than marginally below average.
-                _hard_floor = MIN_OOS_TRADES_HARD.get(tf.upper(), 10)
-                if oos_n < _hard_floor:
-                    return -50.0
-
-                # Safety floor — 20% floating DD is terminal for a $15 account
-                if oos_fdd > MAX_FLOAT_DD:
-                    logger.warning(
-                        "Trial %d: safety floor (OOS floating DD=%.3f > %.0f%%)",
-                        trial.number, oos_fdd, MAX_FLOAT_DD * 100,
-                    )
-                    return -50.0
-
-                oos_result = {
-                    "total_return":          result.get("oos_total_return", 0.0),
-                    "floating_max_drawdown": oos_fdd,
-                    "sharpe_ratio":          result.get("oos_sharpe_ratio", 0.0),
-                    "profit_factor":         result.get("oos_profit_factor", 1.0),
-                    "expected_payoff":       result.get("oos_expected_payoff", 0.0),
-                    "return_consistency":    result.get("oos_return_consistency", 0.0),
-                }
-                score = _score_result(oos_result, tier, broker, tf)
-
-                # H1 Drawdown Guard: a 5% floating DD on an hourly model
-                # typically means a runaway multi-day trend against a Mean
-                # Reversion position — a structural failure, not just noise.
-                # Half the score to strongly bias Optuna toward low-DD H1 solutions.
-                if tf.upper() == "H1" and oos_fdd > 0.05:
-                    score *= 0.5
-
-                # Progressive trade penalty — low-count solutions score at 10%
-                # so Optuna learns to explore higher-density regions without
-                # the hard cliff of a return -10.0 that poisons the surrogate.
-                tf_floor = TF_MIN_OOS_TRADES.get(tf.upper(), 60)
-                if oos_n < tf_floor:
-                    score *= 0.1
-
-                # Payoff floor — any trial whose average dollar edge < $0.035 per
-                # trade (3.5c on a $15 cent account) gets a 90% penalty.  Trades
-                # that don't move enough to cover spread are noise, not alpha.
-                oos_payoff_usd = oos_result["expected_payoff"] * balance
-                if oos_payoff_usd < PAYOFF_FLOOR_USD:
-                    score *= 0.1
-
-                # Activity Bonus (M5 only) — penalise solutions that "hide"
-                # drawdown by barely trading, and reward genuinely high-frequency
-                # configs that prove robustness across many market opportunities.
-                # < 150 trades: extra 50% cut on top of the progressive 10% penalty.
-                # > 300 trades: 20% bonus — pushes Optuna toward the M5 "heartbeat".
-                if tf.upper() == "M5":
-                    if oos_n < 150:
-                        score *= 0.5
-                    elif oos_n > 300:
-                        score *= 1.2
-
-                # IS/OOS Sharpe ratio constraint — discard trials where the model
-                # generalises poorly (IS Sharpe >> OOS Sharpe).  A ratio < 0.35
-                # means the model fitted IS noise; the edge evaporates in OOS.
-                # Only applied when IS Sharpe is meaningfully positive (> 0.1) to
-                # avoid false-positive rejections on flat IS periods.
-                is_sharpe  = result.get("is_sharpe_ratio",  result.get("sharpe_ratio", 0.0))
-                oos_sharpe = result.get("oos_sharpe_ratio", 0.0)
-                if is_sharpe > 0.1:
-                    generalization_ratio = oos_sharpe / is_sharpe
-                    if generalization_ratio < 0.35:
-                        logger.warning(
-                            "Trial %d: IS/OOS Sharpe ratio=%.2f < 0.35 "
-                            "(IS=%.3f OOS=%.3f) — overfitting, penalising.",
-                            trial.number, generalization_ratio, is_sharpe, oos_sharpe,
-                        )
-                        return -50.0
-            else:
-                score = _score_result(result, tier, broker, tf)
-
-            _oos_payoff  = result.get("oos_expected_payoff", result.get("expected_payoff", 0.0))
-            _oos_payout  = format_payout(
-                result.get("oos_total_return", result.get("total_return", 0.0)),
-                balance, broker,
-            )
-            _oos_eff     = result.get("oos_avg_efficiency", result.get("avg_efficiency", 0.0))
+            score = compute_cpcv_score(df, balance, broker, tf, n_states, _xgb_kw)
             logger.info(
-                "Trial %d [%s/%s $%.0f]: score=%.3f  "
-                "RF=%.2f  PF=%.2f  Consist=%.2f  Payoff=$%.4f  Eff=%.2fx  FloatDD=%.1f%%  "
-                "trades=%d  payout=%s",
-                trial.number, tf, broker, balance,
-                score,
-                result.get("oos_recovery_factor", result.get("recovery_factor", 0)),
-                result.get("oos_profit_factor",   result.get("profit_factor", 1.0)),
-                result.get("oos_return_consistency", result.get("return_consistency", 0.0)),
-                _oos_payoff * balance,
-                _oos_eff,
-                result.get("oos_floating_max_drawdown",
-                           result.get("oos_max_drawdown", result["max_drawdown"])) * 100,
-                result.get("oos_n_trades", result["n_trades"]),
-                _oos_payout,
+                "Trial %d [%s/%s $%.0f CPCV]: score=%.3f",
+                trial.number, tf, broker, balance, score,
             )
-            _oos_mr_n = result.get("oos_mr_trades", 0)
-            if _oos_mr_n > 0:
-                logger.info(
-                    "  MR Trades: %d | MR WR: %.1f%% | MR P&L (log): %.4f",
-                    _oos_mr_n,
-                    result.get("oos_mr_win_rate", 0.0) * 100,
-                    result.get("oos_mr_pnl", 0.0),
-                )
+            return score
             return score
 
         except Exception as e:
@@ -646,36 +516,29 @@ def run_optimization(
     broker: str     = "standard",
     tf: str         = "H1",
     n_jobs: int     = 1,
-    split_method: str = "static",
 ) -> optuna.Study:
-    """Run (or resume) an Optuna study and return it when complete.
+    """Run (or resume) an Optuna study using CPCV and return it when complete.
 
-    The SQLite study.db persists every completed trial to disk.  If the run
-    is interrupted at any point (Ctrl+C, crash, power cut), simply re-run the
-    same command — Optuna will load_if_exists=True and pick up exactly where
-    it left off.
-
-    To start fresh: delete  models/study.db  manually.
+    Each trial evaluates C(6,2)=15 train/test path combinations.  The study
+    persists to SQLite so interrupted runs resume safely from where they left off.
 
     Args:
-        n_trials: Additional trials to run THIS session.  Optuna adds them
-                  on top of any already-completed trials in the DB.
-        n_jobs:   Parallel trial workers (Python threads).  Default 1.
-                  XGBoost already uses all CPU cores internally, so n_jobs>2
-                  can cause core contention and actually slow things down.
-                  For true multi-process parallelism, open multiple terminals
-                  and run the same command simultaneously — they all share the
-                  same study.db safely via SQLite locking.
+        n_trials: Total study target.  Optuna adds new trials on top of those
+                  already in the DB — delete models/study_{broker}.db to start fresh.
+        n_jobs:   Parallel trial workers.  Default 1 — XGBoost already uses all
+                  CPU cores, so n_jobs>1 causes core contention.  For true
+                  parallelism, open multiple terminals with the same command.
     """
     tier = _get_tier(balance)
     name = _study_name(broker=broker, tier=tier, tf=tf)
     storage = _study_db(broker)
 
-    # Purged TS uses fewer trials (3× cost per trial) and forces sequential folds
-    if split_method == "purged_ts":
-        if n_trials == 250:  # caller used default — apply TF-specific purged default
-            n_trials = PURGED_TS_TRIALS.get(tf.upper(), 200)
-        n_jobs = INTERNAL_N_JOBS
+    # Apply TF-specific CPCV trial count when caller used the default 250
+    if n_trials == 250:
+        n_trials = CPCV_TRIALS.get(tf.upper(), 80)
+    # Force sequential within each trial — 15 HMM+XGB fits per trial already
+    # saturates CPU cores; parallelism between trials causes contention.
+    n_jobs = 1
 
     os.makedirs("models", exist_ok=True)
 
@@ -717,7 +580,7 @@ def run_optimization(
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     study.optimize(
-        make_objective(balance=balance, broker=broker, tf=tf, split_method=split_method),
+        make_objective(balance=balance, broker=broker, tf=tf),
         n_trials=remaining,
         n_jobs=n_jobs,
         show_progress_bar=(n_jobs == 1),   # tqdm bar misleads with threads

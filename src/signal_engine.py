@@ -118,35 +118,41 @@ class SignalEngine:
         if self.in_trade:
             return None
 
-        effective_prob = (
-            xgb_prob * TCN_BOOST_FACTOR
-            if tcn_multiplier < TCN_BOOST_THRESHOLD
-            else xgb_prob
-        )
+        # xgb_prob = P(next bar UP) from binary XGBoost classifier.
+        # Compute directional probabilities separately so BUY and SELL both
+        # require XGB to AGREE with the intended trade direction.
+        _boost = TCN_BOOST_FACTOR if tcn_multiplier < TCN_BOOST_THRESHOLD else 1.0
+        eff_buy  = min(1.0, xgb_prob * _boost)           # P(UP)  — for BUY entries
+        eff_sell = min(1.0, (1.0 - xgb_prob) * _boost)   # P(DOWN) — for SELL entries
 
         state = regime_info["state"]
         bars = regime_info["bars_in_regime"]
         stability = regime_info["stability"]
 
-        # ── Trend entry: Bull (0) or Bear (1) ─────────────────────────────────
-        if state in (0, 1):
+        # ── Trend entry: Bull (0) → BUY when XGB confirms UP ──────────────────
+        if state == 0:
             if (
                 bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
-                and effective_prob >= ENTRY_PROB.get(self.tf, 0.55)
+                and eff_buy >= ENTRY_PROB.get(self.tf, 0.55)
                 and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
             ):
-                signal = "BUY" if state == 0 else "SELL"
-                return {"signal": signal, "size_multiplier": 1.0}
+                return {"signal": "BUY", "size_multiplier": 1.0}
+
+        # ── Trend entry: Bear (1) → SELL when XGB confirms DOWN ───────────────
+        elif state == 1:
+            if (
+                bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
+                and eff_sell >= ENTRY_PROB.get(self.tf, 0.55)
+                and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
+            ):
+                return {"signal": "SELL", "size_multiplier": 1.0}
 
         # ── Mean-reversion entry: Chop (state >= 2) ───────────────────────────
         elif state >= 2 and bb_position is not None:
-            if (
-                bars >= MIN_CHOP_CONFIRM_BARS.get(self.tf, 2)
-                and effective_prob >= MR_ENTRY_PROB.get(self.tf, 0.52)
-            ):
-                if bb_position < MR_BB_BUY_MAX:
+            if bars >= MIN_CHOP_CONFIRM_BARS.get(self.tf, 2):
+                if bb_position < MR_BB_BUY_MAX and eff_buy >= MR_ENTRY_PROB.get(self.tf, 0.52):
                     return {"signal": "MR_BUY", "size_multiplier": MR_SIZE_MULTIPLIER}
-                elif bb_position > MR_BB_SELL_MIN:
+                elif bb_position > MR_BB_SELL_MIN and eff_sell >= MR_ENTRY_PROB.get(self.tf, 0.52):
                     return {"signal": "MR_SELL", "size_multiplier": MR_SIZE_MULTIPLIER}
 
         return None

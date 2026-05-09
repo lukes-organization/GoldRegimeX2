@@ -345,6 +345,7 @@ def _run_bar_loop(
     account_size: float,
     split_idx,
     return_trades: bool,
+    test_mask=None,
 ) -> tuple:
     """Bar-by-bar SignalEngine loop — replaces vectorised signal generation.
 
@@ -394,6 +395,7 @@ def _run_bar_loop(
 
     for i in range(n):
         regime_info = engine.update_regime(int(states[i]), hmm_transmat)
+        _in_test = test_mask is None or bool(test_mask[i])
 
         if in_trade:
             bars_in_trade += 1
@@ -405,10 +407,15 @@ def _run_bar_loop(
             signals[i]  = direction
             sizes_arr[i] = size_mult
 
+            # Force-close at test block boundary so no trade spans into training bars
+            _force_exit = (
+                test_mask is not None
+                and (i + 1 >= n or not bool(test_mask[i + 1]))
+            )
             exit_now, _ = engine.should_exit(
                 regime_info, cur_pnl, max_fav_pnl, bars_in_trade
             )
-            if exit_now:
+            if exit_now or _force_exit:
                 costs_arr[i]        = spread_cost * size_mult
                 strategy_returns[i] = bar_gross - spread_cost * size_mult
 
@@ -435,23 +442,24 @@ def _run_bar_loop(
                 strategy_returns[i] = bar_gross
 
         else:
-            bb_position = float(bb_pos[i]) if states[i] >= 2 else None
-            entry = engine.should_enter(
-                regime_info,
-                float(probabilities[i]),
-                int(gmm_col[i]),
-                bb_position,
-            )
-            if entry:
-                direction  = 1 if entry["signal"] in ("BUY", "MR_BUY") else -1
-                size_mult  = entry["size_multiplier"]
-                in_trade   = True
-                signals[i] = direction
-                sizes_arr[i] = size_mult
-                trade_entry_i = i
-                engine.on_trade_entered(int(states[i]))
-                costs_arr[i]        = spread_cost * size_mult
-                strategy_returns[i] = -spread_cost * size_mult
+            if _in_test:  # only enter trades during test periods (no-op in training bars)
+                bb_position = float(bb_pos[i]) if states[i] >= 2 else None
+                entry = engine.should_enter(
+                    regime_info,
+                    float(probabilities[i]),
+                    int(gmm_col[i]),
+                    bb_position,
+                )
+                if entry:
+                    direction  = 1 if entry["signal"] in ("BUY", "MR_BUY") else -1
+                    size_mult  = entry["size_multiplier"]
+                    in_trade   = True
+                    signals[i] = direction
+                    sizes_arr[i] = size_mult
+                    trade_entry_i = i
+                    engine.on_trade_entered(int(states[i]))
+                    costs_arr[i]        = spread_cost * size_mult
+                    strategy_returns[i] = -spread_cost * size_mult
 
     return signals, strategy_returns, gross_returns, costs_arr, sizes_arr, trades
 
@@ -471,6 +479,7 @@ def vectorized_backtest(
     use_tiered: bool = False,       # noqa: ARG001 — kept for backward compat
     return_trades: bool = False,
     hmm_transmat=None,
+    test_mask=None,
 ):
     """Bar-by-bar backtest using SignalEngine for entry/exit decisions.
 
@@ -499,6 +508,7 @@ def vectorized_backtest(
         df, probabilities, hmm_states, hmm_transmat,
         tf=tf, broker=broker, account_size=account_size,
         split_idx=split_idx, return_trades=return_trades,
+        test_mask=test_mask,
     )
 
     _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
@@ -520,7 +530,7 @@ def vectorized_backtest(
     # Full-period MR attribution
     result.update(_mr_attribution(signals, hmm_states, strategy_returns))
 
-    if split_idx is not None and 0 < split_idx < len(strategy_returns):
+    if split_idx is not None and 0 < split_idx < len(strategy_returns) and test_mask is None:
         is_m  = _compute_metrics(strategy_returns[:split_idx], signals[:split_idx], tf)
         oos_m = _compute_metrics(strategy_returns[split_idx:], signals[split_idx:], tf)
         # Floating drawdown per IS/OOS slice — df index must be sliced to match
