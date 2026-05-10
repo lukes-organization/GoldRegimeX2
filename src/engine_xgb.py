@@ -315,14 +315,16 @@ def train_xgb_ensemble(
 ) -> tuple[dict, tuple[float, float], dict]:
     """Train three XGBoost classifiers on Low / Med / High ATR volatility subsets.
 
-    Data is split temporally into IS (first ``train_ratio`` fraction) and OOS.
-    ATR percentile thresholds are computed on IS data only to prevent
-    look-ahead bias.  Each bucket model is trained on its IS-subset bars.
+    When train_ratio=1.0 (used by CPCV, which owns the IS/OOS split), the
+    entire X is used as training data and the thresholds are computed on the
+    full set.  No internal OOS evaluation is performed in this mode — all
+    validation is handled externally by the CPCV loop.
 
     Args:
         X:           Feature DataFrame (output of ``prepare_features``).
         y:           Target Series.
         train_ratio: Fraction of data used for IS training (default 0.8).
+                     Pass 1.0 when CPCV owns the split.
         **xgb_kwargs: Forwarded to ``train_xgb`` for each bucket model.
 
     Returns:
@@ -332,8 +334,10 @@ def train_xgb_ensemble(
                      ``vol_thresholds``, and ``feature_cols``.
     """
     split_idx = int(len(X) * train_ratio)
-    X_is = X.iloc[:split_idx]
-    y_is = y.iloc[:split_idx]
+    # When train_ratio=1.0 (CPCV mode), split_idx == len(X) and X_is == X.
+    # This is correct — the caller owns the IS/OOS split.
+    X_is = X.iloc[:split_idx] if split_idx < len(X) else X
+    y_is = y.iloc[:split_idx] if split_idx < len(X) else y
 
     # Thresholds from IS only — no look-ahead into OOS bars
     p33, p66 = compute_vol_thresholds(X_is["atr_normalized"])
@@ -368,7 +372,7 @@ def train_xgb_ensemble(
             pass
 
     metrics = {
-        "split_idx":        split_idx,
+        "split_idx":        split_idx if split_idx < len(X) else None,
         "vol_thresholds":   (p33, p66),
         "feature_cols":     list(X.columns),
         "bucket_sizes":     bucket_sizes,
