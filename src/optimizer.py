@@ -567,7 +567,7 @@ def _run_cpcv(
 
 def _run_wfo(
     df,
-    states: np.ndarray,
+    n_states: int,
     tf: str,
     balance: float,
     broker: str,
@@ -576,19 +576,16 @@ def _run_wfo(
     oos_bars: int,
     embargo_bars: int,
     step_bars: int,
-    hmm_transmat: np.ndarray = None,
 ) -> dict:
     """Rolling Walk-Forward Optimization — evaluate hyperparams across time windows.
 
     For each non-overlapping OOS window (slides by *step_bars* until data runs out):
       1. IS = [start … start+is_bars);  OOS = [start+is_bars+embargo … +oos_bars)
-      2. TimeSeriesSplit(n_splits=2) on IS data for within-IS consistency check.
-      3. Train final XGBoost ensemble on full IS, backtest OOS, score with Complex Criterion.
-      4. Window score = OOS Complex Criterion; penalise if IS CV is inconsistent.
-
-    The HMM is fitted ONCE per trial on the full dataset (passed as *states*)
-    so every window gets coherent regime labels without refitting the HMM
-    per window (which would multiply wall time by the number of windows).
+      2. HMM is fitted on IS data ONLY — prevents any future-bar lookahead.
+      3. IS-fitted HMM applied to OOS bars via predict_states.
+      4. TimeSeriesSplit(n_splits=2) on IS data for within-IS consistency check.
+      5. Train final XGBoost ensemble on full IS, backtest OOS, score with Complex Criterion.
+      6. Window score = OOS Complex Criterion; penalise if IS CV is inconsistent.
 
     Returns dict with keys:
         wfo_score       — variance-penalised median OOS Complex Criterion
@@ -600,9 +597,6 @@ def _run_wfo(
         wfe_ratio       — mean(OOS Sharpe) / mean(IS CV Sharpe) [walk-forward efficiency]
     """
     n = len(df)
-    X_full, y_full, df_aligned, _ = prepare_features(df, states, tf=tf)
-    states_aligned = states[df.index.isin(df_aligned.index)]
-    aligned_idx    = df_aligned.index
 
     window_scores:   list[float] = []
     window_sharpes:  list[float] = []
@@ -617,16 +611,46 @@ def _run_wfo(
         oos_start  = is_end + embargo_bars
         oos_end    = oos_start + oos_bars
 
-        # Map integer positions → timestamps via the full (unfiltered) df index
-        is_ts  = df.index[start:is_end]
-        oos_ts = df.index[oos_start:min(oos_end, n)]
+        df_is_slice  = df.iloc[start:is_end]
+        df_oos_slice = df.iloc[oos_start:min(oos_end, n)]
 
-        if len(oos_ts) < oos_bars // 2:
+        if len(df_oos_slice) < oos_bars // 2:
             break  # not enough OOS bars left
 
-        X_is  = X_full[X_full.index.isin(is_ts)]
-        y_is  = y_full[y_full.index.isin(is_ts)]
-        X_oos = X_full[X_full.index.isin(oos_ts)]
+        # ── Fit HMM on IS data only (no lookahead) ───────────────────────────
+        try:
+            model_is, states_is, _ = fit_hmm(df_is_slice, n_states=n_states, tf=tf)
+        except Exception as exc:
+            logger.debug("WFO window HMM fit failed at start=%d: %s", start, exc)
+            start += step_bars
+            continue
+
+        # Reject degenerate HMMs per window
+        min_persist = min(model_is.transmat_[i, i] for i in range(n_states))
+        if min_persist < 0.65:
+            start += step_bars
+            continue
+
+        # Apply IS HMM to OOS bars
+        try:
+            states_oos = predict_states(model_is, df_oos_slice)
+        except Exception as exc:
+            logger.debug("WFO window OOS state prediction failed: %s", exc)
+            start += step_bars
+            continue
+
+        # Build feature matrices
+        try:
+            X_is, y_is, df_is_aligned, _ = prepare_features(
+                df_is_slice, states_is, tf=tf
+            )
+            X_oos, _, df_oos_aligned, _  = prepare_features(
+                df_oos_slice, states_oos, tf=tf
+            )
+        except Exception as exc:
+            logger.debug("WFO window feature prep failed: %s", exc)
+            start += step_bars
+            continue
 
         if len(X_is) < 500 or len(X_oos) < 50:
             start += step_bars
@@ -646,15 +670,14 @@ def _run_wfo(
                     X_cv_train, y_cv_train, train_ratio=1.0, **xgb_kwargs
                 )
                 _, _probs = get_predictions_ensemble(_models, _thresh, X_cv_val)
-                _val_ts    = X_cv_val.index
-                _val_df    = df_aligned[aligned_idx.isin(_val_ts)]
-                _val_st    = states_aligned[aligned_idx.isin(_val_ts)]
+                _val_df   = df_is_aligned[df_is_aligned.index.isin(X_cv_val.index)]
+                _val_st   = states_is[df_is_slice.index.isin(X_cv_val.index)]
                 if len(_val_df) < 20:
                     continue
                 _cv_res = vectorized_backtest(
                     _val_df, _probs, _val_st,
                     split_idx=None, account_size=balance, broker=broker, tf=tf,
-                    hmm_transmat=hmm_transmat,
+                    hmm_transmat=model_is.transmat_,
                 )
                 _cv_sharpes.append(_cv_res.get("sharpe_ratio", 0.0))
             except Exception:
@@ -675,27 +698,24 @@ def _run_wfo(
 
         _, probs_oos = get_predictions_ensemble(models_w, thresh_w, X_oos)
 
-        oos_df = df_aligned[aligned_idx.isin(oos_ts)]
-        oos_st = states_aligned[aligned_idx.isin(oos_ts)]
-
-        if len(oos_df) < 20 or len(probs_oos) != len(oos_df):
+        if len(df_oos_aligned) < 20 or len(probs_oos) != len(df_oos_aligned):
             start += step_bars
             continue
 
         try:
             oos_result = vectorized_backtest(
-                oos_df, probs_oos, oos_st,
+                df_oos_aligned, probs_oos, states_oos,
                 split_idx=None, account_size=balance, broker=broker, tf=tf,
-                hmm_transmat=hmm_transmat,
+                hmm_transmat=model_is.transmat_,
             )
         except Exception as exc:
             logger.debug("WFO window backtest failed: %s", exc)
             start += step_bars
             continue
 
-        n_trades = oos_result.get("n_trades", 0)
-        fdd      = oos_result.get("floating_max_drawdown",
-                                   oos_result.get("max_drawdown", 0.0))
+        n_trades   = oos_result.get("n_trades", 0)
+        fdd        = oos_result.get("floating_max_drawdown",
+                                    oos_result.get("max_drawdown", 0.0))
         oos_sharpe = oos_result.get("sharpe_ratio", 0.0)
 
         if n_trades < min_trades_hard or fdd > CPCV_MAX_FLOAT_DD:
@@ -703,6 +723,7 @@ def _run_wfo(
         else:
             n_valid_windows += 1
             score = _score_result(oos_result, broker=broker, tf=tf)
+            score = max(score, -1.0)  # floor for valid windows
             # Penalise when IS CV Sharpe is deeply negative (overfit to noise)
             if mean_cv_sharpe < -1.0:
                 score *= 0.5
@@ -728,7 +749,7 @@ def _run_wfo(
             "wfe_ratio":        0.0,
         }
 
-    wfo_score     = float(np.median(window_scores)) - 0.25 * float(np.std(window_scores))
+    wfo_score     = float(np.median(window_scores)) - 0.15 * float(np.std(window_scores))
     std_sharpe    = float(np.std(window_sharpes))
     median_trades = int(np.median(window_trades))
 
@@ -823,8 +844,8 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
         elif tf.upper() == "H1":
             max_depth        = trial.suggest_int("max_depth", 3, 8)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
-            min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.3, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 1, 50)
         else:
             max_depth        = trial.suggest_int("max_depth", 3, 8)
             reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
@@ -833,7 +854,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # learning deep trees without the 0.01 floor cutting off valid configs.
         # H1: n_estimators ceiling raised to 300 — slow learning needs more trees.
         if tf.upper() == "H1":
-            learning_rate = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
+            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
             n_estimators  = trial.suggest_int("n_estimators", 50, 300, step=50)
         elif tf.upper() == "M5":
             learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
@@ -843,7 +864,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             n_estimators  = trial.suggest_int("n_estimators", 100, 500, step=50)
         subsample        = trial.suggest_float("subsample", 0.6, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
-        gamma            = trial.suggest_float("gamma",     0.01, 0.5,  log=True)
+        gamma            = trial.suggest_float("gamma",     1e-6, 0.3,  log=True)
         # scale_pos_weight: handles class imbalance between Bull/Bear/Chop labels.
         # H1 distribution is ~Bull 35%, Bear 30%, Chop 35% — slight imbalance.
         scale_pos_weight = trial.suggest_float("scale_pos_weight", 0.5, 2.0, log=True)
@@ -852,21 +873,6 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             df = process_pipeline(
                 obs_cov=obs_cov, trans_cov=trans_cov, save=False, tf=tf
             )
-
-            # Fit HMM once on the full dataset — CPCV reuses these states
-            # across all XGBoost paths.  One fit per trial (not per path)
-            # reduces wall time from ~15×HMM+XGB to 1×HMM + 10×XGB.
-            model_full, states, _ = fit_hmm(df, n_states=n_states, tf=tf)
-
-            # HMM quality gate — degenerate models cause excessive transitions
-            # and noisy XGBoost targets.  0.65 persistence floor.
-            min_persist = min(model_full.transmat_[i, i] for i in range(n_states))
-            if min_persist < 0.65:
-                logger.debug(
-                    "Trial %d: HMM rejected (min_persist=%.3f < 0.65)",
-                    trial.number, min_persist,
-                )
-                return -100.0
 
             xgb_kwargs = dict(
                 max_depth=max_depth,
@@ -881,9 +887,10 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             )
 
             # ── WFO scoring ───────────────────────────────────────────────
+            # HMM is now fitted per-window inside _run_wfo to prevent lookahead.
             wfo_result = _run_wfo(
                 df=df,
-                states=states,
+                n_states=n_states,
                 tf=tf,
                 balance=balance,
                 broker=broker,
@@ -892,7 +899,6 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 oos_bars=wfo_cfg["oos_bars"],
                 embargo_bars=wfo_cfg["embargo_bars"],
                 step_bars=wfo_cfg["step_bars"],
-                hmm_transmat=model_full.transmat_,
             )
 
             score           = wfo_result["wfo_score"]

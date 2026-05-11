@@ -25,9 +25,10 @@ _CONTINUOUS_COLS = [
 ]
 
 # All optional external-asset feature columns (log returns + synth_vix)
+# US500 and USDJPY removed — consistently 0.0 importance across H1 trials.
 _EXTERNAL_ASSETS = [
     "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
-    "us500_log_return",  "usdjpy_log_return", "synth_vix_zscore",
+    "synth_vix_zscore",
 ]
 
 # LSTM context feature columns added when a trained LSTM context model is present.
@@ -68,7 +69,6 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     - Drops gmm_vol_cluster if not present (old parquet without GMM).
     - Appends any external asset log returns and synth_vix that are present
       and >50% non-null (graceful degradation when masters are absent).
-    - Staleness counters ({asset}_staleness) are appended as integer features.
     """
     cols = []
     for c in FEATURE_COLS:
@@ -80,10 +80,6 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     # External asset log returns + synth_vix (ordered consistently)
     for c in _EXTERNAL_ASSETS:
         if c in df.columns and df[c].notna().mean() > 0.5:
-            cols.append(c)
-    # Staleness counters for any asset that is present (non-negative integers)
-    for c in sorted(df.columns):
-        if c.endswith("_staleness") and c not in cols:
             cols.append(c)
     return cols
 

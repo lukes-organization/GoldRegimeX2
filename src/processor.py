@@ -157,8 +157,6 @@ _EXTERNAL_ASSET_PATHS: dict[str, dict[str, Path]] = {
     "usdchf": _USDCHF_PATH_BY_TF,
     "xagusd": _XAGUSD_PATH_BY_TF,
     "xtiusd": _XTIUSD_PATH_BY_TF,
-    "us500":  _US500_PATH_BY_TF,
-    "usdjpy": _USDJPY_PATH_BY_TF,
 }
 
 TF_CONFIG = {
@@ -531,8 +529,7 @@ def process_pipeline(
         path      = path_by_tf.get(tf, path_by_tf.get("H1"))
         asset_df  = load_asset_data(path, col_name)
         if asset_df is not None:
-            ffilled_series, raw_series = map_asset_to_bars(df.index, asset_df, col_name, return_raw=True)
-            df[f"{asset_key}_staleness"] = _compute_staleness(raw_series, col_name)
+            ffilled_series = map_asset_to_bars(df.index, asset_df, col_name)
             df[col_name] = ffilled_series
             n_valid = df[col_name].notna().sum()
             logger.info(
@@ -546,18 +543,17 @@ def process_pipeline(
                 asset_key.upper(), path, col_name,
             )
 
-    # Drop only rows where core features are NaN; preserve rows where external
-    # assets have no history yet (e.g. XTIUSD starts Feb 2017, not Jan 2016).
+    # Backfill external asset columns first so short-history assets (e.g. XTIUSD
+    # starting Feb 2017) don't cause row loss when dropna runs on core columns.
+    _ext_cols = [c for c in df.columns if c.endswith("_log_return")
+                 and c != "log_return"]
+    if _ext_cols:
+        df[_ext_cols] = df[_ext_cols].bfill()
+
+    # Drop only rows where core features are NaN.
     _core_cols = ["log_return", "kalman_return", "volatility", "rsi", "rsi_slope",
                   "atr_normalized", "gmm_vol_cluster"]
     df.dropna(subset=[c for c in _core_cols if c in df.columns], inplace=True)
-
-    # Backfill external asset columns so short-history assets don't cause row loss.
-    # bfill() propagates the first available value backward to fill pre-history rows.
-    _ext_cols = [c for c in df.columns
-                 if c.endswith("_log_return") or c.endswith("_staleness")]
-    if _ext_cols:
-        df[_ext_cols] = df[_ext_cols].bfill()
 
     # ── Synthetic VIX (Williams VIX Fix) ────────────────────────────────────
     df["synth_vix_zscore"] = compute_synth_vix(df)
