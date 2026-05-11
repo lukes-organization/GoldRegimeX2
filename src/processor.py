@@ -546,7 +546,18 @@ def process_pipeline(
                 asset_key.upper(), path, col_name,
             )
 
-    df.dropna(inplace=True)
+    # Drop only rows where core features are NaN; preserve rows where external
+    # assets have no history yet (e.g. XTIUSD starts Feb 2017, not Jan 2016).
+    _core_cols = ["log_return", "kalman_return", "volatility", "rsi", "rsi_slope",
+                  "atr_normalized", "gmm_vol_cluster"]
+    df.dropna(subset=[c for c in _core_cols if c in df.columns], inplace=True)
+
+    # Backfill external asset columns so short-history assets don't cause row loss.
+    # bfill() propagates the first available value backward to fill pre-history rows.
+    _ext_cols = [c for c in df.columns
+                 if c.endswith("_log_return") or c.endswith("_staleness")]
+    if _ext_cols:
+        df[_ext_cols] = df[_ext_cols].bfill()
 
     # ── Synthetic VIX (Williams VIX Fix) ────────────────────────────────────
     df["synth_vix_zscore"] = compute_synth_vix(df)
