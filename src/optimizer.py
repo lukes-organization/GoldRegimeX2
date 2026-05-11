@@ -702,9 +702,13 @@ def _run_wfo(
             start += step_bars
             continue
 
+        # Align states to df_oos_aligned index (prepare_features drops first/last row)
+        oos_mask = df_oos_slice.index.isin(df_oos_aligned.index)
+        states_oos_al = states_oos[oos_mask]
+
         try:
             oos_result = vectorized_backtest(
-                df_oos_aligned, probs_oos, states_oos,
+                df_oos_aligned, probs_oos, states_oos_al,
                 split_idx=None, account_size=balance, broker=broker, tf=tf,
                 hmm_transmat=model_is.transmat_,
             )
