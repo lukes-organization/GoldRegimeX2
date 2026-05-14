@@ -47,11 +47,18 @@ def _sort_states(model: GaussianHMM, raw_states: np.ndarray, n_states: int):
         }
         state_names = STATE_NAMES_3
     else:
-        remap = {int(sorted_idx[i]): i for i in range(n_states)}
-        remap[int(sorted_idx[0])] = 1   # Bear
-        remap[int(sorted_idx[-1])] = 0  # Bull
-        for j in range(1, n_states - 1):
-            remap[int(sorted_idx[j])] = j + 1
+        # Bull = highest kalman_return, Bear = lowest.
+        # For the two middle states, sort by volatility (col 1) so Chop_Low
+        # always maps to the lower-vol state and Chop_High to the higher-vol
+        # one.  Sorting middles by return alone caused them to swap labels
+        # across IS windows — the root cause of OOS regime inconsistency.
+        middle_orig   = [int(sorted_idx[j]) for j in range(1, n_states - 1)]
+        middle_by_vol = sorted(middle_orig, key=lambda s: model.means_[s, 1])
+        remap = {}
+        remap[int(sorted_idx[0])]  = 1  # Bear       (lowest return)
+        remap[int(sorted_idx[-1])] = 0  # Bull       (highest return)
+        remap[middle_by_vol[0]]    = 2  # Chop_Low   (lower vol)
+        remap[middle_by_vol[1]]    = 3  # Chop_High  (higher vol)
         state_names = STATE_NAMES_4
 
     remapped = np.array([remap[s] for s in raw_states])
@@ -207,9 +214,13 @@ def predict_states(model: GaussianHMM, df: pd.DataFrame) -> np.ndarray:
     elif n == 3:
         remap = {int(sorted_idx[0]): 1, int(sorted_idx[1]): 2, int(sorted_idx[2]): 0}
     else:
+        # Mirror the vol-based Chop ordering used in _sort_states so the
+        # IS-fitted label assignment is reproduced exactly on OOS bars.
+        middle_orig   = [int(sorted_idx[j]) for j in range(1, n - 1)]
+        middle_by_vol = sorted(middle_orig, key=lambda s: model.means_[s, 1])
         remap = {int(sorted_idx[0]): 1, int(sorted_idx[-1]): 0}
-        for j in range(1, n - 1):
-            remap[int(sorted_idx[j])] = j + 1
+        remap[middle_by_vol[0]] = 2  # Chop_Low  (lower vol)
+        remap[middle_by_vol[1]] = 3  # Chop_High (higher vol)
     return np.array([remap.get(s, s) for s in raw])
 
 

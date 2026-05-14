@@ -62,6 +62,9 @@ WFO_PARAMS_FAST = {
 # Bars per calendar day per TF
 BARS_PER_DAY = {"H1": 24, "M15": 96, "M5": 288}
 
+# Bars per calendar year per TF (for Calmar annualisation)
+BARS_PER_YEAR = {"H1": 8760, "M15": 35040, "M5": 105120}
+
 # IS window as fraction of (IS + OOS) bars — used for config hash
 IS_OOS_SPLIT = {
     tf: round(WFO_PARAMS[tf]["is_bars"] / (WFO_PARAMS[tf]["is_bars"] + WFO_PARAMS[tf]["oos_bars"]), 4)
@@ -172,32 +175,43 @@ def _make_inner_cv_splits(X: pd.DataFrame, n_splits: int):
     return list(TimeSeriesSplit(n_splits=n_splits).split(X))
 
 
-def _score_from_backtest(result: dict, tf: str = "H1", account_size: float = 15.0) -> float:
-    """Compute Complex Criterion score from a vectorized_backtest result dict.
+def _score_from_backtest(
+    result:       dict,
+    tf:           str   = "H1",
+    account_size: float = 15.0,
+    n_bars:       int   = 2160,
+) -> float:
+    """Compute Calmar-dominant composite score from a vectorized_backtest result dict.
 
-    Formula:
-        RF_c × 0.35  +  Sharpe_c × 0.35  +  (PF−1)_c × 0.20  +  Edge_c × 0.10
+    Formula (industry-aligned):
+        Calmar_c × 0.45  +  Sharpe_c × 0.35  +  (PF−1)_c × 0.15  +  Edge_c × 0.05
         + consistency_bonus (M5/M15 only, max +0.30)
 
+    Calmar = Annualised Return / Max Floating DD.  Annualisation makes the reward
+    proportional to the deployment horizon rather than the raw OOS window return,
+    which avoids favouring parameter sets that got lucky in a long OOS slice.
     All components are symmetrically clamped to prevent single-metric dominance.
     """
-    net_profit  = result.get("total_return", 0.0)
-    floating_dd = result.get("floating_max_drawdown", result.get("max_drawdown", 0.0))
-    sharpe      = result.get("sharpe_ratio", 0.0)
-    pf          = result.get("profit_factor", 1.0)
-    avg_payoff  = result.get("expected_payoff", result.get("avg_trade_pnl", 0.0))
+    total_return = result.get("total_return", 0.0)
+    floating_dd  = result.get("floating_max_drawdown", result.get("max_drawdown", 0.0))
+    sharpe       = result.get("sharpe_ratio", 0.0)
+    pf           = result.get("profit_factor", 1.0)
+    avg_payoff   = result.get("expected_payoff", result.get("avg_trade_pnl", 0.0))
 
+    # Annualise the OOS return so Calmar is comparable across window lengths
+    bpy        = BARS_PER_YEAR.get(tf.upper(), 8760)
+    ann_return = total_return * (bpy / max(n_bars, 1))
     if floating_dd <= 0:
-        rf = 5.0 if net_profit > 0 else 0.0
+        calmar = 5.0 if ann_return > 0 else 0.0
     else:
-        rf = net_profit / floating_dd
+        calmar = ann_return / floating_dd
 
-    rf_c     = float(np.clip(rf, -5.0, 5.0))
+    calmar_c = float(np.clip(calmar, -5.0, 5.0))
     sharpe_c = float(np.clip(sharpe, -3.0, 3.0))
     pf_norm  = float(np.clip(pf - 1.0, -2.0, 2.0))
     edge_c   = float(np.clip(avg_payoff / max(PAYOFF_FLOOR_USD, 1e-9), 0.0, 2.0))
 
-    score = rf_c * 0.35 + sharpe_c * 0.35 + pf_norm * 0.20 + edge_c * 0.10
+    score = calmar_c * 0.45 + sharpe_c * 0.35 + pf_norm * 0.15 + edge_c * 0.05
 
     if tf.upper() in ("M5", "M15"):
         consistency = result.get("return_consistency", 0.0)
@@ -263,16 +277,18 @@ def _run_single_window(
     broker:     str,
     xgb_kwargs: dict,
     n_cv_folds: int = 2,
+    oos_bars:   int = 2160,
 ) -> dict:
     """Fit HMM+XGBoost on IS, evaluate on OOS, return per-window metrics.
 
     Returns dict with keys:
-        ok, error, oos_score, oos_sharpe, oos_n_trades, oos_fdd, is_cv_sharpe
+        ok, error, oos_score, oos_sharpe, oos_n_trades, oos_fdd, is_cv_sharpe,
+        hmm_zeroed
     """
     def _fail(msg):
         return {"ok": False, "error": msg, "oos_score": -50.0,
                 "oos_sharpe": -10.0, "oos_n_trades": 0, "oos_fdd": 1.0,
-                "is_cv_sharpe": 0.0}
+                "is_cv_sharpe": 0.0, "hmm_zeroed": False}
 
     try:
         model_is, states_is, _ = fit_hmm(df_is, n_states=n_states, tf=tf)
@@ -330,9 +346,14 @@ def _run_single_window(
     mean_cv_sharpe = float(np.mean(cv_sharpes)) if cv_sharpes else 0.0
 
     try:
-        models_w, thresh_w, _ = train_xgb_ensemble(X_is, y_is, train_ratio=1.0, **xgb_kwargs)
+        models_w, thresh_w, ens_metrics = train_xgb_ensemble(X_is, y_is, train_ratio=1.0, **xgb_kwargs)
     except Exception as exc:
         return _fail(f"XGB train: {exc}")
+
+    # Detect if XGBoost zeroed out hmm_state — a signal of over-regularisation
+    # that breaks the HMM→XGB regime connection entirely.
+    hmm_state_imp = ens_metrics.get("feature_importance", {}).get("hmm_state", 1.0)
+    hmm_zeroed    = (float(hmm_state_imp) == 0.0)
 
     _, probs_oos = get_predictions_ensemble(models_w, thresh_w, X_oos)
 
@@ -355,8 +376,12 @@ def _run_single_window(
     if n_trades < HARD_TRADE_FLOORS.get(tf.upper(), 10) or oos_fdd > CPCV_MAX_FLOAT_DD:
         oos_score = -50.0
     else:
-        oos_score = _score_from_backtest(oos_result, tf=tf, account_size=balance)
+        oos_score = _score_from_backtest(
+            oos_result, tf=tf, account_size=balance, n_bars=oos_bars
+        )
         oos_score = max(oos_score, -1.0)
+        if hmm_zeroed:
+            oos_score *= 0.5  # XGB ignoring HMM regime = signal quality failure
         if mean_cv_sharpe < -1.0:
             oos_score *= 0.5
 
@@ -368,6 +393,7 @@ def _run_single_window(
         "oos_n_trades": n_trades,
         "oos_fdd":      oos_fdd,
         "is_cv_sharpe": mean_cv_sharpe,
+        "hmm_zeroed":   hmm_zeroed,
     }
 
 
@@ -418,11 +444,12 @@ def _run_wfo(
             balance=balance, broker=broker,
             xgb_kwargs=xgb_kwargs,
             n_cv_folds=n_cv_folds,
+            oos_bars=oos_bars,
         )
 
         # Skip windows that error out before producing any result
         if not win["ok"] and "degenerate" not in (win.get("error") or ""):
-            logger.debug("WFO [%s] window start=%d skipped: %s", tf, start, win.get("error"))
+            logger.warning("WFO [%s] window start=%d skipped: %s", tf, start, win.get("error"))
             start += step_bars
             continue
 
@@ -435,13 +462,17 @@ def _run_wfo(
         window_trades.append(win["oos_n_trades"])
         is_cv_sharpes.append(win["is_cv_sharpe"])
 
-        logger.debug(
+        logger.info(
             "WFO [%s] window start=%d: trades=%d sharpe=%.3f cv_sharpe=%.3f score=%.3f",
             tf, start, win["oos_n_trades"], win["oos_sharpe"], win["is_cv_sharpe"], score,
         )
         start += step_bars
 
     if not window_scores:
+        logger.warning(
+            "WFO [%s]: ALL windows were skipped (no valid results). "
+            "Check for exceptions in XGB training or backtester.", tf,
+        )
         return {
             "wfo_score": -100.0, "n_windows": 0, "n_valid_windows": 0,
             "median_trades": 0, "std_sharpe": 0.0, "window_scores": [], "wfe_ratio": 0.0,
@@ -587,14 +618,19 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             wfe_ratio       = wfo_result["wfe_ratio"]
             window_scores   = wfo_result["window_scores"]
 
-            if n_valid_windows == 0:
-                return -50.0
-
             if n_valid_windows < n_total_windows // 2:
                 score = min(score, -10.0)
 
+            # Penalise high cross-window Sharpe variance (inconsistent model)
             if std_sharpe > 1.0:
-                score -= (std_sharpe - 1.0) * 0.3
+                score -= (std_sharpe - 1.0) * 0.5
+
+            # WFE penalty: negative WFE means OOS Sharpe is the opposite sign
+            # of IS CV Sharpe — classic overfitting.  Cap score harshly.
+            if wfe_ratio < 0:
+                score = min(score, -3.0)
+            elif wfe_ratio < 0.3:
+                score *= 0.6
 
             tf_floor = SOFT_TRADE_FLOORS.get(tf_up, 60)
             if median_trades < tf_floor:
@@ -619,6 +655,10 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
                 std_sharpe, median_trades, wfe_ratio,
                 [round(s, 3) for s in window_scores],
             )
+
+            if n_valid_windows == 0:
+                return -50.0
+
             return score
 
         except Exception as exc:

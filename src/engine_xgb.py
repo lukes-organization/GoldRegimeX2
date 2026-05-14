@@ -145,13 +145,17 @@ def train_xgb(
     min_child_weight: int = 5,
     gamma: float = 1.0,
     reg_alpha: float = 0.1,
+    reg_lambda: float = 1.0,
     colsample_bytree: float = 0.8,
     scale_pos_weight: float = 1.0,
     train_ratio: float = 0.8,
 ):
     split_idx = int(len(X) * train_ratio)
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    has_holdout = split_idx < len(X)
+    X_train = X.iloc[:split_idx] if has_holdout else X
+    y_train = y.iloc[:split_idx] if has_holdout else y
+    X_test  = X.iloc[split_idx:] if has_holdout else None
+    y_test  = y.iloc[split_idx:] if has_holdout else None
 
     model = xgb.XGBClassifier(
         max_depth=max_depth,
@@ -161,6 +165,7 @@ def train_xgb(
         min_child_weight=min_child_weight,
         gamma=gamma,
         reg_alpha=reg_alpha,
+        reg_lambda=reg_lambda,
         colsample_bytree=colsample_bytree,
         scale_pos_weight=scale_pos_weight,
         objective="binary:logistic",
@@ -169,10 +174,13 @@ def train_xgb(
         n_jobs=-1,
         verbosity=0,
     )
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    if has_holdout:
+        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    else:
+        model.fit(X_train, y_train, verbose=False)
 
     train_acc = accuracy_score(y_train, model.predict(X_train))
-    test_acc = accuracy_score(y_test, model.predict(X_test))
+    test_acc  = accuracy_score(y_test, model.predict(X_test)) if has_holdout else train_acc
     importance = dict(zip(list(X.columns), model.feature_importances_))
     if importance.get("hmm_state", 1.0) == 0.0:
         logger.warning(
@@ -376,7 +384,7 @@ def train_xgb_ensemble(
             )
             X_b, y_b = X_is, y_is
 
-        model, _ = train_xgb(X_b, y_b, **xgb_kwargs)
+        model, _ = train_xgb(X_b, y_b, train_ratio=train_ratio, **xgb_kwargs)
         models[bucket] = model
         logger.info("Trained vol-bucket '%s': %d samples.", bucket, len(X_b))
 
