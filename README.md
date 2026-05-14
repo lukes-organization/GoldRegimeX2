@@ -19,6 +19,7 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 11. [TCN Confidence Scorer](#tcn-confidence-scorer)
 12. [Automatic Data Updates & TCN Maintenance](#automatic-data-updates--tcn-maintenance)
 13. [Sensitivity Analysis](#sensitivity-analysis)
+14. [Interactive Research Notebook](#interactive-research-notebook)
 15. [Risk Management](#risk-management)
 16. [Timeframe Configurations](#timeframe-configurations)
 17. [Performance Metrics & Scoring](#performance-metrics--scoring)
@@ -26,9 +27,11 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 19. [Telegram Remote Control](#telegram-remote-control)
 20. [Multi-TF Live Trading](#multi-tf-live-trading)
 21. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
-22. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
-23. [Troubleshooting](#troubleshooting)
-24. [Security Notes](#security-notes)
+22. [Walk-Forward Optimization (WFO)](#walk-forward-optimization-wfo)
+23. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
+24. [Troubleshooting](#troubleshooting)
+25. [Security Notes](#security-notes)
+26. [Changelog](#changelog)
 
 ---
 
@@ -80,8 +83,9 @@ IS / OOS Backtest
       │  Profit Factor, MR attribution, MT5-style equity curve
       │
       ▼
-Complex Criterion Score  =  RF×0.4 + PF×0.3 + Sharpe×0.3
-      │  (+return_consistency×0.5 bonus for M5/M15)
+Complex Criterion Score  =  RF_c×0.35 + Sharpe_c×0.35 + (PF−1)×0.20 + Edge_c×0.10
+      │  (+return_consistency×0.30 bonus cap for M5/M15)
+      │  All terms symmetrically clamped — see Scoring section for details
       │
       ▼
 Live Bridge  →  MT5 Market Orders
@@ -90,7 +94,7 @@ Live Bridge  →  MT5 Market Orders
       │  TF-specific magic numbers: H1=123456, M15=123457, M5=123458
 ```
 
-The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoost hyperparameters, scoring every trial on **OOS Complex Criterion only** using the `SignalEngine` bar-by-bar backtest path. Supports purged 3-fold time-series cross-validation via `--split_method purged_ts`.
+The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoost hyperparameters (including L1 and L2 regularisation), scoring every trial on **OOS Complex Criterion only** using the Rolling Walk-Forward Optimization (`_run_wfo`) with per-window IS cross-validation. Supports purged 3-fold time-series cross-validation via `--split_method purged_ts`. A `"fast"` WFO mode is available for M5/M15 with a shorter 6-month IS window for quicker intraday regime adaptation.
 
 ---
 
@@ -105,7 +109,8 @@ The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoos
 | `src/signal_engine.py` | **Stateful signal engine** — `SignalEngine`; regime-confirmation entry (persistence + XGBoost prob); exit on regime reversal, persistence collapse, profit erosion, or max hold |
 | `src/sensitivity.py` | Z-Score sensitivity analysis — sweeps Bull/Bear cutoffs 1.5–3.0, outputs comparison table + CSV/JSON |
 | `src/backtester.py` | Bar-by-bar backtest via `SignalEngine` — IS/OOS split, broker costs, floating drawdown, MT5 equity curve, MR attribution |
-| `src/optimizer.py` | Optuna study — Complex Criterion scoring, purged 3-fold TS CV (`--split_method purged_ts`), per-broker SQLite resume, RAM guard, Telegram heartbeat |
+| `src/optimizer.py` | Rolling WFO optimizer — per-window IS cross-validation; Revised Complex Criterion scoring; `WFO_PARAMS`, `WFO_PARAMS_FAST`, `CV_FOLDS`; per-broker SQLite resume; RAM guard; Telegram heartbeat |
+| `notebooks/GoldRegimeX_Explorer.ipynb` | Interactive research notebook — equity explorer, WFO window analysis (standard/fast mode), feature/regime explorer, parameter sensitivity with WFO comparison, CV Path Inspector (Section 6) |
 | `src/risk_manager.py` | AdaptiveRiskManager, CentConverter, DailyEquityGate, broker cost configs |
 | `src/visualizer.py` | 6-chart visual report: regime overlay, equity curve, features, transition matrix, dashboard, MT5 balance/equity |
 | `src/mt5_sync.py` | MT5 data downloader |
@@ -770,6 +775,47 @@ The JSON includes `current_z`, `best_z`, and `best_sharpe` for automated compari
 
 ---
 
+## Interactive Research Notebook
+
+`notebooks/GoldRegimeX_Explorer.ipynb` is a fully interactive Jupyter notebook for exploring, tweaking, and diagnosing the system without touching any source files. Run it from the repo root:
+
+```bash
+jupyter notebook notebooks/GoldRegimeX_Explorer.ipynb
+```
+
+### Sections
+
+| Section | Feature | Typical runtime |
+|---------|---------|-----------------|
+| **1 — Data & Model Loader** | Select TF, broker, balance, and **WFO mode** (`standard` / `fast`). Loads processed data, best Optuna params, and trained HMM + XGB models. | ~5 s |
+| **2 — Equity Curve Explorer** | Interactive equity curve with IS/OOS split line, drawdown panel, and full metric table. Re-runs instantly on balance/broker change. | instant |
+| **3 — WFO Window Analysis** | Runs `_run_wfo` using the loaded best params. Plots per-window OOS score bars. Drill into any window's equity curve with the **Window #** slider. Shows **Walk-Forward Efficiency (WFE) interpretation** label. | ~2–3 min |
+| **4 — Feature & Regime Explorer** | Price + HMM regime overlay, regime distribution pie, GMM volatility cluster histogram, feature distributions per regime, XGB feature importance. | instant |
+| **5 — Parameter Sensitivity** | Sliders for `n_states`, `max_depth`, `learning_rate`, `reg_alpha`, **`reg_lambda`**, and **`min_child_weight`**. **Run Comparison** re-trains and shows a side-by-side metric bar chart. **Run WFO Score Comparison** runs proper rolling WFO (not just a full-dataset backtest) on both baseline and modified configs. | ~30–60 s / ~4–8 min WFO |
+| **6 — CV Path Inspector** | Runs either **WFO IS CV** (per-window inner fold scores) or **CPCV** (C(6,2)=15 paths). Displays a per-path boxplot, per-path score bar chart, and a **consistency score** = `n_profitable_paths / total × 100%`. | ~2–5 min |
+
+### WFO Mode (`standard` vs `fast`)
+
+Selected via the **WFO Mode** dropdown in Section 1. Stored in `_CACHE` and used by Sections 3, 5, and 6.
+
+| Mode | IS window | OOS window | Use case |
+|------|-----------|------------|----------|
+| `standard` | H1: 1 yr / M15: 1 yr / M5: 1 yr | H1: 90d / M15: 90d / M5: 90d | Default; thorough evaluation |
+| `fast` | H1: 6 mo / M15: 6 mo / M5: 6 mo | H1: 45d / M15: 45d / M5: 30d | Quicker feedback; suits intraday regime shifts |
+
+### Walk-Forward Efficiency (WFE) Labels
+
+Section 3 automatically labels the WFE ratio after each run:
+
+| WFE | Label |
+|-----|-------|
+| ≥ 0.80 | ✅ Excellent (OOS ≥ 80% of IS CV performance) |
+| ≥ 0.50 | 🟡 Acceptable (OOS ≥ 50% of IS CV performance) |
+| ≥ 0.20 | 🟠 Marginal — consider broader regularization |
+| < 0.20 | 🔴 Poor — strong overfitting signal |
+
+---
+
 ## Risk Management
 
 ### Position Sizing — 1% Risk Rule
@@ -805,10 +851,10 @@ Minimum lot is always **0.01**. All lots rounded to 2 decimal places.
 |-----------|-----|-----|-----|
 | Kalman `obs_cov` default | 0.05 | 4.0 | 1.0 |
 | Bars/day (annualisation) | 288 | 96 | 24 |
-| HMM `n_states` search space | `{2, 4}` only | 3–4 | 3–4 |
+| HMM `n_states` search space | `{4}` only | 3–4 | 3–4 |
 | HMM persistence gate (training) | ≥ 0.65 | ≥ 0.65 | ≥ 0.65 |
 | IS/OOS split | 65% / 35% | 65% / 35% | **70% / 30%** |
-| Min OOS trades (hard floor) | **120** | 30 | 20 |
+| Min OOS trades (hard floor) | **120** | **60** | 20 |
 | Min OOS trades (penalty threshold) | 350 | 140 | 25 |
 | SL ATR multiplier | 1.5× | 2.0× | 2.0× |
 | TP1 multiplier (trend) | 0.8× SL | 1.0× SL | 1.5× SL |
@@ -823,7 +869,7 @@ Minimum lot is always **0.01**. All lots rounded to 2 decimal places.
 | M5 optimisation freshness gate | **120 h** | — | — |
 | Recommended `--trials` | 1000 | 600 | 400 |
 
-> **M5 `n_states` restriction:** n_states=3 is always degenerate for M5 — Bull/Chop collapse to identical means, producing 500K+ HMM transitions. Optimizer uses `{2, 4}` only.
+> **M5 `n_states` restriction:** n_states=3 is always degenerate for M5 — Bull/Chop collapse to identical means, producing 500K+ HMM transitions. n_states=2 has no Chop state and causes counter-trend signals. Optimizer uses `{4}` only.
 >
 > **H1/M15 `n_states` restriction:** n_states=2 is banned — with only Bull/Bear states every bar is signal-eligible, creating excessive counter-trend noise. Minimum is 3.
 
@@ -834,16 +880,40 @@ Minimum lot is always **0.01**. All lots rounded to 2 decimal places.
 ### Complex Criterion Score
 
 ```
-Score = (Recovery Factor × 0.4) + (Profit Factor × 0.3) + (Sharpe Ratio × 0.3)
-      + (return_consistency × 0.5)   ← M5 and M15 only
+Score = clamp(RF, -5, 5) × 0.35
+      + clamp(Sharpe, -3, 3) × 0.35
+      + clamp(PF − 1, -2, 2) × 0.20     ← normalised: breakeven = 0
+      + clamp(avg_payoff / $0.035, 0, 2) × 0.10
+      + [M5/M15 only] return_consistency × 0.30  (cap +0.30)
 ```
 
-| Component | Weight | Measures |
-|-----------|--------|---------|
-| Recovery Factor (RF) | 0.4 | Capital preservation — capped at 5.0 for scoring |
-| Profit Factor (PF) | 0.3 | Trade quality — capped at 3.0 for scoring |
-| Sharpe Ratio | 0.3 | Return smoothness |
-| Return Consistency | +0.5 bonus | Weekly P&L stability (M5/M15 only) |
+**Score range:** approximately −5 to +5. A score > 0.5 is considered a worthwhile configuration.
+
+| Component | Weight | Clamp | Measures |
+|-----------|--------|-------|---------|
+| Recovery Factor (RF) | **0.35** | [−5, 5] | Capital preservation — net profit / floating max DD |
+| Sharpe Ratio | **0.35** | [−3, 3] | Return smoothness — prevents outlier-driven strategies |
+| Profit Factor − 1 (normalised) | **0.20** | [−2, 2] | Trade quality — breakeven = 0, loss-only = −1 |
+| Edge / Spread ratio | **0.10** | [0, 2] | avg payoff vs $0.035 spread proxy |
+| Return Consistency | +0.30 bonus cap | — | Weekly P&L stability (M5/M15 only) |
+
+> **Why the formula changed:**  
+> The previous `RF×0.4 + PF×0.3 + Sharpe×0.3` had three problems:  
+> 1. PF = 1.0 (breakeven) contributed +0.30 — rewarding zero edge.  
+> 2. No floor on Sharpe — a Sharpe of −10 contributed −3.0, swamping RF and PF.  
+> 3. No explicit edge/spread quality term, which matters for small-account sizing.  
+> The new formula normalises PF so breakeven = 0, symmetrically clamps all terms,  
+> and adds a spread-relative edge component.
+
+### WFO Variance Penalty
+
+The final WFO score aggregates per-window scores with an increased variance penalty:
+
+```
+wfo_score = median(window_scores) − 0.20 × std(window_scores)
+```
+
+The 0.20 multiplier (up from 0.15) aligns with the wider score range (−5 to +5) to meaningfully penalise inconsistent strategies.
 
 ### All Reported Metrics
 
@@ -881,7 +951,7 @@ Score = (Recovery Factor × 0.4) + (Profit Factor × 0.3) + (Sharpe Ratio × 0.3
 | Rule | Detail |
 |------|--------|
 | OOS-only scoring | All scoring uses OOS data only — IS is never evaluated in the objective |
-| Complex Criterion | `RF×0.4 + PF×0.3 + Sharpe×0.3` prevents high-Sharpe / deep-DD solutions |
+| Complex Criterion | `RF_c×0.35 + Sharpe_c×0.35 + (PF−1)×0.20 + Edge_c×0.10` — all terms clamped symmetrically |
 | Hard trade floor | OOS trades < hard minimum → score **−50.0** (trial discarded) |
 | Progressive trade penalty | OOS trades below soft threshold → score × 0.1 |
 | Payoff floor | OOS average edge < $0.035 → score × 0.1 |
@@ -890,17 +960,39 @@ Score = (Recovery Factor × 0.4) + (Profit Factor × 0.3) + (Sharpe Ratio × 0.3
 | IS/OOS generalisation | If IS Sharpe > 0.1 and OOS/IS Sharpe < 0.35 → score **−50.0** |
 | HMM persistence gate | Any self-transition < 0.65 → score **−100.0** |
 | M5 activity bonus | OOS trades > 300 → score × 1.2; OOS trades < 150 → score × 0.5 |
-| n_states restriction | M5: `{2, 4}`; H1/M15: `{3, 4}` |
+| n_states restriction | M5: `{4}`; H1/M15: `{3, 4}` |
 | No threshold search | SignalEngine thresholds are hardcoded TF constants — not Optuna parameters |
 | Per-broker study isolation | `study_headway_cent.db` and `study_standard.db` never interfere |
+| Rolling WFO per trial | Every Optuna trial evaluates across all rolling IS/OOS windows — not a single split |
+| IS inner CV | Each WFO window runs TF-dependent inner time-series CV: H1=2 folds, M15=3 folds, M5=4 folds |
+| OOS scaler consistency | OOS features are always scaled with the IS-fitted scaler (no data leakage) |
+| State alignment | `states_oos` and `states_is_cv` are re-aligned to `df_aligned.index` after NaN drops |
+| L2 regularisation | `reg_lambda` is searched for all TFs — XGBoost default of 1.0 is no longer forced |
+| Pruner per TF | M5: `HyperbandPruner` (early-stops expensive trials); H1/M15: `MedianPruner(startup=10, warmup=5)` |
 
-```
+```python
 # Hard trade floors (trials below these return -50.0 immediately):
-MIN_OOS_TRADES_HARD = {"M5": 120, "M15": 30, "H1": 20}
+MIN_OOS_TRADES_HARD = {"M5": 120, "M15": 60, "H1": 20}
 
 # Soft trade floors (trials below these have score × 0.1):
 TF_MIN_OOS_TRADES   = {"M5": 350, "M15": 140, "H1": 25}
+
+# WFO trial budgets (auto-selected when --trials 250 default is used):
+WFO_TRIALS = {"H1": 60, "M15": 100, "M5": 120}
 ```
+
+### Optuna Search Space per Timeframe
+
+| Parameter | H1 | M15 | M5 |
+|-----------|-----|------|-----|
+| `learning_rate` | 0.005 – 0.15 | 0.005 – 0.20 | 0.01 – 0.15 |
+| `n_estimators` | 50 – 400 (step 50) | 100 – 500 (step 50) | 200 – 600 (step 50) |
+| `max_depth` | 3 – 7 | 3 – 7 | 2 – 4 |
+| `min_child_weight` | 5 – 100 | 3 – 30 | 5 – 25 |
+| `reg_alpha` (L1) | 1e-6 – 0.3 | 0.05 – 5.0 | 1.0 – 30.0 |
+| `reg_lambda` (L2) | **0.1 – 10.0** | **0.5 – 15.0** | **1.0 – 30.0** |
+| `subsample` | 0.5 – 0.9 | 0.5 – 0.9 | 0.55 – 0.85 |
+| `colsample_bytree` | 0.4 – 0.9 | 0.5 – 1.0 | 0.4 – 0.8 |
 
 > ⚠️ **Delete the study DB** whenever a fundamental parameter changes (e.g. after adding a new feature, changing n_states search space, or altering the score function). Old trials bias the surrogate model.
 >
@@ -998,6 +1090,78 @@ To use the EA:
 1. `python main.py --mode export --tf H1 --broker headway_cent`
 2. Copy `mql5/GoldRegimeX.mq5` and the `.onnx` file to `MQL5/Experts/`
 3. Compile in MetaEditor (F7) and attach to the XAUUSD chart
+
+---
+
+## Walk-Forward Optimization (WFO)
+
+The Optuna optimizer evaluates every trial using **Rolling Walk-Forward Optimization** (`_run_wfo` in `src/optimizer.py`). This is distinct from the post-training `--mode wfa` diagnostic command.
+
+### How it works
+
+```
+Full dataset (e.g., 10 years of H1 bars)
+  │
+  ├── Window 1: IS=[Y1–Y2]  embargo  OOS=[Y2 Q3+90d]
+  ├── Window 2: IS=[Y1+90d–Y2+90d]  embargo  OOS=[Y2 Q3+180d]
+  ├── Window 3: ...
+  └── Window N
+  │
+  For each window:
+    1. HMM fitted on IS only (no lookahead)
+    2. IS HMM applied to OOS bars via predict_states
+    3. OOS features scaled with IS-fitted scaler (no data leakage)
+    4. Inner IS cross-validation (TF-dependent folds) for consistency check
+    5. Final XGBoost trained on full IS → backtest on OOS
+    6. Window score = Complex Criterion on OOS results
+  │
+  wfo_score = median(window_scores) − 0.20 × std(window_scores)
+```
+
+### WFO Parameters
+
+#### Standard mode (`wfo_mode="standard"`)
+
+| TF | IS window | OOS window | Embargo | Step | Approx. windows (10yr) |
+|----|-----------|------------|---------|------|------------------------|
+| H1 | 8 760 bars (1 yr) | 2 160 bars (90d) | 24 bars | 2 160 | ~23 |
+| M15 | 35 040 bars (1 yr) | 8 640 bars (90d) | 96 bars | 8 640 | ~23 |
+| M5 | 105 120 bars (1 yr) | 25 920 bars (90d) | 288 bars | 25 920 | ~7 |
+
+#### Fast mode (`wfo_mode="fast"`)
+
+A shorter IS window for quicker intraday regime adaptation. Available via the notebook WFO Mode dropdown or by passing `wfo_mode="fast"` to `_run_wfo` / `make_objective`.
+
+| TF | IS window | OOS window | Embargo | Step |
+|----|-----------|------------|---------|------|
+| H1 | 4 380 bars (6 mo) | 1 080 bars (45d) | 24 bars | 1 080 |
+| M15 | 17 520 bars (6 mo) | 4 320 bars (45d) | 96 bars | 4 320 |
+| M5 | 52 560 bars (6 mo) | 8 640 bars (30d) | 288 bars | 8 640 |
+
+### Inner cross-validation folds
+
+Each WFO window runs an inner time-series CV on the IS data to check for intra-IS consistency before accepting the window score. The fold count is TF-dependent:
+
+| TF | Inner CV folds (`CV_FOLDS`) |
+|----|-----------------------------|
+| H1 | 2 |
+| M15 | 3 |
+| M5 | 4 |
+
+A deeply negative mean IS CV Sharpe (< −1.0) halves the window score to penalise IS noise memorisation.
+
+### Walk-Forward Efficiency (WFE)
+
+```
+WFE = mean(OOS Sharpe across windows) / mean(IS CV Sharpe across windows)
+```
+
+| WFE | Interpretation |
+|-----|----------------|
+| ≥ 0.80 | ✅ Excellent — OOS captures ≥ 80% of IS performance |
+| ≥ 0.50 | 🟡 Acceptable — robust enough for live use |
+| ≥ 0.20 | 🟠 Marginal — consider broader regularization |
+| < 0.20 | 🔴 Poor — strong overfitting signal; re-optimise |
 
 ---
 
@@ -1131,3 +1295,74 @@ models/
     ├── M15_headway_cent/  …
     └── M5_headway_cent/   …
 ```
+
+---
+
+## Changelog
+
+### Latest — WFO Bugs, Scoring Formula & Optimizer Overhaul
+
+#### 🐛 Critical Bug Fixes in `_run_wfo` (`src/optimizer.py`)
+
+| # | Bug | Impact | Fix |
+|---|-----|--------|-----|
+| 1 | **OOS feature scaling leakage** — OOS `prepare_features` fitted a fresh scaler on OOS-only data, placing IS and OOS features in different scaling spaces | Silent feature space mismatch; XGBoost sees inconsistent scales between IS training and OOS inference | Capture IS scaler (`scaler_is`) and pass `feature_scaler=scaler_is` to the OOS call |
+| 2 | **`states_oos` length mismatch** — `states_oos` (same length as `df_oos_slice`) passed to `vectorized_backtest` alongside `df_oos_aligned` (shorter after NaN drops) | Silent misalignment: wrong regime states assigned to the wrong OOS bars | Re-align via `states_oos_aligned = states_oos[df_oos_slice.index.isin(df_oos_aligned.index)]` |
+| 3 | **IS CV wrong state indexing** — `_val_st = states_is[df_is_slice.index.isin(X_cv_val.index)]` used the full IS slice as base instead of `df_is_aligned` | Wrong states fed to IS cross-validation backtest; CV Sharpes unreliable | Build `states_is_aligned` once per window (aligned to `df_is_aligned`) and index through it |
+| 4 | **Fixed 2-fold IS CV for all TFs** — a 2-fold split on 105K-bar M5 IS windows produces folds of ~6 months each, giving only one data point for IS consistency | Coarse IS consistency check fails to detect within-IS regime shifts | Add `CV_FOLDS = {"H1": 2, "M15": 3, "M5": 4}` and use `TimeSeriesSplit(n_splits=CV_FOLDS[tf])` |
+
+#### 📐 Revised Scoring Formula (`_score_result`)
+
+| | Old | New |
+|--|-----|-----|
+| Formula | `RF×0.4 + PF×0.3 + Sharpe×0.3` | `RF_c×0.35 + Sharpe_c×0.35 + (PF−1)×0.20 + Edge_c×0.10` |
+| RF clamp | `min(RF, 5.0)` (one-sided) | `clamp(RF, −5, 5)` (symmetric) |
+| PF normalisation | Raw PF (breakeven = +0.30 contribution) | `PF − 1` (breakeven = 0) |
+| Sharpe floor | None (−10 Sharpe → −3.0) | `clamp(Sharpe, −3, 3)` |
+| Edge term | Absent | `clamp(avg_payoff / $0.035, 0, 2) × 0.10` |
+| Consistency bonus cap | +0.50 | +0.30 |
+| WFO variance penalty | `0.15 × std` | `0.20 × std` |
+| CPCV inline formula | `RF×0.4 + PF×0.3 + Sharpe×0.3`, cap=2.0 | `RF×0.35 + Sharpe×0.35 + (PF−1)×0.20`, cap=3.5 |
+
+#### ⚙️ Optuna Search Space Improvements
+
+- **`reg_lambda` (L2 regularisation) added** for all TFs — was completely absent before, forcing XGBoost to use a hard-coded default of 1.0
+- **`WFO_TRIALS` raised ~20%**: H1: 50 → 60, M15: 80 → 100, M5: 100 → 120 (compensates for wider search space)
+- **`MIN_OOS_TRADES_HARD` M15 raised**: 30 → 60 (30 trades / 90-day OOS window is statistically meaningless)
+- **`HyperbandPruner` for M5** (early-stops expensive trials); `MedianPruner(startup=10, warmup=5)` for H1/M15
+- Per-TF hyperparameter range revisions:
+
+| Parameter | Change | Rationale |
+|-----------|--------|-----------|
+| H1 `learning_rate` | 0.01–0.20 → **0.005–0.15** | Lower floor allows slow-learning deep trees |
+| H1 `n_estimators` | 50–300 → **50–400** | Slow lr needs more trees to converge |
+| H1 `max_depth` | 3–8 → **3–7** | Depth-8 on H1 overfits leaf splits |
+| H1 `min_child_weight` | 1–50 → **5–100** | Floor of 5 skips clearly overfit configs |
+| M15 `learning_rate` | 0.01–0.30 → **0.005–0.20** | Wider low end; ceiling reduced |
+| M15 `max_depth` | 3–8 → **3–7** | Same as H1 rationale |
+| M15 `reg_alpha` | 0.01–1.20 → **0.05–5.0** | Previous ceiling was too tight |
+| M15 `min_child_weight` | 1–15 → **3–30** | More representative of M15 bar count |
+| M5 `learning_rate` | 0.01–0.30 → **0.01–0.15** | High lr + shallow trees memorises IS noise |
+| M5 `n_estimators` | 100–500 → **200–600** | Slow lr needs more iterations; floor raised |
+| M5 `max_depth` | 2–3 → **2–4** | Allows depth-4 for 4-state regime fitting |
+| M5 `min_child_weight` | 1–15 → **5–25** | Large bar count requires larger MCW |
+| M5 `subsample` | 0.6–1.0 → **0.55–0.85** | Cap at 0.85 prevents fully-correlated trees |
+
+#### 🆕 New Constants (`src/optimizer.py`)
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `WFO_PARAMS_FAST` | 6-month IS windows | Fast WFO mode for intraday regime detection |
+| `WFO_TRIALS_FAST` | `{"H1": 60, "M15": 100, "M5": 120}` | Companion trial budgets for fast mode |
+| `CV_FOLDS` | `{"H1": 2, "M15": 3, "M5": 4}` | TF-dependent inner CV fold counts |
+| `_N_PATHS` | `_n_paths_total()` precomputed at import | Replaces per-iteration `math.comb` calls |
+| `wfo_mode` param | `"standard"` default | Selects `WFO_PARAMS` or `WFO_PARAMS_FAST` in `_run_wfo` and `make_objective` |
+
+#### 📓 Notebook Additions (`notebooks/GoldRegimeX_Explorer.ipynb`)
+
+| Section | Change |
+|---------|--------|
+| Section 1 | Added `wfo_mode` dropdown (`standard` / `fast`) stored in `_CACHE`; imported `WFO_PARAMS_FAST`, `CV_FOLDS`, `compute_cpcv_score` |
+| Section 3 | Mode-aware WFO config selection; WFE interpretation labels (✅/🟡/🟠/🔴); updated score label `0.15×std` → `0.20×std` |
+| Section 5 | `depth5_w` max raised to 7; added `reg_lambda5_w` (FloatLogSlider) and `min_child_weight5_w` (IntSlider); new **Run WFO Score Comparison** button |
+| Section 6 (new) | CV Path Inspector — CPCV or WFO IS CV, per-path boxplot + bar chart, consistency score |

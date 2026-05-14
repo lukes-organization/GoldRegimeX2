@@ -51,7 +51,7 @@ def _study_db(broker: str) -> str:
 # TF-specific hard floor: trials below these counts return -50.0 immediately.
 # They produce statistically meaningless RF/PF ratios (10 trades → RF=20 by chance)
 # and pollute the surrogate model, biasing future sampling toward "tiny trade" configs.
-MIN_OOS_TRADES_HARD = {"M5": 120, "M15": 30, "H1": 20}
+MIN_OOS_TRADES_HARD = {"M5": 120, "M15": 60, "H1": 20}
 MAX_FLOAT_DD    = 0.20   # 20% floating drawdown hard cap — terminal for $15 account
 CPCV_MAX_FLOAT_DD = 0.20 # 20% cap for CPCV paths (2/5 of data — single volatile chunk can exceed 20%)
 PAYOFF_FLOOR_USD = 0.035 # $0.035 minimum average edge per trade — covers spread + gives real alpha
@@ -72,9 +72,21 @@ WFO_PARAMS = {
     "M15": {"is_bars": 35040,  "oos_bars": 8640,  "embargo_bars": 96,  "step_bars": 8640},
     "M5":  {"is_bars": 105120, "oos_bars": 25920, "embargo_bars": 288, "step_bars": 25920},
 }
+# "Fast" WFO — shorter IS window for quicker intraday regime detection.
+# Useful for M5/M15 where regimes can shift in weeks, not months.
+WFO_PARAMS_FAST = {
+    "H1":  {"is_bars": 4380,  "oos_bars": 1080, "embargo_bars": 24,  "step_bars": 1080},  # 6mo IS / 45d OOS
+    "M15": {"is_bars": 17520, "oos_bars": 4320, "embargo_bars": 96,  "step_bars": 4320},  # 6mo IS / 45d OOS
+    "M5":  {"is_bars": 52560, "oos_bars": 8640, "embargo_bars": 288, "step_bars": 8640},  # 6mo IS / 30d OOS
+}
 # Outer Optuna trial counts for WFO (each trial runs all WFO windows).
-# Lower than CPCV because each WFO trial is computationally heavier.
-WFO_TRIALS = {"H1": 50, "M15": 80, "M5": 100}
+# Raised ~20% vs prior values to compensate for the wider search space (reg_lambda added).
+WFO_TRIALS      = {"H1": 60,  "M15": 100, "M5": 120}
+WFO_TRIALS_FAST = {"H1": 60,  "M15": 100, "M5": 120}
+
+# TF-dependent inner cross-validation fold counts for _run_wfo.
+# More folds for higher-frequency TFs where the IS window is much larger.
+CV_FOLDS = {"H1": 2, "M15": 3, "M5": 4}
 
 # Retained for legacy reference / compare runs — new code uses WFO
 # ── CPCV parameters ──────────────────────────────────────────────────────────
@@ -268,9 +280,9 @@ def compute_cpcv_score(
             wr     = path_result.get("win_rate", 0.0)
             logger.debug(
                 "  CPCV path %d/%d: n=%d WR=%.1f%% Sharpe=%.3f RF=%.2f PF=%.2f",
-                path_idx + 1, _n_paths_total(), path_n, wr * 100, sharpe, rf, pf,
+                path_idx + 1, _N_PATHS, path_n, wr * 100, sharpe, rf, pf,
             )
-            path_score = min(float(rf * 0.4 + pf * 0.3 + sharpe * 0.3), 2.0)
+            path_score = min(float(rf * 0.35 + sharpe * 0.35 + (min(pf, 3.0) - 1.0) * 0.20), 3.5)
             path_scores.append(path_score)
 
         except Exception as exc:
@@ -325,36 +337,57 @@ def _n_paths_total() -> int:
     return comb(CPCV_N_BLOCKS, CPCV_K_TEST)
 
 
+# Pre-computed once at import — avoids repeated math.comb calls in hot loops.
+_N_PATHS = _n_paths_total()
+
+
 def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = "H1") -> float:
-    """Complex Criterion: (RF × 0.4) + (PF × 0.3) + (Sharpe × 0.3) + Consistency bonus (M5/M15).
+    """Revised Composite Score for GoldRegime X.
 
-    RF  = OOS Net Profit / OOS Max Floating Drawdown   (capped at 5)
-    PF  = Gross Profit / |Gross Loss|                  (capped at 3)
+    Formula:
+        score = RF_c × 0.35  +  Sharpe_c × 0.35  +  (PF - 1) × 0.20  +  Edge_c × 0.10
 
-    Weighting rationale:
-    - RF (40 %): primary capital-preservation metric; rewards profit relative to risk
-    - PF (30 %): trade quality; filters inconsistent winners that inflate Sharpe
-    - Sharpe (30 %): risk-adjusted consistency; prevents high-RF/noisy trajectories
-    - Consistency bonus (M5/M15 only, max +0.5): rewards steady week-to-week income
-      over models that owe their RF/PF to 1-2 outlier streaks.  Not applied to H1
-      (swing TF with only 1-2 trades/week — weekly bucketing adds no signal there).
+    Where:
+        RF_c     = clamp(RF, -5, 5)           RF = net_profit / floating_max_dd
+        Sharpe_c = clamp(Sharpe, -3, 3)       standard annualised Sharpe
+        (PF - 1) = clamp(PF - 1, -2, 2)       normalised profit factor (0 = breakeven)
+        Edge_c   = clamp(avg_payoff / spread,  0, 2)  trade quality vs spread cost
+
+    Consistency bonus (M5/M15 only, max +0.30):
+        Rewards strategies with steady weekly income instead of outlier-driven RF/PF.
+        Reduced from +0.50 to +0.30 to avoid swamping the base score.
+
+    Score range approximately −5 to +5 (before bonus).
+    A score > 0.5 is considered a worthwhile configuration.
     """
     net_profit  = result.get("total_return", 0.0)
     floating_dd = result.get("floating_max_drawdown", result.get("max_drawdown", 0.0))
     sharpe      = result.get("sharpe_ratio", 0.0)
     pf          = result.get("profit_factor", 1.0)
+    avg_payoff  = result.get("avg_payoff_usd", result.get("avg_trade_pnl", 0.0))
 
+    # Recovery Factor — capped symmetrically
     if floating_dd <= 0:
         rf = 5.0 if net_profit > 0 else 0.0
     else:
-        rf = min(net_profit / floating_dd, 5.0)   # cap at 5 — max contribution 2.0
-    pf = min(pf, 3.0)                              # cap at 3 — max contribution 0.9
+        rf = net_profit / floating_dd
+    rf_c     = float(np.clip(rf, -5.0, 5.0))
 
-    score = float((rf * 0.4) + (pf * 0.3) + (sharpe * 0.3))
+    # Sharpe — capped to prevent single outlier dominance
+    sharpe_c = float(np.clip(sharpe, -3.0, 3.0))
 
+    # Profit factor normalised (breakeven = 0, loss = negative)
+    pf_norm  = float(np.clip(pf - 1.0, -2.0, 2.0))
+
+    # Edge component: average payoff relative to a $0.035 spread proxy
+    edge_c = float(np.clip(avg_payoff / max(PAYOFF_FLOOR_USD, 1e-9), 0.0, 2.0))
+
+    score = rf_c * 0.35 + sharpe_c * 0.35 + pf_norm * 0.20 + edge_c * 0.10
+
+    # Consistency bonus — M5/M15 only, reduced cap
     if tf.upper() in ("M5", "M15"):
         consistency = result.get("return_consistency", 0.0)
-        score += consistency * 0.5   # max +0.5 for perfectly steady weekly income
+        score += float(np.clip(consistency, 0.0, 1.0)) * 0.30
 
     return score
 
@@ -576,6 +609,7 @@ def _run_wfo(
     oos_bars: int,
     embargo_bars: int,
     step_bars: int,
+    wfo_mode: str = "standard",
 ) -> dict:
     """Rolling Walk-Forward Optimization — evaluate hyperparams across time windows.
 
@@ -583,12 +617,17 @@ def _run_wfo(
       1. IS = [start … start+is_bars);  OOS = [start+is_bars+embargo … +oos_bars)
       2. HMM is fitted on IS data ONLY — prevents any future-bar lookahead.
       3. IS-fitted HMM applied to OOS bars via predict_states.
-      4. TimeSeriesSplit(n_splits=2) on IS data for within-IS consistency check.
+      4. TimeSeriesSplit(n_splits=CV_FOLDS[tf]) on IS data for within-IS consistency check.
       5. Train final XGBoost ensemble on full IS, backtest OOS, score with Complex Criterion.
       6. Window score = OOS Complex Criterion; penalise if IS CV is inconsistent.
 
+    Args:
+        wfo_mode: ``"standard"`` (default) uses WFO_PARAMS; ``"fast"`` uses WFO_PARAMS_FAST.
+                  The caller is responsible for passing the correct is_bars/oos_bars/etc.,
+                  but the mode string is stored in the return dict for diagnostics.
+
     Returns dict with keys:
-        wfo_score       — variance-penalised median OOS Complex Criterion
+        wfo_score       — median OOS Complex Criterion − 0.20 × std (variance-penalised)
         n_windows       — total windows attempted
         n_valid_windows — windows with enough OOS trades (not penalised)
         median_trades   — median OOS trade count
@@ -639,13 +678,13 @@ def _run_wfo(
             start += step_bars
             continue
 
-        # Build feature matrices
+        # Build feature matrices — OOS uses IS-fitted scaler to stay in same space
         try:
-            X_is, y_is, df_is_aligned, _ = prepare_features(
+            X_is, y_is, df_is_aligned, scaler_is = prepare_features(
                 df_is_slice, states_is, tf=tf
             )
             X_oos, _, df_oos_aligned, _  = prepare_features(
-                df_oos_slice, states_oos, tf=tf
+                df_oos_slice, states_oos, feature_scaler=scaler_is, tf=tf
             )
         except Exception as exc:
             logger.debug("WFO window feature prep failed: %s", exc)
@@ -656,8 +695,17 @@ def _run_wfo(
             start += step_bars
             continue
 
-        # ── Inner IS cross-validation (2 folds) for consistency check ────────
-        tscv = TimeSeriesSplit(n_splits=2)
+        # Align IS states to the rows kept after prepare_features (Bug 3 fix)
+        _kept_is      = df_is_slice.index.isin(df_is_aligned.index)
+        states_is_aligned = states_is[_kept_is]  # same length as df_is_aligned / X_is
+
+        # Align OOS states to the rows kept after prepare_features (Bug 2 fix)
+        _kept_oos         = df_oos_slice.index.isin(df_oos_aligned.index)
+        states_oos_aligned = states_oos[_kept_oos]  # same length as df_oos_aligned
+
+        # ── Inner IS cross-validation (TF-dependent folds) for consistency check
+        n_cv_folds = CV_FOLDS.get(tf.upper(), 2)
+        tscv = TimeSeriesSplit(n_splits=n_cv_folds)
         _cv_sharpes: list[float] = []
         for _train_idx, _val_idx in tscv.split(X_is):
             X_cv_train = X_is.iloc[_train_idx]
@@ -671,7 +719,8 @@ def _run_wfo(
                 )
                 _, _probs = get_predictions_ensemble(_models, _thresh, X_cv_val)
                 _val_df   = df_is_aligned[df_is_aligned.index.isin(X_cv_val.index)]
-                _val_st   = states_is[df_is_slice.index.isin(X_cv_val.index)]
+                # Use states_is_aligned (aligned to df_is_aligned) for correct indexing
+                _val_st   = states_is_aligned[df_is_aligned.index.isin(X_cv_val.index)]
                 if len(_val_df) < 20:
                     continue
                 _cv_res = vectorized_backtest(
@@ -702,13 +751,9 @@ def _run_wfo(
             start += step_bars
             continue
 
-        # Align states to df_oos_aligned index (prepare_features drops first/last row)
-        oos_mask = df_oos_slice.index.isin(df_oos_aligned.index)
-        states_oos_al = states_oos[oos_mask]
-
         try:
             oos_result = vectorized_backtest(
-                df_oos_aligned, probs_oos, states_oos_al,
+                df_oos_aligned, probs_oos, states_oos_aligned,
                 split_idx=None, account_size=balance, broker=broker, tf=tf,
                 hmm_transmat=model_is.transmat_,
             )
@@ -753,7 +798,7 @@ def _run_wfo(
             "wfe_ratio":        0.0,
         }
 
-    wfo_score     = float(np.median(window_scores)) - 0.15 * float(np.std(window_scores))
+    wfo_score     = float(np.median(window_scores)) - 0.20 * float(np.std(window_scores))
     std_sharpe    = float(np.std(window_sharpes))
     median_trades = int(np.median(window_trades))
 
@@ -784,10 +829,12 @@ def _run_wfo(
     }
 
 
-def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
+def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1",
+                   wfo_mode: str = "standard"):
     """Return an Optuna objective function for the given account / TF context."""
     tier    = _get_tier(balance)
-    wfo_cfg = WFO_PARAMS.get(tf.upper(), WFO_PARAMS["H1"])
+    _wfo_map = WFO_PARAMS_FAST if wfo_mode == "fast" else WFO_PARAMS
+    wfo_cfg = _wfo_map.get(tf.upper(), WFO_PARAMS["H1"])
 
     def objective(trial: optuna.Trial) -> float:
         # obs_cov controls Kalman filter responsiveness (lower = trusts measurements
@@ -837,37 +884,54 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             n_states = trial.suggest_categorical("n_states", [4])
         else:
             n_states   = trial.suggest_int("n_states", 3, 4)
-        # M5 uses shallower trees (2-3) to prevent IS memorisation across the
-        # large bar count; heavier L1 reg (1-20) to sparsify feature weights.
-        # H1/M15: max_depth extended to [3,8] — best trial was hitting the old
-        # ceiling of 6, indicating Optuna needs headroom to explore 7-8.
-        # H1 n_estimators raised to [50,300] to match the lower learning_rate floor.
+        # M5 uses shallow trees (depth 2–4) to prevent IS memorisation across the
+        # very large bar count (~105K bars IS); min_child_weight≥5 prevents tiny
+        # leaf splits on noisy micro-regime boundaries; heavier L1/L2 reg to
+        # sparsify feature weights.  Allowing depth-4 gives Optuna room to fit
+        # 4-state regimes without forcing under-capacity at depth-3.
+        # H1/M15: max_depth ceiling lowered to 7 (was 8) — depth-8 trees on H1/M15
+        # consistently overfit leaf splits with the available bar counts.
+        # H1 min_child_weight floor raised to 5: H1 has fewer samples per node
+        # (fewer bars overall) so small MCW values produce trivially overfit leaves.
         if tf.upper() == "M5":
-            max_depth        = trial.suggest_int("max_depth", 2, 3)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1.0, 20.0, log=True)
-            min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
+            max_depth        = trial.suggest_int("max_depth", 2, 4)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1.0, 30.0, log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 1.0, 30.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
         elif tf.upper() == "H1":
-            max_depth        = trial.suggest_int("max_depth", 3, 8)
+            max_depth        = trial.suggest_int("max_depth", 3, 7)
             reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.3, log=True)
-            min_child_weight = trial.suggest_int("min_child_weight", 1, 50)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.1, 10.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 5, 100)
         else:
-            max_depth        = trial.suggest_int("max_depth", 3, 8)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
-            min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
-        # H1: learning_rate floor lowered to 0.005 so Optuna can explore slow-
-        # learning deep trees without the 0.01 floor cutting off valid configs.
-        # H1: n_estimators ceiling raised to 300 — slow learning needs more trees.
+            max_depth        = trial.suggest_int("max_depth", 3, 7)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.05, 5.0, log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 15.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 3, 30)
+        # H1: learning_rate floor lowered to 0.005 and ceiling to 0.15 so Optuna
+        # can explore slow-learning deep trees; n_estimators ceiling raised to 400
+        # to give slow-lr configs enough trees to converge.
+        # M15: ceiling reduced to 0.20 — high lr + shallow trees memorise IS noise.
+        # M5: ceiling reduced to 0.15 and floor raised to 200 estimators — slow lr
+        # needs more iterations to converge; high lr on M5's large dataset overfits.
         if tf.upper() == "H1":
-            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
-            n_estimators  = trial.suggest_int("n_estimators", 50, 300, step=50)
+            learning_rate = trial.suggest_float("learning_rate", 0.005, 0.15, log=True)
+            n_estimators  = trial.suggest_int("n_estimators", 50, 400, step=50)
         elif tf.upper() == "M5":
-            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
-            n_estimators  = trial.suggest_int("n_estimators", 100, 500, step=50)
+            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
+            n_estimators  = trial.suggest_int("n_estimators", 200, 600, step=50)
         else:
-            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
+            learning_rate = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
             n_estimators  = trial.suggest_int("n_estimators", 100, 500, step=50)
-        subsample        = trial.suggest_float("subsample", 0.6, 1.0)
-        colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
+        if tf.upper() == "M5":
+            subsample        = trial.suggest_float("subsample", 0.55, 0.85)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.8)
+        elif tf.upper() == "H1":
+            subsample        = trial.suggest_float("subsample", 0.5, 0.9)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.9)
+        else:
+            subsample        = trial.suggest_float("subsample", 0.5, 0.9)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
         gamma            = trial.suggest_float("gamma",     1e-6, 0.3,  log=True)
         # scale_pos_weight: handles class imbalance between Bull/Bear/Chop labels.
         # H1 distribution is ~Bull 35%, Bear 30%, Chop 35% — slight imbalance.
@@ -887,6 +951,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 min_child_weight=min_child_weight,
                 gamma=gamma,
                 reg_alpha=reg_alpha,
+                reg_lambda=reg_lambda,
                 scale_pos_weight=scale_pos_weight,
             )
 
@@ -903,6 +968,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 oos_bars=wfo_cfg["oos_bars"],
                 embargo_bars=wfo_cfg["embargo_bars"],
                 step_bars=wfo_cfg["step_bars"],
+                wfo_mode=wfo_mode,
             )
 
             score           = wfo_result["wfo_score"]
@@ -1077,12 +1143,17 @@ def run_optimization(
 
     os.makedirs("models", exist_ok=True)
 
+    if tf.upper() == "M5":
+        pruner = optuna.pruners.HyperbandPruner(min_resource=3, max_resource=9, reduction_factor=3)
+    else:
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5)
+
     study = optuna.create_study(
         study_name=name,
         storage=storage,
         direction="maximize",
         load_if_exists=True,       # crash-safe resume
-        pruner=optuna.pruners.MedianPruner(),
+        pruner=pruner,
     )
 
     already_done = len([
@@ -1159,7 +1230,7 @@ def run_optimization(
         f"<b>Optimization 100% Complete!</b>\n"
         f"Study: <code>{name}</code>\n"
         f"Trials: <b>{total_done}</b>\n"
-        f"Best Score (RF×Sharpe): <b>{best:.3f}</b>\n"
+        f"Best Score (RF×0.35+Sharpe×0.35+PF-1×0.20+Edge×0.10): <b>{best:.3f}</b>\n"
         + "\n".join(
             f"  <code>{k}</code>: {v}"
             for k, v in study.best_params.items()
