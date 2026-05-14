@@ -1366,3 +1366,33 @@ models/
 | Section 3 | Mode-aware WFO config selection; WFE interpretation labels (✅/🟡/🟠/🔴); updated score label `0.15×std` → `0.20×std` |
 | Section 5 | `depth5_w` max raised to 7; added `reg_lambda5_w` (FloatLogSlider) and `min_child_weight5_w` (IntSlider); new **Run WFO Score Comparison** button |
 | Section 6 (new) | CV Path Inspector — CPCV or WFO IS CV, per-path boxplot + bar chart, consistency score |
+
+---
+
+### Notebook Merge Conflict Resolution & API Fix
+
+#### 🐛 Notebook JSON Was Invalid (Committed Merge Conflicts)
+
+The notebook file (`notebooks/GoldRegimeX_Explorer.ipynb`) was committed with 5 unresolved git merge conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), making it invalid JSON that could not be opened or executed in Jupyter.
+
+**Conflicts resolved:**
+
+| Conflict | Cell | Resolution |
+|----------|------|------------|
+| 1 | `cell01` imports | Kept HEAD ensemble API (`load_xgb_ensemble`, `get_predictions_ensemble`) + added OTHER's `WFO_PARAMS_FAST`, `CV_FOLDS`, `compute_cpcv_score` to optimizer import |
+| 2 | `cell03` Section 1 loader | Took OTHER — adds `wfo_mode_w` dropdown and stores `wfo_mode` in `_CACHE` |
+| 3 | `cell07` Section 3 WFO | Took OTHER — uses `WFO_PARAMS_FAST`, WFE interpretation labels, updated `0.20×std` label |
+| 4 | `cell11` Section 5 start | Took OTHER — adds `reg_lambda5_w`, `min_child_weight5_w`, `run_wfo5_btn`, `_run_wfo5_comparison` |
+| 5 | `cell11` Section 5/6 body | Took OTHER — full `_run_cv_inspector` with CPCV and WFO IS CV support |
+
+#### 🔧 Notebook Ensemble API Fix
+
+Sections 1 (`cell03`), 5 (`cell11`) were updated to use the correct vol-bucketed ensemble API throughout, matching the optimizer and training pipeline:
+
+| Old (single-model) | New (ensemble) |
+|--------------------|----------------|
+| `load_xgb(path)` → `(model, metrics)` | `load_xgb_ensemble(path)` → `(models, thresholds, metrics)` |
+| `train_xgb(X, y, **kws)` → `(model, metrics)` | `train_xgb_ensemble(X, y, **kws)` → `(models, thresholds, metrics)` |
+| `get_predictions(model, X)` → `(preds, probs)` | `get_predictions_ensemble(models, thresholds, X)` → `(preds, probs)` |
+
+Without this fix, the notebook's loaded probabilities came from a single global XGBoost model instead of the three vol-bucket models used by the optimizer and live trader, making Section 2 equity curves and Section 3 WFO scores inconsistent with production results.
