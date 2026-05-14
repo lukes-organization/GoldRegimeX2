@@ -194,25 +194,14 @@ def train_xgb(
         model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
         X_eval, y_eval = X_test, y_test
     else:
-        # Full IS mode (train_ratio=1.0): carve last 15% as early-stopping guard.
-        # Time-ordered split so the guard fold represents "near-future" signal
-        # quality, preventing the model from memorising the IS data.
-        es_idx = int(len(X_train) * 0.85)
-        if es_idx > 30:
-            model.fit(
-                X_train.iloc[:es_idx], y_train.iloc[:es_idx],
-                eval_set=[(X_train.iloc[es_idx:], y_train.iloc[es_idx:])],
-                verbose=False,
-            )
-            X_train = X_train.iloc[:es_idx]
-            y_train = y_train.iloc[:es_idx]
-            X_eval  = X.iloc[es_idx:]
-            y_eval  = y.iloc[es_idx:]
-        else:
-            # Not enough rows for a meaningful guard fold — fall back to no ES
-            model.set_params(early_stopping_rounds=None)
-            model.fit(X_train, y_train, verbose=False)
-            X_eval, y_eval = X_train, y_train
+        # Full IS mode (train_ratio=1.0): train on 100% of the window.
+        # Do NOT carve out an artificial 15% guard fold — that forces the model to
+        # specialise on the last market regime in the IS window, which ruins
+        # generalisation for the upcoming OOS window.  Rely on Optuna-tuned
+        # max_depth and min_child_weight for regularisation instead.
+        model.set_params(early_stopping_rounds=None)
+        model.fit(X_train, y_train, verbose=False)
+        X_eval, y_eval = X_train, y_train
 
     train_acc = accuracy_score(y_train, model.predict(X_train))
     test_acc  = accuracy_score(y_eval, model.predict(X_eval))

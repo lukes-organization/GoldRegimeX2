@@ -23,7 +23,6 @@ from itertools import combinations
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.model_selection import TimeSeriesSplit
 
 from src.processor import kalman_smooth
 from src.engine_hmm import fit_hmm, predict_states
@@ -45,7 +44,7 @@ except ImportError:
     logger.debug("psutil not installed — RAM guard disabled.")
 
 # ── Versioning ─────────────────────────────────────────────────────────────────
-OPTIMIZER_VERSION = "3.5"  # bump when search space or scoring formula changes
+OPTIMIZER_VERSION = "3.6"  # bump when search space or scoring formula changes
 
 # ── Rolling WFO window sizes (bars) ───────────────────────────────────────────
 WFO_PARAMS = {
@@ -100,8 +99,8 @@ SEARCH_SPACES = {
         "trans_cov":         (0.001, 0.03, "log"),
         "n_states":          (3,     4,    "int"),
         "max_depth":         (3,     7,    "int"),
-        "reg_alpha":         (1e-6,  0.3,  "log"),
-        "reg_lambda":        (0.1,   10.0, "log"),
+        "reg_alpha":         (1e-6,  0.5,  "log"),
+        "reg_lambda":        (0.1,   2.0,  "log"),
         "min_child_weight":  (5,     100,  "int"),
         "learning_rate":     (0.005, 0.15, "log"),
         "n_estimators":      (50,    400,  "int"),
@@ -115,8 +114,8 @@ SEARCH_SPACES = {
         "trans_cov":         (0.001, 0.03, "log"),
         "n_states":          (4,     4,    "cat"),
         "max_depth":         (3,     7,    "int"),
-        "reg_alpha":         (0.05,  5.0,  "log"),
-        "reg_lambda":        (0.5,   15.0, "log"),
+        "reg_alpha":         (0.05,  2.0,  "log"),
+        "reg_lambda":        (0.5,   5.0,  "log"),
         "min_child_weight":  (3,     30,   "int"),
         "learning_rate":     (0.005, 0.2,  "log"),
         "n_estimators":      (100,   500,  "int"),
@@ -130,8 +129,8 @@ SEARCH_SPACES = {
         "trans_cov":         (0.001, 0.1,  "log"),
         "n_states":          (4,     4,    "cat"),
         "max_depth":         (2,     4,    "int"),
-        "reg_alpha":         (1.0,   30.0, "log"),
-        "reg_lambda":        (1.0,   30.0, "log"),
+        "reg_alpha":         (0.5,   5.0,  "log"),
+        "reg_lambda":        (0.5,   10.0, "log"),
         "min_child_weight":  (5,     25,   "int"),
         "learning_rate":     (0.01,  0.15, "log"),
         "n_estimators":      (200,   600,  "int"),
@@ -190,9 +189,35 @@ def _align_hmm_states(model, states: np.ndarray) -> np.ndarray:
     return np.vectorize(remap.get)(states)
 
 
-def _make_inner_cv_splits(X: pd.DataFrame, n_splits: int):
-    """Return list of (train_idx, val_idx) from TimeSeriesSplit for inner IS CV."""
-    return list(TimeSeriesSplit(n_splits=n_splits).split(X))
+def _make_purged_inner_cv_splits(
+    X: pd.DataFrame, n_splits: int, embargo_bars: int = 24
+) -> list:
+    """Return list of (train_idx, val_idx) with an embargo gap to prevent leakage.
+
+    Standard TimeSeriesSplit has no embargo period, causing serial-correlation
+    leakage between adjacent train and validation windows.  This splitter inserts
+    a gap of ``embargo_bars`` rows between the end of each training fold and the
+    start of its validation fold.
+    """
+    n = len(X)
+    fold_size = n // (n_splits + 1)
+    splits = []
+
+    for i in range(1, n_splits + 1):
+        val_start = i * fold_size
+        val_end   = val_start + fold_size if i < n_splits else n
+
+        # Everything before the validation block, minus the embargo gap
+        train_end = max(0, val_start - embargo_bars)
+
+        if train_end < 100:  # skip degenerate folds
+            continue
+
+        train_idx = np.arange(0, train_end)
+        val_idx   = np.arange(val_start, val_end)
+        splits.append((train_idx, val_idx))
+
+    return splits
 
 
 def _score_from_backtest(
@@ -340,9 +365,10 @@ def _run_single_window(
     states_is_al  = states_is[df_is.index.isin(df_is_al.index)]
     states_oos_al = states_oos[df_oos.index.isin(df_oos_al.index)]
 
-    # Inner IS CV (consistency check)
+    # Inner IS CV (consistency check) — purged splitter to avoid leakage
     cv_sharpes: list = []
-    for _tr, _val in _make_inner_cv_splits(X_is, n_cv_folds):
+    tf_embargo = WFO_PARAMS.get(tf.upper(), WFO_PARAMS["H1"])["embargo_bars"]
+    for _tr, _val in _make_purged_inner_cv_splits(X_is, n_cv_folds, embargo_bars=tf_embargo):
         X_tr, y_tr = X_is.iloc[_tr], y_is.iloc[_tr]
         X_val      = X_is.iloc[_val]
         if len(X_tr) < 200 or len(X_val) < 50:
@@ -593,8 +619,8 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
         # ── XGBoost params ────────────────────────────────────────────────────
         if tf_up == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 4)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1.0, 30.0, log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 1.0, 30.0, log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.5,  5.0,  log=True)  # capped: prevent hmm_state dropout
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 10.0, log=True)  # capped: prevent hmm_state dropout
             min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
             learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 200, 600, step=50)
@@ -602,8 +628,8 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.8)
         elif tf_up == "H1":
             max_depth        = trial.suggest_int("max_depth", 3, 7)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.3,  log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.1, 10.0, log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.5,  log=True)  # capped: prevent hmm_state dropout
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.1,  2.0,  log=True)  # capped: prevent hmm_state dropout
             min_child_weight = trial.suggest_int("min_child_weight", 5, 100)
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 50, 400, step=50)
@@ -611,8 +637,8 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.9)
         else:  # M15
             max_depth        = trial.suggest_int("max_depth", 3, 7)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.05, 5.0,  log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 15.0, log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.05, 2.0,  log=True)  # capped: prevent hmm_state dropout
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.5,  5.0,  log=True)  # capped: prevent hmm_state dropout
             min_child_weight = trial.suggest_int("min_child_weight", 3, 30)
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)
@@ -670,12 +696,15 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             if std_sharpe > 1.0:
                 score -= (std_sharpe - 1.0) * 0.5
 
-            # WFE penalty: negative WFE means OOS Sharpe is the opposite sign
-            # of IS CV Sharpe — classic overfitting.  Cap score harshly.
-            if wfe_ratio < 0:
-                score = min(score, -3.0)
-            elif wfe_ratio < 0.3:
-                score *= 0.6
+            # WFE penalty: penalize models where OOS performance severely diverges
+            # from the purged IS CV performance.  The thresholds are relaxed vs the
+            # old TimeSeriesSplit-based IS Sharpe, which was inflated by leakage.
+            if wfe_ratio < -0.5:
+                score = min(score, -1.0)
+            elif wfe_ratio < 0.0:
+                score *= 0.5
+            elif wfe_ratio < 0.2:
+                score *= 0.8
 
             tf_floor = SOFT_TRADE_FLOORS.get(tf_up, 60)
             if median_trades < tf_floor:
