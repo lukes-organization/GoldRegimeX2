@@ -31,7 +31,6 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 23. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
 24. [Troubleshooting](#troubleshooting)
 25. [Security Notes](#security-notes)
-26. [Changelog](#changelog)
 
 ---
 
@@ -55,11 +54,14 @@ GMM Volatility Cluster  →  quiet / normal / volatile label
       │
       ▼
 XGBoost Three-Model Volatility Ensemble
-      │  Features (V4, up to 6):
+      │  Base features (always):
       │    [hmm_state, gmm_vol_cluster, rsi_slope,
-      │     atr_normalized, prev_log_return, usdchf_log_return*]
+      │     atr_normalized, prev_log_return]
+      │  External features (optional, added when masters exist):
+      │    usdchf_log_return, xagusd_log_return,
+      │    xtiusd_log_return, synth_vix_zscore*
       │  Low / Med / High ATR bucket → separate XGBoost model
-      │  * optional: requires data/processed/USDCHF_master.csv
+      │  * synth_vix_zscore is computed from price (no CSV needed)
       │
       ▼
       ▼
@@ -104,10 +106,10 @@ The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoos
 |------|---------|
 | `src/processor.py` | Kalman filter, log returns, RSI, ATR, GMM vol cluster, per-TF config |
 | `src/engine_hmm.py` | GaussianHMM with k-means prior init; TF persistence boost |
-| `src/engine_xgb.py` | XGBoost volatility ensemble; `compute_regime_stats()` for metadata; ONNX export |
-| `src/engine_tcn.py` | **TCN confidence scorer** — `SignalConfidenceTCN`, dilated causal Conv1D, `load_tcn_classifier()`, `get_tcn_dir()`; outputs multiplier used by SignalEngine |
-| `src/signal_engine.py` | **Stateful signal engine** — `SignalEngine`; regime-confirmation entry (persistence + XGBoost prob); exit on regime reversal, persistence collapse, profit erosion, or max hold |
-| `src/sensitivity.py` | Z-Score sensitivity analysis — sweeps Bull/Bear cutoffs 1.5–3.0, outputs comparison table + CSV/JSON |
+| `src/engine_xgb.py` | XGBoost volatility ensemble; three vol-bucket models (Low/Med/High ATR); `compute_regime_stats()` for metadata; ONNX export |
+| `src/engine_tcn.py` | **TCN confidence scorer** — `SignalConfidenceTCN`, 4× dilated causal Conv1D, `load_tcn_classifier()`, `get_tcn_dir()`; outputs multiplier [0.7, 1.3] used by `SignalEngine` |
+| `src/signal_engine.py` | **Stateful signal engine** — `SignalEngine`; regime-confirmation entry (persistence + XGBoost prob + BB confluence); exit on regime reversal, persistence collapse, profit erosion, or max hold |
+| `src/sensitivity.py` | Z-Score sensitivity sweep — Bull/Bear cutoffs 1.5–3.0σ; outputs ranked table + `reports/sensitivity_<TF>_<broker>.csv/json` |
 | `src/backtester.py` | Bar-by-bar backtest via `SignalEngine` — IS/OOS split, broker costs, floating drawdown, MT5 equity curve, MR attribution |
 | `src/optimizer.py` | Rolling WFO optimizer — per-window IS cross-validation; Revised Complex Criterion scoring; `WFO_PARAMS`, `WFO_PARAMS_FAST`, `CV_FOLDS`; per-broker SQLite resume; RAM guard; Telegram heartbeat |
 | `notebooks/GoldRegimeX_Explorer.ipynb` | Interactive research notebook — equity explorer, WFO window analysis (standard/fast mode), feature/regime explorer, parameter sensitivity with WFO comparison, CV Path Inspector (Section 6) |
@@ -211,21 +213,25 @@ Export historical OHLCV CSVs from MetaTrader5 (History Center — F2 → XAUUSD 
 2. View → Symbols (`Ctrl+U`) → XAUUSD → Bars tab → Request (repeat until start year is reached)
 3. Export Bars → save as `.csv`
 
-### USDCHF — USD strength feature (optional, recommended)
+### External Asset Features (optional, recommended)
 
-USDCHF is an intraday DXY proxy. Export from MT5 and consolidate:
+The processor enriches each XAUUSD bar with cross-asset log returns. Export each asset from MT5 and run `--mode consolidate` to build the master files.
 
-| Trading TF | Source file | Master produced |
-|------------|-------------|-----------------|
-| H1  | `data/raw/USDCHF_H1.csv` | `data/processed/USDCHF_master.csv` |
-| M15 | `data/raw/USDCHF_M15_*.csv` | `data/processed/USDCHF_master_M15.csv` |
-| M5  | `data/raw/USDCHF_M5_*.csv` | `data/processed/USDCHF_master_M5.csv` |
+| Asset | Role | Source files (`data/raw/`) | Master produced |
+|-------|------|---------------------------|-----------------|
+| USDCHF | Intraday DXY proxy (~0.85 correlation) | `USDCHF_H1.csv` / `USDCHF_M15_*.csv` / `USDCHF_M5_*.csv` | `USDCHF_master[_M15/_M5].csv` |
+| XAGUSD | Silver — cross-commodity regime signal | `XAGUSD_H1.csv` / `XAGUSD_M15_*.csv` / `XAGUSD_M5_*.csv` | `XAGUSD_master[_M15/_M5].csv` |
+| XTIUSD | WTI crude — macro risk-on/off signal | `XTIUSD_H1.csv` / `XTIUSD_M15_*.csv` / `XTIUSD_M5_*.csv` | `XTIUSD_master[_M15/_M5].csv` |
+| US500 | S&P 500 — equity/gold correlation | `US500_H1.csv` / `US500_M15_*.csv` / `US500_M5_*.csv` | `US500_master[_M15/_M5].csv` |
+| USDJPY | JPY safe-haven proxy | `USDJPY_H1.csv` / `USDJPY_M15_*.csv` / `USDJPY_M5_*.csv` | `USDJPY_master[_M15/_M5].csv` |
+
+All masters live in `data/processed/`. The `synth_vix_zscore` feature (Williams VIX Fix) is computed directly from XAUUSD price — no external file needed.
 
 ```bash
 python main.py --mode consolidate
 ```
 
-TFs without a source file degrade gracefully to the 5-feature model.
+The pipeline degrades gracefully: any asset whose master file is absent is simply omitted from the feature set. XGBoost's `get_feature_cols()` only includes a column when it is >50% non-null.
 
 ---
 
@@ -309,11 +315,11 @@ The model saves to `models/tcn/H1_headway_cent/`. Subsequent `--mode live` runs 
 python main.py --mode sync_validate --tf H1 --broker headway_cent --balance 15 --period 6m
 ```
 
-| Status | Sharpe | Action |
-|--------|--------|--------|
-| **PASS** | ≥ 0.8 | Proceed |
-| **WARN** | 0.5–0.8 | Proceed with caution or re-optimise |
-| **FAIL** | < 0.5 | Re-optimise + retrain before going live |
+| Status | H1 Sharpe | M15 Sharpe | M5 Sharpe | Action |
+|--------|-----------|------------|-----------|--------|
+| **PASS** | ≥ 0.25 | ≥ 0.50 | ≥ 0.70 | Proceed |
+| **WARN** | 0.05–0.25 | 0.20–0.50 | 0.40–0.70 | Proceed with caution or re-optimise |
+| **FAIL** | < 0.05 | < 0.20 | < 0.40 | Re-optimise + retrain before going live |
 
 FAIL exits with code 1 and blocks the live script.
 
@@ -620,7 +626,7 @@ Input (100 bars, 8 features)
 
 **Causal padding** ensures no future bar data leaks into the prediction. Each dilation doubles the receptive field without extra parameters.
 
-Input features: `log_return`, `volatility`, `rsi_normalized`, `atr_normalized`, `volume_ratio`, `bb_position`, `gmm_vol_cluster`, `dist_from_sma50`.
+Input features: `log_return`, `kalman_return`, `volatility`, `rsi`, `rsi_slope`, `atr_normalized`, `gmm_vol_cluster`, `usdchf_log_return`.
 
 ### Confidence multiplier mapping
 
@@ -649,16 +655,14 @@ calibrated = sigmoid(logit / T)
 
 ### Training targets
 
-The TCN is trained on a **profit-based binary target**, not regime state labels:
+The TCN is trained on a **regime-persistence target**, not price direction or profit:
 
-| Current HMM state | Next bar condition | Target |
-|-------------------|--------------------|--------|
-| Bull (0) | next log-return > 0 | 1 |
-| Bull (0) | next log-return ≤ 0 | 0 |
-| Bear (1) | next log-return < 0 | 1 |
-| Bear (1) | next log-return ≥ 0 | 0 |
-| Chop (2+) | `|next return|` < 0.003 | 1 |
-| Chop (2+) | `|next return|` ≥ 0.003 | 0 |
+| Target | Condition |
+|--------|-----------|
+| **1** (confident) | HMM regime at `current_bar + forward_window` is the **same** as the regime at `current_bar` — the regime is stable and the signal can be trusted |
+| **0** (uncertain) | HMM regime has **changed** by `current_bar + forward_window` — the signal should be treated cautiously |
+
+The forward window is TF-dependent: H1 = 5 bars (~5 hours), M15 = 12 bars (~3 hours), M5 = 24 bars (~2 hours). A high-confidence prediction (target→1) lowers the multiplier below 0.85, boosting entry probability in the `SignalEngine`.
 
 ### Training commands
 
@@ -896,14 +900,6 @@ Score = clamp(RF, -5, 5) × 0.35
 | Profit Factor − 1 (normalised) | **0.20** | [−2, 2] | Trade quality — breakeven = 0, loss-only = −1 |
 | Edge / Spread ratio | **0.10** | [0, 2] | avg payoff vs $0.035 spread proxy |
 | Return Consistency | +0.30 bonus cap | — | Weekly P&L stability (M5/M15 only) |
-
-> **Why the formula changed:**  
-> The previous `RF×0.4 + PF×0.3 + Sharpe×0.3` had three problems:  
-> 1. PF = 1.0 (breakeven) contributed +0.30 — rewarding zero edge.  
-> 2. No floor on Sharpe — a Sharpe of −10 contributed −3.0, swamping RF and PF.  
-> 3. No explicit edge/spread quality term, which matters for small-account sizing.  
-> The new formula normalises PF so breakeven = 0, symmetrically clamps all terms,  
-> and adds a spread-relative edge component.
 
 ### WFO Variance Penalty
 
@@ -1295,104 +1291,5 @@ models/
     ├── M15_headway_cent/  …
     └── M5_headway_cent/   …
 ```
-
----
-
-## Changelog
-
-### Latest — WFO Bugs, Scoring Formula & Optimizer Overhaul
-
-#### 🐛 Critical Bug Fixes in `_run_wfo` (`src/optimizer.py`)
-
-| # | Bug | Impact | Fix |
-|---|-----|--------|-----|
-| 1 | **OOS feature scaling leakage** — OOS `prepare_features` fitted a fresh scaler on OOS-only data, placing IS and OOS features in different scaling spaces | Silent feature space mismatch; XGBoost sees inconsistent scales between IS training and OOS inference | Capture IS scaler (`scaler_is`) and pass `feature_scaler=scaler_is` to the OOS call |
-| 2 | **`states_oos` length mismatch** — `states_oos` (same length as `df_oos_slice`) passed to `vectorized_backtest` alongside `df_oos_aligned` (shorter after NaN drops) | Silent misalignment: wrong regime states assigned to the wrong OOS bars | Re-align via `states_oos_aligned = states_oos[df_oos_slice.index.isin(df_oos_aligned.index)]` |
-| 3 | **IS CV wrong state indexing** — `_val_st = states_is[df_is_slice.index.isin(X_cv_val.index)]` used the full IS slice as base instead of `df_is_aligned` | Wrong states fed to IS cross-validation backtest; CV Sharpes unreliable | Build `states_is_aligned` once per window (aligned to `df_is_aligned`) and index through it |
-| 4 | **Fixed 2-fold IS CV for all TFs** — a 2-fold split on 105K-bar M5 IS windows produces folds of ~6 months each, giving only one data point for IS consistency | Coarse IS consistency check fails to detect within-IS regime shifts | Add `CV_FOLDS = {"H1": 2, "M15": 3, "M5": 4}` and use `TimeSeriesSplit(n_splits=CV_FOLDS[tf])` |
-
-#### 📐 Revised Scoring Formula (`_score_result`)
-
-| | Old | New |
-|--|-----|-----|
-| Formula | `RF×0.4 + PF×0.3 + Sharpe×0.3` | `RF_c×0.35 + Sharpe_c×0.35 + (PF−1)×0.20 + Edge_c×0.10` |
-| RF clamp | `min(RF, 5.0)` (one-sided) | `clamp(RF, −5, 5)` (symmetric) |
-| PF normalisation | Raw PF (breakeven = +0.30 contribution) | `PF − 1` (breakeven = 0) |
-| Sharpe floor | None (−10 Sharpe → −3.0) | `clamp(Sharpe, −3, 3)` |
-| Edge term | Absent | `clamp(avg_payoff / $0.035, 0, 2) × 0.10` |
-| Consistency bonus cap | +0.50 | +0.30 |
-| WFO variance penalty | `0.15 × std` | `0.20 × std` |
-| CPCV inline formula | `RF×0.4 + PF×0.3 + Sharpe×0.3`, cap=2.0 | `RF×0.35 + Sharpe×0.35 + (PF−1)×0.20`, cap=3.5 |
-
-#### ⚙️ Optuna Search Space Improvements
-
-- **`reg_lambda` (L2 regularisation) added** for all TFs — was completely absent before, forcing XGBoost to use a hard-coded default of 1.0
-- **`WFO_TRIALS` raised ~20%**: H1: 50 → 60, M15: 80 → 100, M5: 100 → 120 (compensates for wider search space)
-- **`MIN_OOS_TRADES_HARD` M15 raised**: 30 → 60 (30 trades / 90-day OOS window is statistically meaningless)
-- **`HyperbandPruner` for M5** (early-stops expensive trials); `MedianPruner(startup=10, warmup=5)` for H1/M15
-- Per-TF hyperparameter range revisions:
-
-| Parameter | Change | Rationale |
-|-----------|--------|-----------|
-| H1 `learning_rate` | 0.01–0.20 → **0.005–0.15** | Lower floor allows slow-learning deep trees |
-| H1 `n_estimators` | 50–300 → **50–400** | Slow lr needs more trees to converge |
-| H1 `max_depth` | 3–8 → **3–7** | Depth-8 on H1 overfits leaf splits |
-| H1 `min_child_weight` | 1–50 → **5–100** | Floor of 5 skips clearly overfit configs |
-| M15 `learning_rate` | 0.01–0.30 → **0.005–0.20** | Wider low end; ceiling reduced |
-| M15 `max_depth` | 3–8 → **3–7** | Same as H1 rationale |
-| M15 `reg_alpha` | 0.01–1.20 → **0.05–5.0** | Previous ceiling was too tight |
-| M15 `min_child_weight` | 1–15 → **3–30** | More representative of M15 bar count |
-| M5 `learning_rate` | 0.01–0.30 → **0.01–0.15** | High lr + shallow trees memorises IS noise |
-| M5 `n_estimators` | 100–500 → **200–600** | Slow lr needs more iterations; floor raised |
-| M5 `max_depth` | 2–3 → **2–4** | Allows depth-4 for 4-state regime fitting |
-| M5 `min_child_weight` | 1–15 → **5–25** | Large bar count requires larger MCW |
-| M5 `subsample` | 0.6–1.0 → **0.55–0.85** | Cap at 0.85 prevents fully-correlated trees |
-
-#### 🆕 New Constants (`src/optimizer.py`)
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `WFO_PARAMS_FAST` | 6-month IS windows | Fast WFO mode for intraday regime detection |
-| `WFO_TRIALS_FAST` | `{"H1": 60, "M15": 100, "M5": 120}` | Companion trial budgets for fast mode |
-| `CV_FOLDS` | `{"H1": 2, "M15": 3, "M5": 4}` | TF-dependent inner CV fold counts |
-| `_N_PATHS` | `_n_paths_total()` precomputed at import | Replaces per-iteration `math.comb` calls |
-| `wfo_mode` param | `"standard"` default | Selects `WFO_PARAMS` or `WFO_PARAMS_FAST` in `_run_wfo` and `make_objective` |
-
-#### 📓 Notebook Additions (`notebooks/GoldRegimeX_Explorer.ipynb`)
-
-| Section | Change |
-|---------|--------|
-| Section 1 | Added `wfo_mode` dropdown (`standard` / `fast`) stored in `_CACHE`; imported `WFO_PARAMS_FAST`, `CV_FOLDS`, `compute_cpcv_score` |
-| Section 3 | Mode-aware WFO config selection; WFE interpretation labels (✅/🟡/🟠/🔴); updated score label `0.15×std` → `0.20×std` |
-| Section 5 | `depth5_w` max raised to 7; added `reg_lambda5_w` (FloatLogSlider) and `min_child_weight5_w` (IntSlider); new **Run WFO Score Comparison** button |
-| Section 6 (new) | CV Path Inspector — CPCV or WFO IS CV, per-path boxplot + bar chart, consistency score |
-
----
-
-### Notebook Merge Conflict Resolution & API Fix
-
-#### 🐛 Notebook JSON Was Invalid (Committed Merge Conflicts)
-
-The notebook file (`notebooks/GoldRegimeX_Explorer.ipynb`) was committed with 5 unresolved git merge conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), making it invalid JSON that could not be opened or executed in Jupyter.
-
-**Conflicts resolved:**
-
-| Conflict | Cell | Resolution |
-|----------|------|------------|
-| 1 | `cell01` imports | Kept HEAD ensemble API (`load_xgb_ensemble`, `get_predictions_ensemble`) + added OTHER's `WFO_PARAMS_FAST`, `CV_FOLDS`, `compute_cpcv_score` to optimizer import |
-| 2 | `cell03` Section 1 loader | Took OTHER — adds `wfo_mode_w` dropdown and stores `wfo_mode` in `_CACHE` |
-| 3 | `cell07` Section 3 WFO | Took OTHER — uses `WFO_PARAMS_FAST`, WFE interpretation labels, updated `0.20×std` label |
-| 4 | `cell11` Section 5 start | Took OTHER — adds `reg_lambda5_w`, `min_child_weight5_w`, `run_wfo5_btn`, `_run_wfo5_comparison` |
-| 5 | `cell11` Section 5/6 body | Took OTHER — full `_run_cv_inspector` with CPCV and WFO IS CV support |
-
-#### 🔧 Notebook Ensemble API Fix
-
-Sections 1 (`cell03`), 5 (`cell11`) were updated to use the correct vol-bucketed ensemble API throughout, matching the optimizer and training pipeline:
-
-| Old (single-model) | New (ensemble) |
-|--------------------|----------------|
-| `load_xgb(path)` → `(model, metrics)` | `load_xgb_ensemble(path)` → `(models, thresholds, metrics)` |
-| `train_xgb(X, y, **kws)` → `(model, metrics)` | `train_xgb_ensemble(X, y, **kws)` → `(models, thresholds, metrics)` |
-| `get_predictions(model, X)` → `(preds, probs)` | `get_predictions_ensemble(models, thresholds, X)` → `(preds, probs)` |
 
 Without this fix, the notebook's loaded probabilities came from a single global XGBoost model instead of the three vol-bucket models used by the optimizer and live trader, making Section 2 equity curves and Section 3 WFO scores inconsistent with production results.
