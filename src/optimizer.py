@@ -44,7 +44,7 @@ except ImportError:
     logger.debug("psutil not installed — RAM guard disabled.")
 
 # ── Versioning ─────────────────────────────────────────────────────────────────
-OPTIMIZER_VERSION = "3.6"  # bump when search space or scoring formula changes
+OPTIMIZER_VERSION = "3.7"  # bump when search space or scoring formula changes
 
 # ── Rolling WFO window sizes (bars) ───────────────────────────────────────────
 WFO_PARAMS = {
@@ -582,7 +582,7 @@ def _run_wfo(
 
 def make_objective(df: pd.DataFrame, tf: str, broker: str,
                    account_size: float = 15.0, wfo_mode: str = "standard"):
-    """Return an Optuna objective that scores hyperparams via rolling WFO.
+    """Return an Optuna objective that scores hyperparams via CPCV.
 
     Args:
         df:           Full processed parquet df (pre-loaded by caller).
@@ -590,14 +590,12 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
         tf:           Timeframe string.
         broker:       Broker name for cost model.
         account_size: Account balance in USD.
-        wfo_mode:     "standard" or "fast" WFO window sizes.
+        wfo_mode:     Retained for backward-compat; unused with CPCV.
 
     Each trial only recomputes kalman_smooth (fast) instead of process_pipeline
     (slow), giving a 10-50× speedup on long M5/M15 studies.
     """
-    _wfo_map = WFO_PARAMS_FAST if wfo_mode == "fast" else WFO_PARAMS
-    wfo_cfg  = _wfo_map.get(tf.upper(), WFO_PARAMS["H1"])
-    tf_up    = tf.upper()
+    tf_up = tf.upper()
 
     def objective(trial: optuna.Trial) -> float:
         # ── Kalman params ─────────────────────────────────────────────────────
@@ -667,71 +665,38 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
                 scale_pos_weight=scale_pos_weight,
             )
 
-            wfo_result = _run_wfo(
-                df=df_trial,
+            # Execute Combinatorial Purged CV
+            tf_embargo = CPCV_PURGE_BARS.get(tf_up, 24)
+
+            cpcv_result = execute_cpcv(
+                df_full=df_trial,
                 n_states=n_states,
-                tf=tf,
+                tf=tf_up,
                 balance=account_size,
                 broker=broker,
                 xgb_kwargs=xgb_kwargs,
-                is_bars=wfo_cfg["is_bars"],
-                oos_bars=wfo_cfg["oos_bars"],
-                embargo_bars=wfo_cfg["embargo_bars"],
-                step_bars=wfo_cfg["step_bars"],
-                wfo_mode=wfo_mode,
+                n_splits=CPCV_N_BLOCKS,
+                n_test_splits=CPCV_K_TEST,
+                embargo_bars=tf_embargo,
             )
 
-            score           = wfo_result["wfo_score"]
-            n_valid_windows = wfo_result["n_valid_windows"]
-            n_total_windows = wfo_result["n_windows"]
-            std_sharpe      = wfo_result["std_sharpe"]
-            median_trades   = wfo_result["median_trades"]
-            wfe_ratio       = wfo_result["wfe_ratio"]
-            window_scores   = wfo_result["window_scores"]
+            score         = cpcv_result["cpcv_score"]
+            n_valid_paths = cpcv_result["n_valid_paths"]
+            std_sharpe    = cpcv_result["std_sharpe"]
+            median_trades = cpcv_result["median_trades"]
 
-            if n_valid_windows < n_total_windows // 2:
-                score = min(score, -10.0)
-
-            # Penalise high cross-window Sharpe variance (inconsistent model)
-            if std_sharpe > 1.0:
-                score -= (std_sharpe - 1.0) * 0.5
-
-            # WFE penalty: penalize models where OOS performance severely diverges
-            # from the purged IS CV performance.  The thresholds are relaxed vs the
-            # old TimeSeriesSplit-based IS Sharpe, which was inflated by leakage.
-            if wfe_ratio < -0.5:
-                score = min(score, -1.0)
-            elif wfe_ratio < 0.0:
-                score *= 0.5
-            elif wfe_ratio < 0.2:
-                score *= 0.8
-
-            tf_floor = SOFT_TRADE_FLOORS.get(tf_up, 60)
-            if median_trades < tf_floor:
-                score *= 0.1
-
-            if tf_up == "M5":
-                if median_trades < 150:
-                    score *= 0.5
-                elif median_trades > 300:
-                    score *= 1.2
-
-            trial.set_user_attr("wfe_ratio",       wfe_ratio)
-            trial.set_user_attr("n_valid_windows", n_valid_windows)
+            # Store metrics for Optuna history
+            trial.set_user_attr("n_valid_paths", n_valid_paths)
             trial.set_user_attr("median_trades",   median_trades)
             trial.set_user_attr("std_sharpe",      std_sharpe)
+            trial.set_user_attr("median_sharpe",   cpcv_result["median_sharpe"])
 
             logger.info(
-                "Trial %d [%s/%s $%.0f %s]: score=%.3f | valid=%d/%d | "
-                "std_sharpe=%.3f | median_trades=%d | WFE=%.2f | scores=%s",
-                trial.number, tf, broker, account_size, wfo_mode,
-                score, n_valid_windows, n_total_windows,
-                std_sharpe, median_trades, wfe_ratio,
-                [round(s, 3) for s in window_scores],
+                "Trial %d [%s/%s]: score=%.3f | valid_paths=%d/%d | "
+                "std_sharpe=%.3f | median_trades=%d",
+                trial.number, tf, broker, score, n_valid_paths, _N_PATHS,
+                std_sharpe, median_trades,
             )
-
-            if n_valid_windows == 0:
-                return -50.0
 
             return score
 
@@ -1036,13 +1001,14 @@ def run_wfa(
     wfo_mode:     str   = "standard",
     save_plots:   bool  = False,
 ) -> dict:
-    """Run WFO analysis using current best params — for post-hoc reporting.
+    """Run CPCV analysis using current best params — for post-hoc reporting.
 
-    Uses the already-optimised params from the study DB to evaluate rolling
-    IS/OOS windows and return per-window diagnostics.
+    Uses the already-optimised params from the study DB to evaluate all
+    C(6,2)=15 combinatorial train/test paths and return aggregate diagnostics.
 
-    Returns the _run_wfo result dict (window_scores, wfe_ratio, etc.)
-    plus a 'params' key with the hyperparameters used.
+    Returns the execute_cpcv result dict plus backward-compat WFO key aliases
+    (wfo_score, n_windows, n_valid_windows, wfe_ratio, window_scores) so that
+    the existing main.py WFA display code continues to work unchanged.
     """
     params    = get_best_params(balance=account_size, broker=broker, tf=tf)
     obs_cov   = params.get("obs_cov",   1.0)
@@ -1058,23 +1024,26 @@ def run_wfa(
     xgb_kwargs = {k: v for k, v in params.items()
                   if k not in ("obs_cov", "trans_cov", "n_states")}
 
-    _wfo_map = WFO_PARAMS_FAST if wfo_mode == "fast" else WFO_PARAMS
-    wfo_cfg  = _wfo_map.get(tf.upper(), WFO_PARAMS["H1"])
-
-    result = _run_wfo(
-        df=df_trial,
+    tf_embargo = CPCV_PURGE_BARS.get(tf.upper(), 24)
+    result = execute_cpcv(
+        df_full=df_trial,
         n_states=n_states,
         tf=tf,
         balance=account_size,
         broker=broker,
         xgb_kwargs=xgb_kwargs,
-        is_bars=wfo_cfg["is_bars"],
-        oos_bars=wfo_cfg["oos_bars"],
-        embargo_bars=wfo_cfg["embargo_bars"],
-        step_bars=wfo_cfg["step_bars"],
-        wfo_mode=wfo_mode,
+        n_splits=CPCV_N_BLOCKS,
+        n_test_splits=CPCV_K_TEST,
+        embargo_bars=tf_embargo,
     )
+
     result["params"] = params
+    # Backward-compat aliases so main.py --mode wfa display works unchanged
+    result["wfo_score"]       = result["cpcv_score"]
+    result["n_windows"]       = _N_PATHS
+    result["n_valid_windows"] = result["n_valid_paths"]
+    result["wfe_ratio"]       = 0.0           # not applicable in CPCV
+    result["window_scores"]   = result.get("path_scores", [])
     return result
 
 
@@ -1119,6 +1088,150 @@ def _n_paths_total() -> int:
 _N_PATHS = _n_paths_total()
 
 
+def execute_cpcv(
+    df_full: pd.DataFrame,
+    n_states: int,
+    tf: str,
+    balance: float,
+    broker: str,
+    xgb_kwargs: dict,
+    n_splits: int = 6,
+    n_test_splits: int = 2,
+    embargo_bars: int = 24,
+) -> dict:
+    """Execute Combinatorial Purged CV with strict per-path HMM and Scaler fitting.
+
+    For each of C(n_splits, n_test_splits) combinatorial train/test mask pairs:
+      1. HMM is fitted *inside* the loop on purged training blocks only — no
+         lookahead leakage from a globally pre-fitted model.
+      2. StandardScaler is fitted on training rows only.
+      3. XGBoost ensemble is trained on train_ratio=1.0 (CPCV owns the split).
+      4. OOS backtest is run on the test blocks.
+
+    Returns a dict with cpcv_score, n_valid_paths, median_sharpe, std_sharpe,
+    median_trades, and path_scores.
+    """
+    splitter = CPCVSplitter(
+        n=len(df_full), n_blocks=n_splits, k_test=n_test_splits,
+        purge_bars=embargo_bars,
+    )
+
+    path_scores:  list = []
+    path_sharpes: list = []
+    path_trades:  list = []
+    n_valid_paths = 0
+    min_trades = HARD_TRADE_FLOORS.get(tf.upper(), 10)
+
+    for path_idx, (train_mask, test_mask) in enumerate(splitter.split()):
+        try:
+            df_train = df_full[train_mask]
+            if len(df_train) < 500:
+                continue
+
+            # 1. Fit HMM STRICTLY on the purged training blocks (no lookahead)
+            model_path, train_states, _ = fit_hmm(df_train, n_states=n_states, tf=tf)
+            if min(model_path.transmat_[i, i] for i in range(n_states)) < 0.60:
+                continue
+
+            # 2. Predict states for the full dataset using the IS model
+            all_states = predict_states(model_path, df_full)
+
+            # 3. Fit scaler ONLY on the training data, then transform everything
+            _, _, _, scaler = prepare_features(
+                df_train, train_states, feature_scaler=None, tf=tf
+            )
+            X_all, y_all, df_all_aligned, _ = prepare_features(
+                df_full, all_states, feature_scaler=scaler, tf=tf
+            )
+
+            # Align masks with the valid feature rows
+            _kept = df_full.index.isin(df_all_aligned.index)
+            train_mask_al = train_mask[_kept]
+            test_mask_al  = test_mask[_kept]
+
+            if train_mask_al.sum() < 100 or test_mask_al.sum() < 50:
+                continue
+
+            # 4. Train XGBoost on the training paths (train_ratio=1.0)
+            X_tr, y_tr = X_all.iloc[train_mask_al], y_all.iloc[train_mask_al]
+            models_ens, thresholds, ens_metrics = train_xgb_ensemble(
+                X_tr, y_tr, train_ratio=1.0, **xgb_kwargs
+            )
+
+            # Penalise immediately if the model zeroed out hmm_state
+            if float(ens_metrics.get("feature_importance", {}).get("hmm_state", 1.0)) == 0.0:
+                return {
+                    "cpcv_score": -50.0, "n_valid_paths": 0,
+                    "median_sharpe": -10.0, "std_sharpe": 0.0,
+                    "median_trades": 0, "path_scores": [],
+                }
+
+            # 5. Get predictions and backtest on the OOS test paths
+            _, probs_all = get_predictions_ensemble(models_ens, thresholds, X_all)
+            states_all_al = df_all_aligned["hmm_state"].values
+
+            test_df     = df_all_aligned.iloc[test_mask_al]
+            test_probs  = probs_all[test_mask_al]
+            test_states = states_all_al[test_mask_al]
+
+            path_result = vectorized_backtest(
+                test_df, test_probs, test_states,
+                split_idx=None, account_size=balance, broker=broker, tf=tf,
+                hmm_transmat=model_path.transmat_,
+            )
+
+            n_trades = path_result.get("n_trades", 0)
+            fdd = path_result.get("floating_max_drawdown", path_result.get("max_drawdown", 0.0))
+
+            if n_trades < min_trades or fdd > CPCV_MAX_FLOAT_DD:
+                path_scores.append(-50.0)
+                path_sharpes.append(-10.0)
+                path_trades.append(n_trades)
+                continue
+
+            n_valid_paths += 1
+            path_scores.append(_score_result(path_result, broker=broker, tf=tf))
+            path_sharpes.append(path_result.get("sharpe_ratio", 0.0))
+            path_trades.append(n_trades)
+
+        except Exception as exc:
+            logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
+            continue
+
+    if n_valid_paths < 6:  # require at least 6 successful combinatorial paths
+        logger.warning(
+            "CPCV [%s]: only %d valid paths — rejecting trial.", tf, n_valid_paths
+        )
+        return {
+            "cpcv_score": -50.0, "n_valid_paths": n_valid_paths,
+            "median_sharpe": -10.0, "std_sharpe": 0.0,
+            "median_trades": int(np.median(path_trades) if path_trades else 0),
+            "path_scores": path_scores,
+        }
+
+    _med_score = float(np.median(path_scores))
+    _std_score = float(np.std(path_scores))
+    final_score = _med_score - 0.25 * _std_score  # variance penalty
+
+    logger.info(
+        "CPCV [%s]: %d/%d valid paths | median_score=%.3f std=%.3f | "
+        "median_sharpe=%.3f | median_trades=%d | final_score=%.3f",
+        tf, n_valid_paths, len(path_scores),
+        _med_score, _std_score,
+        float(np.median(path_sharpes)),
+        int(np.median(path_trades) if path_trades else 0),
+        final_score,
+    )
+    return {
+        "cpcv_score":    final_score,
+        "n_valid_paths": n_valid_paths,
+        "median_sharpe": float(np.median(path_sharpes)),
+        "std_sharpe":    float(np.std(path_sharpes)),
+        "median_trades": int(np.median(path_trades) if path_trades else 0),
+        "path_scores":   path_scores,
+    }
+
+
 def compute_cpcv_score(
     df_full,
     balance: float,
@@ -1127,266 +1240,17 @@ def compute_cpcv_score(
     n_states: int,
     xgb_kwargs: dict,
 ) -> float:
-    """Combinatorial Purged Cross-Validation score — C(6,2) = 15 paths.
+    """Backward-compat shim — delegates to execute_cpcv.
 
-    For each of 15 train/test mask pairs:
-      1. Fit HMM on concatenated training bars.
-      2. Predict states on ALL bars using the IS model.
-      3. Prepare features; scaler fitted on training rows only.
-      4. Train XGB on training bars (train_ratio=1.0).
-      5. Backtest with test_mask.
-      6. Path score = RF×0.35 + Sharpe×0.35 + (PF-1)×0.20 (capped at 3.5).
-
-    Returns variance-penalised median of valid path scores, or -50.0 if fewer
-    than 6 valid paths.
+    Retained so that existing notebook calls remain valid.
     """
-    purge    = CPCV_PURGE_BARS.get(tf.upper(), 24)
-    splitter = CPCVSplitter(n=len(df_full), purge_bars=purge)
-
-    path_scores: list = []
-    total_trades = 0
-
-    for path_idx, (train_mask, test_mask) in enumerate(splitter.split()):
-        try:
-            df_train = df_full.iloc[train_mask]
-            if len(df_train) < 500:
-                path_scores.append(None)
-                continue
-
-            model_path, train_states, _ = fit_hmm(df_train, n_states=n_states, tf=tf)
-
-            _min_persist = min(model_path.transmat_[i, i] for i in range(n_states))
-            if _min_persist < 0.60:
-                path_scores.append(None)
-                continue
-
-            all_states = predict_states(model_path, df_full)
-
-            X_train_raw, y_train_raw, _, scaler = prepare_features(
-                df_train, train_states, tf=tf
-            )
-            X_all, y_all, df_all_aligned, _ = prepare_features(
-                df_full, all_states, feature_scaler=scaler, tf=tf
-            )
-
-            _kept          = df_full.index.isin(df_all_aligned.index)
-            train_mask_al  = train_mask[_kept]
-            test_mask_al   = test_mask[_kept]
-
-            if train_mask_al.sum() < 100:
-                path_scores.append(None)
-                continue
-
-            X_tr = X_all.iloc[train_mask_al]
-            y_tr = y_all.iloc[train_mask_al]
-            models_ens, thresholds, _ = train_xgb_ensemble(
-                X_tr, y_tr, train_ratio=1.0, **xgb_kwargs
-            )
-
-            _, probs_all    = get_predictions_ensemble(models_ens, thresholds, X_all)
-            states_all_al   = df_all_aligned["hmm_state"].values
-
-            path_result = vectorized_backtest(
-                df_all_aligned, probs_all, states_all_al,
-                split_idx=None, account_size=balance, broker=broker, tf=tf,
-                hmm_transmat=model_path.transmat_,
-                test_mask=test_mask_al,
-            )
-
-            path_n       = path_result.get("n_trades", 0)
-            total_trades += path_n
-
-            if path_n == 0:
-                path_scores.append(None)
-                continue
-
-            rf     = min(path_result.get("recovery_factor", 0.0), 5.0)
-            pf     = min(path_result.get("profit_factor", 1.0), 3.0)
-            sharpe = path_result.get("sharpe_ratio", 0.0)
-            wr     = path_result.get("win_rate", 0.0)
-            logger.debug(
-                "  CPCV path %d/%d: n=%d WR=%.1f%% Sharpe=%.3f RF=%.2f PF=%.2f",
-                path_idx + 1, _N_PATHS, path_n, wr * 100, sharpe, rf, pf,
-            )
-            path_scores.append(min(float(rf * 0.35 + sharpe * 0.35 + (pf - 1.0) * 0.20), 3.5))
-
-        except Exception as exc:
-            logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
-            path_scores.append(None)
-
-    valid_scores = [s for s in path_scores if s is not None]
-    n_valid      = len(valid_scores)
-
-    if n_valid < 6:
-        logger.warning("CPCV: only %d/%d valid paths — rejecting.", n_valid, len(path_scores))
-        return -50.0
-
-    _min_total = MIN_TRADES_PER_PATH.get(tf.upper(), 30) * n_valid
-    if total_trades < _min_total:
-        logger.warning(
-            "CPCV: total_trades=%d < min=%d (%d paths) — rejecting.",
-            total_trades, _min_total, n_valid,
-        )
-        return -50.0
-
-    _med   = float(np.median(valid_scores))
-    _std   = float(np.std(valid_scores))
-    score  = _med - 0.25 * _std
-
-    _ideal_total = MIN_TRADES_PER_PATH.get(tf.upper(), 30) * 2 * n_valid
-    score *= min(1.0, total_trades / max(_ideal_total, 1))
-
-    if all(s > 0.30 for s in valid_scores):
-        score *= 1.05
-
-    logger.info(
-        "CPCV [%s]: %d/%d valid | trades=%d | median=%.3f std=%.3f | score=%.3f",
-        tf, n_valid, len(path_scores), total_trades, _med, _std, score,
+    result = execute_cpcv(
+        df_full=df_full, n_states=n_states, tf=tf,
+        balance=balance, broker=broker, xgb_kwargs=xgb_kwargs,
+        n_splits=CPCV_N_BLOCKS, n_test_splits=CPCV_K_TEST,
+        embargo_bars=CPCV_PURGE_BARS.get(tf.upper(), 24),
     )
-    return score
+    return result["cpcv_score"]
 
 
-def _make_cpcv_paths(n: int, n_splits: int, n_test_splits: int):
-    fold_size = n // n_splits
-    folds = []
-    for i in range(n_splits):
-        start = i * fold_size
-        end   = start + fold_size if i < n_splits - 1 else n
-        folds.append(np.arange(start, end))
 
-    paths = []
-    for test_combo in itertools.combinations(range(n_splits), n_test_splits):
-        test_folds       = set(test_combo)
-        train_folds      = [i for i in range(n_splits) if i not in test_folds]
-        test_idx         = np.concatenate([folds[i] for i in sorted(test_combo)])
-        train_idx        = np.concatenate([folds[i] for i in train_folds])
-        individual_folds = [folds[i] for i in sorted(test_combo)]
-        paths.append((train_idx, test_idx, individual_folds))
-
-    return paths
-
-
-def _run_cpcv(
-    df,
-    states:      np.ndarray,
-    tf:          str,
-    balance:     float,
-    broker:      str,
-    xgb_kwargs:  dict,
-    n_splits:    int,
-    n_test_splits: int,
-    embargo_bars: int,
-    hmm_transmat: np.ndarray = None,
-) -> dict:
-    """Run CPCV and return aggregate stats across all backtest paths."""
-    n     = len(df)
-    paths = _make_cpcv_paths(n, n_splits, n_test_splits)
-
-    X_full, y_full, df_aligned, _ = prepare_features(df, states, tf=tf)
-    states_aligned = states[df.index.isin(df_aligned.index)]
-
-    path_scores:  list = []
-    path_sharpes: list = []
-    path_trades:  list = []
-    n_valid_paths = 0
-    min_trades    = HARD_TRADE_FLOORS.get(tf.upper(), 10)
-
-    for train_raw, test_raw, test_fold_arrays in paths:
-        if len(test_raw) == 0 or len(train_raw) == 0:
-            continue
-
-        purged_train_mask = np.ones(len(train_raw), dtype=bool)
-        for fold_arr in test_fold_arrays:
-            fold_start = int(fold_arr[0])
-            fold_end   = int(fold_arr[-1])
-            purged_train_mask &= (
-                (train_raw < fold_start - embargo_bars) |
-                (train_raw > fold_end   + embargo_bars)
-            )
-        purged_train = train_raw[purged_train_mask]
-
-        if len(purged_train) < 500:
-            continue
-
-        df_idx      = df.index
-        safe_train  = purged_train[purged_train < len(df_idx)]
-        safe_test   = test_raw[test_raw < len(df_idx)]
-
-        if len(safe_train) == 0 or len(safe_test) == 0:
-            continue
-
-        train_ts = df_idx[safe_train]
-        test_ts  = df_idx[safe_test]
-
-        X_train = X_full[X_full.index.isin(train_ts)]
-        y_train = y_full[y_full.index.isin(train_ts)]
-        X_test  = X_full[X_full.index.isin(test_ts)]
-
-        if len(X_train) < 500 or len(X_test) < 50:
-            continue
-
-        try:
-            models_path, thresholds_path, _ = train_xgb_ensemble(
-                X_train, y_train, train_ratio=1.0, **xgb_kwargs,
-            )
-        except Exception as exc:
-            logger.debug("CPCV path train failed: %s", exc)
-            continue
-
-        _, probs_test = get_predictions_ensemble(models_path, thresholds_path, X_test)
-
-        test_df     = df_aligned[df_aligned.index.isin(test_ts)]
-        test_states = states_aligned[df_aligned.index.isin(test_ts)]
-
-        if len(test_df) < 50 or len(probs_test) != len(test_df):
-            continue
-
-        try:
-            train_states_path = states_aligned[df_aligned.index.isin(train_ts)]
-            regime_stats_path = compute_regime_stats(
-                models_path, thresholds_path, X_train, train_states_path
-            )
-        except Exception:
-            regime_stats_path = None
-
-        try:
-            result_path = vectorized_backtest(
-                test_df, probs_test, test_states,
-                split_idx=None, account_size=balance, broker=broker, tf=tf,
-                hmm_transmat=hmm_transmat,
-                regime_stats=regime_stats_path,
-            )
-        except Exception as exc:
-            logger.debug("CPCV path backtest failed: %s", exc)
-            continue
-
-        n_trades = result_path.get("n_trades", 0)
-        fdd      = result_path.get("floating_max_drawdown", result_path.get("max_drawdown", 0.0))
-
-        if n_trades < min_trades or fdd > CPCV_MAX_FLOAT_DD:
-            path_scores.append(-50.0)
-            path_sharpes.append(result_path.get("sharpe_ratio", -10.0))
-            path_trades.append(n_trades)
-            continue
-
-        n_valid_paths += 1
-        score = _score_result(result_path, broker=broker, tf=tf)
-        path_scores.append(score)
-        path_sharpes.append(result_path.get("sharpe_ratio", 0.0))
-        path_trades.append(n_trades)
-
-    if not path_scores:
-        return {
-            "cpcv_score": -100.0, "n_paths": len(paths), "n_valid_paths": 0,
-            "median_sharpe": -10.0, "std_sharpe": 0.0, "median_trades": 0, "path_scores": [],
-        }
-
-    return {
-        "cpcv_score":    float(np.median(path_scores)),
-        "n_paths":       len(paths),
-        "n_valid_paths": n_valid_paths,
-        "median_sharpe": float(np.median(path_sharpes)),
-        "std_sharpe":    float(np.std(path_sharpes)),
-        "median_trades": int(np.median(path_trades)),
-        "path_scores":   path_scores,
-    }
