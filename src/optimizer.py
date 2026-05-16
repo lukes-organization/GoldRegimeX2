@@ -1112,10 +1112,90 @@ def run_optimization(
         + "\n".join(f"  <code>{k}</code>: {v}" for k, v in study.best_params.items())
     )
 
+    # Persist best-trial CPCV stats so --mode report can display them directly.
+    # These are the ground-truth OOS metrics recorded during optimisation.
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        _tf_up  = tf.upper()
+        _bt     = study.best_trial
+        _attrs  = _bt.user_attrs  # {'median_sharpe', 'median_trades', 'n_valid_paths', 'std_sharpe'}
+        _cpcv_data = {
+            "cpcv_score":      float(best),
+            "n_valid_paths":   int(_attrs.get("n_valid_paths", 0)),
+            "median_sharpe":   float(_attrs.get("median_sharpe", 0.0)),
+            "std_sharpe":      float(_attrs.get("std_sharpe", 0.0)),
+            "median_trades":   int(_attrs.get("median_trades", 0)),
+            # These aren't stored per-trial; leave as 0.0 to be filled by --mode wfa
+            "median_win_rate": 0.0,
+            "median_drawdown": 0.0,
+            "median_return":   0.0,
+            "path_scores":     [],
+        }
+        os.makedirs("reports", exist_ok=True)
+        _cpcv_path = _Path(f"reports/cpcv_{_tf_up.lower()}_{broker}.json")
+        _cpcv_path.write_text(_json.dumps(_cpcv_data, indent=2))
+        logger.info(
+            "Best-trial CPCV stats saved → %s  (median_sharpe=%.3f  median_trades=%d)",
+            _cpcv_path, _cpcv_data["median_sharpe"], _cpcv_data["median_trades"],
+        )
+    except Exception as _save_err:
+        logger.warning("Could not save CPCV stats after optimisation: %s", _save_err)
+
     return study
 
 
 # ── Param extraction ───────────────────────────────────────────────────────────
+
+def save_best_trial_cpcv(
+    broker: str,
+    tf: str,
+    balance: float = 15.0,
+) -> bool:
+    """Extract and save the best trial's CPCV stats to reports/cpcv_{tf}_{broker}.json.
+
+    Used to backfill the CPCV JSON from an existing completed study without
+    re-running optimisation.  Returns True on success, False if study is empty.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    tier    = _get_tier(balance)
+    name    = _study_name(broker=broker, tier=tier, tf=tf)
+    storage = _study_db(broker)
+
+    try:
+        _study = optuna.load_study(study_name=name, storage=storage)
+    except Exception as _e:
+        logger.warning("Could not load study '%s': %s", name, _e)
+        return False
+
+    if not _study.best_trial:
+        logger.warning("Study '%s' has no complete trials.", name)
+        return False
+
+    _bt    = _study.best_trial
+    _attrs = _bt.user_attrs
+    _data  = {
+        "cpcv_score":      float(_study.best_value),
+        "n_valid_paths":   int(_attrs.get("n_valid_paths", 0)),
+        "median_sharpe":   float(_attrs.get("median_sharpe", 0.0)),
+        "std_sharpe":      float(_attrs.get("std_sharpe", 0.0)),
+        "median_trades":   int(_attrs.get("median_trades", 0)),
+        "median_win_rate": 0.0,
+        "median_drawdown": 0.0,
+        "median_return":   0.0,
+        "path_scores":     [],
+    }
+    os.makedirs("reports", exist_ok=True)
+    _path = _Path(f"reports/cpcv_{tf.lower()}_{broker}.json")
+    _path.write_text(_json.dumps(_data, indent=2))
+    logger.info(
+        "CPCV stats saved from best trial → %s  (score=%.3f  median_sharpe=%.3f  trades=%d)",
+        _path, _data["cpcv_score"], _data["median_sharpe"], _data["median_trades"],
+    )
+    return True
+
 
 def get_best_params(balance: float = 15.0, broker: str = "standard", tf: str = "H1") -> dict:
     """Load best hyperparameters from the persisted SQLite study.
@@ -1280,6 +1360,23 @@ def run_wfa(
     result["n_valid_windows"] = result["n_valid_paths"]
     result["wfe_ratio"]       = 0.0           # not applicable in CPCV
     result["window_scores"]   = result.get("path_scores", [])
+
+    # Persist CPCV summary so --mode report can load it as primary OOS metrics
+    import json as _json
+    from pathlib import Path as _Path
+    _cpcv_path = _Path(f"reports/cpcv_{tf.lower()}_{broker}.json")
+    _cpcv_path.parent.mkdir(parents=True, exist_ok=True)
+    _saveable = {k: v for k, v in result.items() if k != "params"}
+    # Convert any numpy types to native Python for JSON serialisation
+    def _to_native(obj):
+        if isinstance(obj, (np.integer,)):   return int(obj)
+        if isinstance(obj, (np.floating,)):  return float(obj)
+        if isinstance(obj, np.ndarray):      return obj.tolist()
+        if isinstance(obj, list):            return [_to_native(x) for x in obj]
+        return obj
+    _cpcv_path.write_text(_json.dumps({k: _to_native(v) for k, v in _saveable.items()}, indent=2))
+    logger.info("CPCV report saved → %s", _cpcv_path)
+
     return result
 
 
@@ -1352,9 +1449,12 @@ def execute_cpcv(
         purge_bars=embargo_bars,
     )
 
-    path_scores:  list = []
-    path_sharpes: list = []
-    path_trades:  list = []
+    path_scores:    list = []
+    path_sharpes:   list = []
+    path_trades:    list = []
+    path_winrates:  list = []
+    path_drawdowns: list = []
+    path_returns:   list = []
     n_valid_paths = 0
     min_trades = HARD_TRADE_FLOORS.get(tf.upper(), 10)
 
@@ -1439,12 +1539,18 @@ def execute_cpcv(
                 path_scores.append(-50.0)
                 path_sharpes.append(-10.0)
                 path_trades.append(n_trades)
+                path_winrates.append(0.0)
+                path_drawdowns.append(float(fdd))
+                path_returns.append(0.0)
                 continue
 
             n_valid_paths += 1
             path_scores.append(_score_result(path_result, broker=broker, tf=tf))
             path_sharpes.append(path_result.get("sharpe_ratio", 0.0))
             path_trades.append(n_trades)
+            path_winrates.append(float(path_result.get("win_rate", 0.0)))
+            path_drawdowns.append(float(fdd))
+            path_returns.append(float(path_result.get("total_return", 0.0)))
 
         except Exception as exc:
             logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
@@ -1475,12 +1581,20 @@ def execute_cpcv(
         final_score,
     )
     return {
-        "cpcv_score":    final_score,
-        "n_valid_paths": n_valid_paths,
-        "median_sharpe": float(np.median(path_sharpes)),
-        "std_sharpe":    float(np.std(path_sharpes)),
-        "median_trades": int(np.median(path_trades) if path_trades else 0),
-        "path_scores":   path_scores,
+        "cpcv_score":      final_score,
+        "n_valid_paths":   n_valid_paths,
+        "median_sharpe":   float(np.median(path_sharpes)),
+        "std_sharpe":      float(np.std(path_sharpes)),
+        "median_trades":   int(np.median(path_trades) if path_trades else 0),
+        "median_win_rate": float(np.median(path_winrates) if path_winrates else 0.0),
+        "median_drawdown": float(np.median(path_drawdowns) if path_drawdowns else 0.0),
+        "median_return":   float(np.median(path_returns) if path_returns else 0.0),
+        "path_scores":     path_scores,
+        "path_sharpes":    path_sharpes,
+        "path_trades":     path_trades,
+        "path_winrates":   path_winrates,
+        "path_drawdowns":  path_drawdowns,
+        "path_returns":    path_returns,
     }
 
 

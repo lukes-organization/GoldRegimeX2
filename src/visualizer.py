@@ -389,7 +389,8 @@ def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent",
     rf       = result.get("recovery_factor", 0.0)
     pf       = result.get("profit_factor", 1.0)
 
-    ax.text(0.05, 0.83, "Performance (Full Period)", fontsize=13, fontweight="bold",
+    _period_label = "Performance (Full Period IS)" if "cpcv_score" in result else "Performance (Full Period)"
+    ax.text(0.05, 0.83, _period_label, fontsize=13, fontweight="bold",
             transform=ax.transAxes, va="top", color="#2c3e50")
     metrics_data = [
         ("Sharpe Ratio",    f"{sharpe:.3f}",  "#2ecc71" if sharpe >= 1.0 else "#e67e22"),
@@ -411,24 +412,30 @@ def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent",
     # ── OOS metrics ──────────────────────────────────────────────────────────
     if "oos_sharpe_ratio" in result:
         y -= 0.01
-        ax.text(0.05, y, "Out-of-Sample", fontsize=12, fontweight="bold",
+        _is_cpcv = "cpcv_score" in result
+        _oos_label = (
+            f"CPCV OOS  ({result.get('cpcv_n_valid_paths', '?')}/{6} valid paths)"
+            if _is_cpcv else "Out-of-Sample"
+        )
+        ax.text(0.05, y, _oos_label, fontsize=12, fontweight="bold",
                 transform=ax.transAxes, va="top", color="#c0392b")
         y -= 0.06
         oos_fdd = result.get("oos_floating_max_drawdown", result.get("oos_max_drawdown", 0.0))
         oos_fdd_usd = oos_fdd * account_size
         oos_data = [
-            ("Sharpe",           f"{result['oos_sharpe_ratio']:.3f}"),
-            ("Max DD",           f"{oos_fdd*100:.1f}%"),
+            ("Sharpe (median)",  f"{result['oos_sharpe_ratio']:.3f}"),
+            ("Std Sharpe",       f"{result.get('cpcv_std_sharpe', 0.0):.3f}" if _is_cpcv else "N/A"),
+            ("Max DD (median)",  f"{oos_fdd*100:.1f}%"),
             ("Max Monetary Risk",f"${oos_fdd_usd:.2f} USD"),
-            ("Win Rate",         f"{result['oos_win_rate']*100:.1f}%"),
-            ("Trades",           f"{result['oos_n_trades']}"),
+            ("Win Rate (median)",f"{result['oos_win_rate']*100:.1f}%"),
+            ("Trades (median)",  f"{result['oos_n_trades']}"),
         ]
         for label, value in oos_data:
             ax.text(0.07, y, label, fontsize=10, transform=ax.transAxes, va="top",
                     fontfamily="monospace", color="#7f8c8d")
-            ax.text(0.25, y, value, fontsize=10, transform=ax.transAxes, va="top",
+            ax.text(0.30, y, value, fontsize=10, transform=ax.transAxes, va="top",
                     fontfamily="monospace", fontweight="bold", color="#c0392b")
-            y -= 0.065
+            y -= 0.060
 
     # ── Middle column: Signal-type attribution ───────────────────────────────
     ax.text(0.50, 0.83, "Profit Attribution", fontsize=13, fontweight="bold",
@@ -660,8 +667,7 @@ def generate_full_report(df, hmm_states, state_names, model_hmm,
     paths = []
     paths.append(plot_regime_overlay(df, hmm_states, state_names, tf=tf, broker=broker))
     paths.append(plot_equity_curve(df, probabilities, hmm_states, split_idx=split_idx,
-                                   tf=tf, broker=broker,
-                                   regime_stats=regime_stats))
+                                   tf=tf, broker=broker))
     paths.append(plot_feature_analysis(X, hmm_states, metrics, tf=tf, broker=broker))
     paths.append(plot_transition_matrix(model_hmm, state_names, tf=tf, broker=broker))
     paths.append(plot_summary_dashboard(result_enriched, params or {},

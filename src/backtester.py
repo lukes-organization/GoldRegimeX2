@@ -403,8 +403,8 @@ def _run_bar_loop(
     tf: str,
     broker: str,
     account_size: float,
-    split_idx,
-    return_trades: bool,
+    split_idx=None,
+    return_trades: bool = False,
     test_mask=None,
     raw_atr_arr=None,
 ) -> tuple:

@@ -24,7 +24,7 @@ MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 3}
 # Thresholds are deliberately strict: XGB test accuracy is 50-52% (next-bar
 # direction), so only the highest-confidence bars have real signal.  Allowing
 # lower thresholds floods the engine with noise trades and destroys performance.
-ENTRY_PROB    = {"H1": 0.54, "M15": 0.55, "M5": 0.52}
+ENTRY_PROB    = {"H1": 0.55, "M15": 0.55, "M5": 0.52}
 MR_ENTRY_PROB = {"H1": 0.56, "M15": 0.52, "M5": 0.50}
 
 # Maximum bars to hold a single trade before forcing exit

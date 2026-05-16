@@ -138,6 +138,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         account_size=balance,
         broker=broker,
         tf=tf,
+        hmm_transmat=model_hmm.transmat_,  # use real persistence values, consistent with optimizer CPCV
     )
     return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
 
@@ -692,20 +693,49 @@ def cmd_report(args):
         _hs_is    = states_aligned[:len(_X_is)]
         metrics["regime_stats"] = compute_regime_stats(models_xgb, thresholds_xgb, _X_is, _hs_is)
 
-    # split_idx in saved metrics may come from a different TF's training run
-    # (e.g. M15 split_idx ~186k used in an H1 report with only ~58k bars).
-    # Recompute from current data when the stored value doesn't fit.
+    # split_idx=None means the model was trained with train_ratio=1.0 (full-data /
+    # CPCV mode).  In that case keep split_idx=None so the report backtest is
+    # also full-period — matching the training output exactly.
+    # Only fall back to 80/20 when a stored split_idx exists but doesn't fit the
+    # current data (e.g. loaded from a model trained on a different TF).
     split_idx = metrics.get("split_idx")
-    if split_idx is None or not (0 < split_idx < len(X)):
+    if split_idx is not None and not (0 < split_idx < len(X)):
         split_idx = int(len(X) * 0.8)
 
     result = vectorized_backtest(
         df_aligned, probabilities, states_aligned,
         split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
-        regime_stats=metrics.get("regime_stats"),
-        evaluator_config=({"Z_CUTOFF_BULL": params["z_cutoff_bull"], "Z_CUTOFF_BEAR": -params["z_cutoff_bull"]}
-                          if params.get("z_cutoff_bull") else None),
+        hmm_transmat=model_hmm.transmat_,  # use real persistence values, consistent with optimizer CPCV
     )
+
+    # ── Inject CPCV OOS stats from last --mode optimize run if available ─────
+    _cpcv_json = Path(f"reports/cpcv_{tf.lower()}_{broker}.json")
+    if not _cpcv_json.exists():
+        # Try to backfill from the existing Optuna study DB
+        try:
+            from src.optimizer import save_best_trial_cpcv
+            save_best_trial_cpcv(broker=broker, tf=tf, balance=balance)
+        except Exception as _be:
+            logger.warning("Could not backfill CPCV JSON from study: %s", _be)
+    if _cpcv_json.exists():
+        try:
+            _cpcv = json.loads(_cpcv_json.read_text())
+            result["cpcv_score"]          = _cpcv.get("cpcv_score", 0.0)
+            result["cpcv_n_valid_paths"]  = _cpcv.get("n_valid_paths", 0)
+            result["oos_sharpe_ratio"]    = _cpcv.get("median_sharpe", 0.0)
+            result["oos_n_trades"]        = _cpcv.get("median_trades", 0)
+            result["oos_win_rate"]        = _cpcv.get("median_win_rate", 0.0)
+            result["oos_max_drawdown"]    = _cpcv.get("median_drawdown", 0.0)
+            result["oos_floating_max_drawdown"] = _cpcv.get("median_drawdown", 0.0)
+            result["oos_total_return"]    = _cpcv.get("median_return", 0.0)
+            result["cpcv_path_scores"]    = _cpcv.get("path_scores", [])
+            result["cpcv_std_sharpe"]     = _cpcv.get("std_sharpe", 0.0)
+            logger.info(
+                "Loaded CPCV OOS stats from %s — median_sharpe=%.3f  median_trades=%d",
+                _cpcv_json, result["oos_sharpe_ratio"], result["oos_n_trades"],
+            )
+        except Exception as _e:
+            logger.warning("Could not load CPCV JSON (%s): %s", _cpcv_json, _e)
 
     arm = AdaptiveRiskManager(balance, broker=broker)
     limits = arm.get_trade_limits()
