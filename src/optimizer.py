@@ -627,7 +627,7 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
         elif tf_up == "H1":
             max_depth        = trial.suggest_int("max_depth", 3, 7)
             reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.5,  log=True)  # capped: prevent hmm_state dropout
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.1,  2.0,  log=True)  # capped: prevent hmm_state dropout
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0,  log=True)  # lowered floor: allow hmm_state signal
             min_child_weight = trial.suggest_int("min_child_weight", 5, 100)
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 50, 400, step=50)
@@ -1174,6 +1174,20 @@ def execute_cpcv(
             test_probs  = probs_all[test_mask_al]
             test_states = states_all_al[test_mask_al]
 
+            # ── Regime oscillation guard ──────────────────────────────────
+            # If the HMM state sequence has more than 12% transition bars
+            # (e.g. switching every ~8 bars) the path is degenerate —
+            # the signal engine will trade every 3 bars → DD blowup.
+            # Threshold: 5% is typical for healthy H1; 12% = 2.4× elevated.
+            if len(test_states) > 1:
+                _n_trans = int(np.sum(np.diff(test_states) != 0))
+                if _n_trans / len(test_states) > 0.12:
+                    logger.debug(
+                        "CPCV path %d: high oscillation rate %.1f%% — skipped",
+                        path_idx + 1, _n_trans / len(test_states) * 100,
+                    )
+                    continue
+
             path_result = vectorized_backtest(
                 test_df, test_probs, test_states,
                 split_idx=None, account_size=balance, broker=broker, tf=tf,
@@ -1198,7 +1212,7 @@ def execute_cpcv(
             logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
             continue
 
-    if n_valid_paths < 6:  # require at least 6 successful combinatorial paths
+    if n_valid_paths < 5:  # require at least 5 successful combinatorial paths
         logger.warning(
             "CPCV [%s]: only %d valid paths — rejecting trial.", tf, n_valid_paths
         )

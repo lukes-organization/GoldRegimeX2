@@ -420,16 +420,18 @@ def _run_bar_loop(
     max_fav_pnl   = 0.0
     bars_in_trade = 0
     trade_entry_i = 0
+    cooldown_bars = 0   # bars to wait before next entry (prevent churn)
 
     # ── Execution tracker ─────────────────────────────────────────────────────
     entry_price   = 0.0
     current_sl    = 0.0
     tp1_level     = 0.0
-    entry_atr     = 0.0
-    guard_hit     = False
-    atr_activated = False
-    partial_done  = False
     signal_type   = "trend"
+
+    # Cooldown length: H1 → 5 bars (one quarter-day); shorter TFs → 2 bars.
+    # Prevents immediate re-entry after a stop-out in a rapidly oscillating
+    # HMM regime, which otherwise produces 700+ H1 trades per OOS window.
+    _entry_cooldown = 5 if _tf_up == "H1" else 2
 
     for i in range(n):
         regime_info  = engine.update_regime(int(states[i]), hmm_transmat)
@@ -440,7 +442,6 @@ def _run_bar_loop(
             bars_in_trade += 1
             bar_high  = float(highs[i])
             bar_low   = float(lows[i])
-            bar_close = float(closes[i])
 
             # ── 1. Intra-bar SL / TP hit check ───────────────────────────────
             hit_sl = hit_tp1 = False
@@ -460,57 +461,21 @@ def _run_bar_loop(
             signals[i]   = direction
             sizes_arr[i] = size_mult
 
-            # ── 3. 70 % profit guard → move SL to entry ──────────────────────
-            if not guard_hit and not hit_tp1:
-                guard_dist = abs(tp1_level - entry_price) * 0.70
-                if direction == 1 and bar_high >= entry_price + guard_dist:
-                    current_sl = entry_price + (spread_cost * 2)
-                    guard_hit  = True
-                elif direction == -1 and bar_low <= entry_price - guard_dist:
-                    current_sl = entry_price - (spread_cost * 2)
-                    guard_hit  = True
-
-            # ── 4. ATR trail activation & optional partial close ──────────────
-            if not atr_activated and cur_pnl >= _trail_cfg["activation_pnl"]:
-                atr_activated = True
-                if _trail_cfg.get("partial_close") and not partial_done:
-                    size_mult    *= 0.50
-                    partial_done  = True
-                    costs_arr[i] += spread_cost * size_mult  # cost of closing half
-
-            # ── 5. Ratchet trail SL ───────────────────────────────────────────
-            if atr_activated:
-                trail_dist = _trail_cfg["trail_mult"] * entry_atr
-                if direction == 1:
-                    new_sl = bar_close - trail_dist
-                    if new_sl > current_sl: current_sl = new_sl
-                else:
-                    new_sl = bar_close + trail_dist
-                    if new_sl < current_sl: current_sl = new_sl
-
-            # ── 6. End-of-bar exit checks ─────────────────────────────────────
+            # ── 3. End-of-bar exit checks ─────────────────────────────────────
+            # Simplified: fixed SL/TP + time stop + SignalEngine regime exit.
+            # ATR trailing, partial close, and profit guard are disabled during
+            # optimization to reduce noise in the CPCV landscape.  Re-enable
+            # after a stable baseline is established.
             hit_time_stop = bars_in_trade >= MAX_HOLD_BARS
-
-            _hmm_now    = int(states[i])
-            regime_exit = (
-                (signal_type == "trend"          and _hmm_now >= CHOP_STATE) or
-                (signal_type == "mean_reversion" and _hmm_now <  CHOP_STATE)
+            engine_exit, _exit_reason = engine.should_exit(
+                regime_info, cur_pnl, max_fav_pnl, bars_in_trade
             )
-
-            engine_exit, _ = engine.should_exit(regime_info, cur_pnl, max_fav_pnl, bars_in_trade)
-
-            _scalp_hit = (
-                _tf_up == "M5"
-                and not _trail_cfg.get("partial_close")
-                and cur_pnl >= _trail_cfg.get("scalp_target", 4.00)
-            )
-
             _force_exit = (
                 test_mask is not None
                 and (i + 1 >= n or not bool(test_mask[i + 1]))
             )
 
-            exit_now = engine_exit or hit_sl or hit_tp1 or hit_time_stop or regime_exit or _scalp_hit or _force_exit
+            exit_now = hit_sl or hit_tp1 or hit_time_stop or engine_exit or _force_exit
 
             if exit_now:
                 costs_arr[i]        += spread_cost * size_mult
@@ -525,19 +490,25 @@ def _run_bar_loop(
                             "signal":      direction,
                             "prob":        float(probabilities[trade_entry_i]),
                             "pnl":         cur_pnl,
-                            "exit_reason": "SL"     if hit_sl        else
-                                           "TP"     if hit_tp1        else
-                                           "TIME"   if hit_time_stop  else
-                                           "REGIME" if regime_exit    else "ENGINE",
+                            "exit_reason": "SL"     if hit_sl       else
+                                           "TP"     if hit_tp1       else
+                                           "TIME"   if hit_time_stop else
+                                           _exit_reason if engine_exit else "FORCE",
                         })
 
-                in_trade, guard_hit, atr_activated, partial_done = False, False, False, False
+                in_trade      = False
+                cooldown_bars = _entry_cooldown   # lock out re-entry
                 engine.on_trade_closed()
                 cum_return, max_fav_pnl, bars_in_trade = 0.0, 0.0, 0
             else:
                 strategy_returns[i] = bar_gross
 
         else:
+            # ── Cooldown: count down before allowing new entries ──────────────
+            if cooldown_bars > 0:
+                cooldown_bars -= 1
+                continue
+
             valid_long  = current_prob >= prob_thresh
             valid_short = current_prob <= short_thresh
 
@@ -571,9 +542,6 @@ def _run_bar_loop(
                             current_sl = entry_price + sl_dist
                             tp1_level  = entry_price - tp1_dist
 
-                        guard_hit     = False
-                        atr_activated = False
-                        partial_done  = False
                         engine.on_trade_entered(int(states[i]))
                         costs_arr[i]        = spread_cost * size_mult
                         strategy_returns[i] = -spread_cost * size_mult

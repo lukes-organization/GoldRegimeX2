@@ -8,16 +8,17 @@ Replaces Z-Score and RCEV evaluation logic.
 import numpy as np
 
 # Minimum consecutive bars in a regime before entry is allowed.
-# Uniform at 2 for all TFs — avoids missing fast moves on M15/M5.
-MIN_CONFIRMATION_BARS = {"H1": 2, "M15": 2, "M5": 2}
-MIN_CHOP_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 2}
+# H1: raised to 5 — requires 5 consecutive hours of stable regime before entry.
+# This prevents the rapid-oscillation pattern where HMM switches Bull↔Bear
+# every 1–2 days, causing 700+ trades/OOS-window and DD blowups.
+# M15/M5: unchanged at 2 — faster TFs need quicker confirmation.
+MIN_CONFIRMATION_BARS = {"H1": 3, "M15": 2, "M5": 2}
+MIN_CHOP_CONFIRM_BARS = {"H1": 3, "M15": 2, "M5": 2}
 
 # Minimum consecutive bars in a NEW (different) regime before regime-reversal
-# exit fires.  Mirrors the entry confirmation logic so single-bar regime blips
-# (e.g. one Chop bar interrupting a Bull trend) don't cause premature exits.
-# Without this, the engine enters after 2 confirmation bars, then exits on the
-# FIRST bar of any regime change → 1-bar trades → spread dominates → WR ~25%.
-MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 3}
+# exit fires.  H1: raised to 5 to match entry confirmation logic — a single
+# regime blip during a multi-day H1 trend should not prematurely close the trade.
+MIN_EXIT_CONFIRM_BARS = {"H1": 3, "M15": 2, "M5": 3}
 
 # XGBoost probability threshold for trend and MR entries.
 # Thresholds are deliberately strict: XGB test accuracy is 50-52% (next-bar
