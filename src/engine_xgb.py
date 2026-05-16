@@ -109,7 +109,9 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
     df = df.copy()
     df["hmm_state"] = hmm_states
     df["prev_log_return"] = df["log_return"].shift(1)
-    y = (df["log_return"].shift(-1) > 0).astype(int).rename("target")
+    horizon        = 6
+    future_returns = df["log_return"].rolling(window=horizon).sum().shift(-horizon)
+    y = (future_returns > 0).astype(int).rename("target")
 
     feature_cols = get_feature_cols(df)
     X = df[feature_cols]
