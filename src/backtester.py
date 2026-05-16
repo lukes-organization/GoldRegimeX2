@@ -22,7 +22,6 @@ ANNUALIZATION_FACTOR = ANNUALIZATION_FACTORS["H1"]   # default
 TF_MIN_EFFICIENCY = {"M5": 4.5}
 
 RISK_PER_TRADE = 0.01
-PROB_THRESHOLD = 0.55  # legacy scalar — per-TF dicts below are used in _run_bar_loop
 
 # ── Strict Probability Thresholds (mirrored from mt5_trader.py) ──────────────
 TF_PROB_THRESHOLD  = {"M5": 0.52, "M15": 0.54, "H1": 0.54}
@@ -366,7 +365,7 @@ def _compute_bb_positions(close: np.ndarray, window: int = 20) -> np.ndarray:
 
 
 def _run_bar_loop(
-    df_aligned: "pd.DataFrame",
+    df_aligned: pd.DataFrame,
     probabilities: np.ndarray,
     states: np.ndarray,
     hmm_transmat,
@@ -376,11 +375,8 @@ def _run_bar_loop(
     split_idx,
     return_trades: bool,
     test_mask=None,
+    raw_atr_arr=None,
 ) -> tuple:
-    """Bar-by-bar SignalEngine loop — replaces vectorised signal generation.
-
-    Returns: (signals, strategy_returns, gross_returns, costs_arr, sizes_arr, trades)
-    """
     from src.signal_engine import SignalEngine
 
     n = len(df_aligned)
@@ -393,41 +389,28 @@ def _run_bar_loop(
     sizes_arr        = np.zeros(n, dtype=np.float64)
     trades           = [] if return_trades else None
 
-    # Close prices for BB position calculation (case-insensitive column lookup)
-    close_col = next(
-        (c for c in ("Close", "close") if c in df_aligned.columns), None
-    )
-    close = df_aligned[close_col].values if close_col else None
-    bb_pos = _compute_bb_positions(close, window=20) if close is not None else np.full(n, 0.5)
-
-    gmm_col = (
-        df_aligned["gmm_vol_cluster"].values
-        if "gmm_vol_cluster" in df_aligned.columns
-        else np.zeros(n, dtype=int)
-    )
-
+    # ── Core price arrays ─────────────────────────────────────────────────────
+    closes      = df_aligned["Close"].values
+    highs       = df_aligned["High"].values if "High" in df_aligned.columns else closes
+    lows        = df_aligned["Low"].values  if "Low"  in df_aligned.columns else closes
     log_returns = df_aligned["log_return"].values
-    atr_norm    = df_aligned["atr_normalized"].values
+
+    # ── Raw ATR fallback (if not pre-computed by caller) ─────────────────────
+    if raw_atr_arr is None:
+        _tr = np.maximum(highs - lows,
+               np.maximum(np.abs(highs - np.roll(closes, 1)),
+                          np.abs(lows  - np.roll(closes, 1))))
+        raw_atr_arr = pd.Series(_tr).rolling(14, min_periods=1).mean().bfill().values
 
     _broker_cfg = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"])
-    spread_cost = (
-        _broker_cfg.get("spread_frac", 0.0004)
-        + _broker_cfg.get("commission_frac", 0.0)
-    )
+    spread_cost = _broker_cfg.get("spread_frac", 0.0004) + _broker_cfg.get("commission_frac", 0.0)
 
-    # ── Per-TF live config lookups ────────────────────────────────────────────
+    # ── Per-TF configs ────────────────────────────────────────────────────────
     _tf_up       = tf.upper()
-    prob_thresh  = TF_PROB_THRESHOLD.get(_tf_up, 0.54)
-    short_thresh = TF_SHORT_THRESHOLD.get(_tf_up, 0.46)
+    prob_thresh  = TF_PROB_THRESHOLD.get(_tf_up, 0.55)
+    short_thresh = TF_SHORT_THRESHOLD.get(_tf_up, 0.45)
     _trail_cfg   = ATR_TRAIL_CONFIG.get(_tf_up, ATR_TRAIL_CONFIG["H1"])
     _tp_sl_cfg   = TP_SL_CONFIG.get(_tf_up, TP_SL_CONFIG["H1"])
-
-    # ── Close / High / Low arrays for intra-bar SL/TP hit simulation ─────────
-    closes   = close if close is not None else np.ones(n)
-    high_col = next((c for c in ("High", "high") if c in df_aligned.columns), None)
-    low_col  = next((c for c in ("Low",  "low")  if c in df_aligned.columns), None)
-    highs    = df_aligned[high_col].values if high_col is not None else closes
-    lows     = df_aligned[low_col].values  if low_col  is not None else closes
 
     # ── Trade state ───────────────────────────────────────────────────────────
     in_trade      = False
@@ -437,10 +420,12 @@ def _run_bar_loop(
     max_fav_pnl   = 0.0
     bars_in_trade = 0
     trade_entry_i = 0
+
+    # ── Execution tracker ─────────────────────────────────────────────────────
     entry_price   = 0.0
     current_sl    = 0.0
     tp1_level     = 0.0
-    atr_cache     = 0.0
+    entry_atr     = 0.0
     guard_hit     = False
     atr_activated = False
     partial_done  = False
@@ -457,13 +442,16 @@ def _run_bar_loop(
             bar_low   = float(lows[i])
             bar_close = float(closes[i])
 
-            # ── Intra-bar SL/TP hit check ─────────────────────────────────────
-            hit_sl  = (direction ==  1 and bar_low  <= current_sl) or \
-                      (direction == -1 and bar_high >= current_sl)
-            hit_tp1 = (direction ==  1 and bar_high >= tp1_level ) or \
-                      (direction == -1 and bar_low  <= tp1_level )
+            # ── 1. Intra-bar SL / TP hit check ───────────────────────────────
+            hit_sl = hit_tp1 = False
+            if direction == 1:
+                if bar_low  <= current_sl: hit_sl  = True
+                if bar_high >= tp1_level:  hit_tp1 = True
+            else:
+                if bar_high >= current_sl: hit_sl  = True
+                if bar_low  <= tp1_level:  hit_tp1 = True
 
-            # ── Bar return contribution ───────────────────────────────────────
+            # ── 2. PnL accounting ─────────────────────────────────────────────
             bar_gross = direction * log_returns[i] * size_mult
             gross_returns[i] = bar_gross
             cum_return  += direction * log_returns[i]
@@ -472,113 +460,90 @@ def _run_bar_loop(
             signals[i]   = direction
             sizes_arr[i] = size_mult
 
-            # ── 70 % profit guard → move SL to break-even ────────────────────
-            if not guard_hit and atr_cache > 0:
-                guard_threshold = 0.70 * _tp_sl_cfg.get(
-                    signal_type, _tp_sl_cfg["trend"]
-                )["tp1_mult"] * atr_cache * account_size
-                if cur_pnl >= guard_threshold:
-                    current_sl = entry_price
+            # ── 3. 70 % profit guard → move SL to entry ──────────────────────
+            if not guard_hit and not hit_tp1:
+                guard_dist = abs(tp1_level - entry_price) * 0.70
+                if direction == 1 and bar_high >= entry_price + guard_dist:
+                    current_sl = entry_price + (spread_cost * 2)
+                    guard_hit  = True
+                elif direction == -1 and bar_low <= entry_price - guard_dist:
+                    current_sl = entry_price - (spread_cost * 2)
                     guard_hit  = True
 
-            # ── ATR trail activation & optional partial close ─────────────────
+            # ── 4. ATR trail activation & optional partial close ──────────────
             if not atr_activated and cur_pnl >= _trail_cfg["activation_pnl"]:
                 atr_activated = True
                 if _trail_cfg.get("partial_close") and not partial_done:
-                    size_mult   *= 0.50
-                    partial_done = True
+                    size_mult    *= 0.50
+                    partial_done  = True
+                    costs_arr[i] += spread_cost * size_mult  # cost of closing half
 
-            # ── ATR ratchet trail SL ──────────────────────────────────────────
-            if atr_activated and atr_cache > 0:
-                trail_dist = _trail_cfg["trail_mult"] * atr_cache
-                new_sl = bar_close - direction * trail_dist
-                if direction ==  1 and new_sl > current_sl:
-                    current_sl = new_sl
-                elif direction == -1 and new_sl < current_sl:
-                    current_sl = new_sl
+            # ── 5. Ratchet trail SL ───────────────────────────────────────────
+            if atr_activated:
+                trail_dist = _trail_cfg["trail_mult"] * entry_atr
+                if direction == 1:
+                    new_sl = bar_close - trail_dist
+                    if new_sl > current_sl: current_sl = new_sl
+                else:
+                    new_sl = bar_close + trail_dist
+                    if new_sl < current_sl: current_sl = new_sl
 
-            # ── M5 scalp target ───────────────────────────────────────────────
+            # ── 6. End-of-bar exit checks ─────────────────────────────────────
+            hit_time_stop = bars_in_trade >= MAX_HOLD_BARS
+
+            _hmm_now    = int(states[i])
+            regime_exit = (
+                (signal_type == "trend"          and _hmm_now >= CHOP_STATE) or
+                (signal_type == "mean_reversion" and _hmm_now <  CHOP_STATE)
+            )
+
+            engine_exit, _ = engine.should_exit(regime_info, cur_pnl, max_fav_pnl, bars_in_trade)
+
             _scalp_hit = (
                 _tf_up == "M5"
                 and not _trail_cfg.get("partial_close")
                 and cur_pnl >= _trail_cfg.get("scalp_target", 4.00)
             )
 
-            # ── Regime exit (trend trade drifts into chop, or vice-versa) ─────
-            _hmm_now   = int(states[i])
-            regime_exit = (
-                (signal_type == "trend"          and _hmm_now >= CHOP_STATE) or
-                (signal_type == "mean_reversion" and _hmm_now <  CHOP_STATE)
-            )
-
-            # ── Engine signal exit ────────────────────────────────────────────
-            engine_exit, _ = engine.should_exit(
-                regime_info, cur_pnl, max_fav_pnl, bars_in_trade
-            )
-
-            # ── Time stop ────────────────────────────────────────────────────
-            hit_time_stop = bars_in_trade >= MAX_HOLD_BARS
-
-            # ── Force-close at test block boundary ───────────────────────────
             _force_exit = (
                 test_mask is not None
                 and (i + 1 >= n or not bool(test_mask[i + 1]))
             )
 
-            exit_now = (
-                engine_exit or hit_sl or hit_tp1 or hit_time_stop
-                or regime_exit or _scalp_hit or _force_exit
-            )
+            exit_now = engine_exit or hit_sl or hit_tp1 or hit_time_stop or regime_exit or _scalp_hit or _force_exit
+
             if exit_now:
-                exit_reason = (
-                    "SL"     if hit_sl                           else
-                    "TP"     if (hit_tp1 or _scalp_hit)          else
-                    "TIME"   if hit_time_stop                    else
-                    "REGIME" if regime_exit                      else
-                    "ENGINE"
-                )
-                costs_arr[i]        = spread_cost * size_mult
-                strategy_returns[i] = bar_gross - spread_cost * size_mult
+                costs_arr[i]        += spread_cost * size_mult
+                strategy_returns[i]  = bar_gross - spread_cost * size_mult
 
                 if return_trades:
                     _is_end = split_idx if split_idx is not None else n
                     if trade_entry_i < _is_end:
                         trades.append({
-                            "bar_idx":         trade_entry_i,
-                            "regime":          int(states[trade_entry_i]),
-                            "signal":          direction,
-                            "signal_type":     signal_type,
-                            "prob":            float(probabilities[trade_entry_i]),
-                            "volatility":      float(atr_norm[trade_entry_i]),
-                            "spread":          spread_cost,
-                            "gmm_vol_cluster": int(gmm_col[trade_entry_i]),
-                            "pnl":             cur_pnl,
-                            "exit_reason":     exit_reason,
-                            "bars_held":       bars_in_trade,
+                            "bar_idx":     trade_entry_i,
+                            "regime":      int(states[trade_entry_i]),
+                            "signal":      direction,
+                            "prob":        float(probabilities[trade_entry_i]),
+                            "pnl":         cur_pnl,
+                            "exit_reason": "SL"     if hit_sl        else
+                                           "TP"     if hit_tp1        else
+                                           "TIME"   if hit_time_stop  else
+                                           "REGIME" if regime_exit    else "ENGINE",
                         })
 
-                in_trade      = False
+                in_trade, guard_hit, atr_activated, partial_done = False, False, False, False
                 engine.on_trade_closed()
-                cum_return    = 0.0
-                max_fav_pnl   = 0.0
-                bars_in_trade = 0
-                guard_hit     = False
-                atr_activated = False
-                partial_done  = False
+                cum_return, max_fav_pnl, bars_in_trade = 0.0, 0.0, 0
             else:
                 strategy_returns[i] = bar_gross
 
         else:
             valid_long  = current_prob >= prob_thresh
             valid_short = current_prob <= short_thresh
+
             if _in_test and (valid_long or valid_short):
-                bb_position = float(bb_pos[i]) if states[i] >= CHOP_STATE else None
-                entry = engine.should_enter(
-                    regime_info,
-                    current_prob,
-                    int(gmm_col[i]),
-                    bb_position,
-                )
+                entry = engine.should_enter(regime_info, current_prob, 1, 0.5)
+
                 if entry:
                     _dir = 1 if entry["signal"] in ("BUY", "MR_BUY") else -1
                     if (_dir == 1 and valid_long) or (_dir == -1 and valid_short):
@@ -588,22 +553,28 @@ def _run_bar_loop(
                         signals[i]    = direction
                         sizes_arr[i]  = size_mult
                         trade_entry_i = i
+                        signal_type   = "mean_reversion" if "MR" in entry["signal"] else "trend"
+
+                        # ── Raw ATR-based SL/TP at entry ─────────────────────
+                        entry_price = float(closes[i])
+                        entry_atr   = max(float(raw_atr_arr[i]), 1e-6)
+
+                        _regime_key = "chop" if int(states[i]) >= CHOP_STATE else "trend"
+                        _sl_tp      = _tp_sl_cfg.get(_regime_key, _tp_sl_cfg["trend"])
+                        sl_dist     = _sl_tp["sl_mult"]  * entry_atr
+                        tp1_dist    = _sl_tp["tp1_mult"] * entry_atr
+
+                        if direction == 1:
+                            current_sl = entry_price - sl_dist
+                            tp1_level  = entry_price + tp1_dist
+                        else:
+                            current_sl = entry_price + sl_dist
+                            tp1_level  = entry_price - tp1_dist
+
                         guard_hit     = False
                         atr_activated = False
                         partial_done  = False
                         engine.on_trade_entered(int(states[i]))
-
-                        # ── Set ATR-based SL/TP levels at entry ──────────────
-                        ep          = float(closes[i])
-                        entry_price = ep
-                        atr_cache   = max(float(atr_norm[i]) * ep, 1e-6)
-                        _hmm_entry  = int(states[i])
-                        _regime_key = "chop" if _hmm_entry >= CHOP_STATE else "trend"
-                        signal_type = "mean_reversion" if _hmm_entry >= CHOP_STATE else "trend"
-                        _sl_tp      = _tp_sl_cfg.get(_regime_key, _tp_sl_cfg["trend"])
-                        current_sl  = ep - direction * _sl_tp["sl_mult"]  * atr_cache
-                        tp1_level   = ep + direction * _sl_tp["tp1_mult"] * atr_cache
-
                         costs_arr[i]        = spread_cost * size_mult
                         strategy_returns[i] = -spread_cost * size_mult
 
@@ -646,15 +617,24 @@ def vectorized_backtest(
     _ = (prob_threshold, short_threshold, regime_stats, evaluator_config, use_tiered)
     atr_norm    = df["atr_normalized"].values
 
+    # ── RAW ATR CALCULATION (CRITICAL FIX) ───────────────────────────────────
+    # Using standard-scaled atr_normalized for SL/TP distances causes negative
+    # distances when volatility is below mean, instantly inverting stops.
+    # Always recompute from True Range using raw price columns.
+    closes = df["Close"].values
+    highs  = df["High"].values if "High" in df.columns else closes
+    lows   = df["Low"].values  if "Low"  in df.columns else closes
+    _tr    = np.maximum(highs - lows,
+             np.maximum(np.abs(highs - np.roll(closes, 1)),
+                        np.abs(lows  - np.roll(closes, 1))))
+    raw_atr_arr = pd.Series(_tr).rolling(14, min_periods=1).mean().bfill().values
+
     # ── Signal generation via bar-by-bar SignalEngine ─────────────────────────
-    # prob_threshold / short_threshold / regime_stats / evaluator_config /
-    # use_tiered are retained in the signature for backward compatibility with
-    # existing callers (cmd_report, validator) but are no longer used.
     signals, strategy_returns, gross_returns, costs, sizes, _trades = _run_bar_loop(
         df, probabilities, hmm_states, hmm_transmat,
         tf=tf, broker=broker, account_size=account_size,
         split_idx=split_idx, return_trades=return_trades,
-        test_mask=test_mask,
+        test_mask=test_mask, raw_atr_arr=raw_atr_arr,
     )
 
     _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
