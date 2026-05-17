@@ -1557,14 +1557,13 @@ def execute_cpcv(
             logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
             continue
 
-    # Total CPCV paths is C(CPCV_N_BLOCKS, CPCV_K_TEST) = C(4,2) = 6.
-    # Require ALL paths valid: params that can't survive every OOS window will
-    # blow up on the full-data training model (producing excessive trades / DD).
-    _total_cpcv_paths = int(comb(CPCV_N_BLOCKS, CPCV_K_TEST))
-    if n_valid_paths < _total_cpcv_paths:
+    # ── Progressive CPCV Scoring ─────────────────────────────────────────────
+    # 1. Hard Floor: reject outright if fewer than 4/6 paths survived.
+    #    Below this threshold the gradient is meaningless for Optuna.
+    if n_valid_paths < 4:
         logger.warning(
-            "CPCV [%s]: only %d/%d valid paths — rejecting trial.",
-            tf, n_valid_paths, _total_cpcv_paths,
+            "CPCV [%s]: only %d/%d valid paths — hard floor, rejecting trial.",
+            tf, n_valid_paths, int(comb(CPCV_N_BLOCKS, CPCV_K_TEST)),
         )
         return {
             "cpcv_score": -50.0, "n_valid_paths": n_valid_paths,
@@ -1573,24 +1572,25 @@ def execute_cpcv(
             "path_scores": path_scores,
         }
 
-    # All paths are valid — compute score from the full set.
-    valid_scores  = [s for s in path_scores  if s > -49.0]
-    valid_sharpes = [s for s in path_sharpes if s > -9.0]
-    _med_score = float(np.median(valid_scores))  if valid_scores  else -50.0
-    _std_score = float(np.std(valid_scores))     if len(valid_scores) > 1 else 0.0
-    # valid_fraction uses total CPCV paths so that partial-valid trials (rejected
-    # above) would have scored lower — kept here for logging consistency (= 1.0).
-    valid_fraction = n_valid_paths / _total_cpcv_paths
-    final_score = (_med_score - 0.25 * _std_score) * valid_fraction
+    # 2. Base Score: median across ALL path scores (including -50 sentinels for
+    #    invalid paths) minus a variance penalty.  Sentinel values naturally
+    #    drag the median downward when paths fail, complementing the explicit
+    #    path penalty below.
+    _med_score = float(np.median(path_scores))
+    _std_score = float(np.std(path_scores))
+    base_score = _med_score - (0.25 * _std_score)
 
+    # 3. Path Penalty: subtract 2.0 per missing path to force Optuna to seek
+    #    6/6.  A 4/6 trial incurs −4.0; a 5/6 trial incurs −2.0; 6/6 is 0.0.
+    path_penalty = (6 - n_valid_paths) * 2.0
+    final_score  = base_score - path_penalty
+
+    valid_sharpes = [s for s in path_sharpes if s > -9.0]
     logger.info(
         "CPCV [%s]: %d/%d valid paths | median_score=%.3f std=%.3f | "
-        "median_sharpe=%.3f | median_trades=%d | final_score=%.3f",
-        tf, n_valid_paths, len(path_scores),
-        _med_score, _std_score,
-        float(np.median(valid_sharpes)) if valid_sharpes else -10.0,
-        int(np.median(path_trades) if path_trades else 0),
-        final_score,
+        "path_penalty=%.1f | final_score=%.3f",
+        tf, n_valid_paths, int(comb(CPCV_N_BLOCKS, CPCV_K_TEST)),
+        _med_score, _std_score, path_penalty, final_score,
     )
     return {
         "cpcv_score":      final_score,

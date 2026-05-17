@@ -110,12 +110,13 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
     df["hmm_state"] = hmm_states
     df["prev_log_return"] = df["log_return"].shift(1)
 
-    # Spread-aware target: the 6-bar forward return must beat the average
-    # spread + slippage buffer (0.0005 log-return ≈ $1 on $2000 gold) to be
-    # labelled a valid buy signal.  Without this floor, micro-momentum noise
-    # bars generate thousands of false positives that cannot cover costs.
+    # Pure directional target: label 1 when the next 6-bar cumulative return is
+    # positive.  A positive margin pollutes y=0 with flat/chop bars, causing the
+    # backtester to fire catastrophic SELL signals during low-volatility regimes.
+    # Spread protection is enforced downstream by the Spread Efficiency Guard in
+    # backtester._run_bar_loop (TF_MIN_EFFICIENCY).
     horizon           = 6
-    MIN_PROFIT_MARGIN = 0.0005
+    MIN_PROFIT_MARGIN = 0.0
     future_returns    = df["log_return"].rolling(window=horizon).sum().shift(-horizon)
     y = (future_returns > MIN_PROFIT_MARGIN).astype(int).rename("target")
 
@@ -202,14 +203,17 @@ def train_xgb(
         model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
         X_eval, y_eval = X_test, y_test
     else:
-        # Full IS mode (train_ratio=1.0): train on 100% of the window.
-        # Do NOT carve out an artificial 15% guard fold — that forces the model to
-        # specialise on the last market regime in the IS window, which ruins
-        # generalisation for the upcoming OOS window.  Rely on Optuna-tuned
-        # max_depth and min_child_weight for regularisation instead.
-        model.set_params(early_stopping_rounds=None)
-        model.fit(X_train, y_train, verbose=False)
-        X_eval, y_eval = X_train, y_train
+        # Full CPCV mode (train_ratio=1.0): without a holdout XGBoost builds all
+        # n_estimators trees → 90%+ train accuracy (severe overfitting).
+        # Fix: carve the last 15% of the stitched CPCV training path as an internal
+        # eval set for early stopping.  This halts tree growth before memorisation
+        # without leaking future OOS data into the scaler or feature distribution.
+        es_idx = int(len(X_train) * 0.85)
+        X_t, y_t = X_train.iloc[:es_idx], y_train.iloc[:es_idx]
+        X_v, y_v = X_train.iloc[es_idx:], y_train.iloc[es_idx:]
+        model.set_params(early_stopping_rounds=15)
+        model.fit(X_t, y_t, eval_set=[(X_v, y_v)], verbose=False)
+        X_eval, y_eval = X_v, y_v
 
     train_acc = accuracy_score(y_train, model.predict(X_train))
     test_acc  = accuracy_score(y_eval, model.predict(X_eval))

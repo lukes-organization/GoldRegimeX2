@@ -481,19 +481,42 @@ def _run_bar_loop(
             bar_low   = float(lows[i])
             bar_close = float(closes[i])
 
-            # ── 1. Intra-bar SL / TP hit check ───────────────────────────────
+            # ── 1. Intra-bar SL / TP hit check (Pessimistic Execution) ────────
+            # Pessimistic: if both would be hit, assume SL hit first (worst case).
+            # When a level is breached, record the exact SL/TP price so bar_gross
+            # reflects the actual fill rather than the close-to-close return.
             hit_sl = hit_tp1 = False
-            if direction == 1:
-                if bar_low  <= current_sl: hit_sl  = True
-                if bar_high >= tp1_level:  hit_tp1 = True
-            else:
-                if bar_high >= current_sl: hit_sl  = True
-                if bar_low  <= tp1_level:  hit_tp1 = True
+            exit_price = bar_close  # default — overridden when a level is breached
 
-            # ── 2. PnL accounting ─────────────────────────────────────────────
-            bar_gross = direction * log_returns[i] * size_mult
+            if direction == 1:
+                if bar_low <= current_sl:
+                    hit_sl     = True
+                    exit_price = current_sl
+                elif bar_high >= tp1_level:
+                    hit_tp1    = True
+                    exit_price = tp1_level
+            else:
+                if bar_high >= current_sl:
+                    hit_sl     = True
+                    exit_price = current_sl
+                elif bar_low <= tp1_level:
+                    hit_tp1    = True
+                    exit_price = tp1_level
+
+            # ── 2. Precise PnL accounting ─────────────────────────────────────
+            # When a SL/TP is hit use log(exit_price / prev_close) so the return
+            # segment stops at the actual fill price, not the bar close.
+            prev_close = float(closes[i - 1]) if i > 0 else float(closes[i])
+            if (hit_sl or hit_tp1) and prev_close > 0:
+                actual_return = np.log(exit_price / prev_close)
+                bar_gross = direction * actual_return * size_mult
+            else:
+                bar_gross = direction * log_returns[i] * size_mult
+
             gross_returns[i] = bar_gross
-            cum_return  += direction * log_returns[i]
+            # Accumulate the raw directional log-return (un-sized) so cum_return
+            # tracks the true price move from entry regardless of partial closes.
+            cum_return += (bar_gross / size_mult) if size_mult > 0 else 0.0
             cur_pnl      = cum_return * account_size
             max_fav_pnl  = max(max_fav_pnl, cur_pnl)
             signals[i]   = direction
@@ -502,7 +525,8 @@ def _run_bar_loop(
             # ── 3. 70 % Profit Guard ─────────────────────────────────────────
             # Once price has covered 70 % of the TP1 distance, move SL to
             # entry + 2× spread so the trade can't turn into a loss.
-            if not guard_hit and not hit_tp1:
+            # Skip if an intra-bar exit already fired this bar.
+            if not guard_hit and not hit_tp1 and not hit_sl:
                 guard_dist = abs(tp1_level - entry_price) * 0.70
                 if direction == 1 and bar_high >= entry_price + guard_dist:
                     current_sl = entry_price + spread_cost * 2
@@ -594,6 +618,15 @@ def _run_bar_loop(
                 valid_short = current_prob <= short_thresh
 
                 if valid_long or valid_short:
+                    # ── Spread Efficiency Guard ────────────────────────────────
+                    # Reject the signal if the bar's raw ATR cannot cover the
+                    # broker spread by the required multiple.  Mirrors the live
+                    # TF_MIN_EFFICIENCY check and prevents trading illiquid bars.
+                    _bar_atr = max(float(raw_atr_arr[i]), 1e-6)
+                    _min_eff = TF_MIN_EFFICIENCY.get(_tf_up, 1.25)
+                    if (_bar_atr / spread_cost) < _min_eff:
+                        continue
+
                     entry = engine.should_enter(regime_info, current_prob, 1, 0.5)
 
                     if entry:
