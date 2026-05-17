@@ -19,6 +19,7 @@ import sys
 import time
 from collections import Counter
 from itertools import combinations
+from math import comb
 
 import numpy as np
 import optuna
@@ -78,7 +79,7 @@ IS_OOS_SPLIT = {
     for tf in WFO_PARAMS
 }
 
-WFO_TRIALS      = {"H1": 60,  "M15": 100, "M5": 120}
+WFO_TRIALS      = {"H1": 250,  "M15": 100, "M5": 120}
 WFO_TRIALS_FAST = {"H1": 60,  "M15": 100, "M5": 120}
 
 # Inner IS cross-validation folds per TF
@@ -1556,9 +1557,14 @@ def execute_cpcv(
             logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
             continue
 
-    if n_valid_paths < 4:  # C(4,2)=6 total paths; require 4/6 valid (one bad pair tolerated)
+    # Total CPCV paths is C(CPCV_N_BLOCKS, CPCV_K_TEST) = C(4,2) = 6.
+    # Require ALL paths valid: params that can't survive every OOS window will
+    # blow up on the full-data training model (producing excessive trades / DD).
+    _total_cpcv_paths = int(comb(CPCV_N_BLOCKS, CPCV_K_TEST))
+    if n_valid_paths < _total_cpcv_paths:
         logger.warning(
-            "CPCV [%s]: only %d valid paths — rejecting trial.", tf, n_valid_paths
+            "CPCV [%s]: only %d/%d valid paths — rejecting trial.",
+            tf, n_valid_paths, _total_cpcv_paths,
         )
         return {
             "cpcv_score": -50.0, "n_valid_paths": n_valid_paths,
@@ -1567,24 +1573,30 @@ def execute_cpcv(
             "path_scores": path_scores,
         }
 
-    _med_score = float(np.median(path_scores))
-    _std_score = float(np.std(path_scores))
-    final_score = _med_score - 0.25 * _std_score  # variance penalty
+    # All paths are valid — compute score from the full set.
+    valid_scores  = [s for s in path_scores  if s > -49.0]
+    valid_sharpes = [s for s in path_sharpes if s > -9.0]
+    _med_score = float(np.median(valid_scores))  if valid_scores  else -50.0
+    _std_score = float(np.std(valid_scores))     if len(valid_scores) > 1 else 0.0
+    # valid_fraction uses total CPCV paths so that partial-valid trials (rejected
+    # above) would have scored lower — kept here for logging consistency (= 1.0).
+    valid_fraction = n_valid_paths / _total_cpcv_paths
+    final_score = (_med_score - 0.25 * _std_score) * valid_fraction
 
     logger.info(
         "CPCV [%s]: %d/%d valid paths | median_score=%.3f std=%.3f | "
         "median_sharpe=%.3f | median_trades=%d | final_score=%.3f",
         tf, n_valid_paths, len(path_scores),
         _med_score, _std_score,
-        float(np.median(path_sharpes)),
+        float(np.median(valid_sharpes)) if valid_sharpes else -10.0,
         int(np.median(path_trades) if path_trades else 0),
         final_score,
     )
     return {
         "cpcv_score":      final_score,
         "n_valid_paths":   n_valid_paths,
-        "median_sharpe":   float(np.median(path_sharpes)),
-        "std_sharpe":      float(np.std(path_sharpes)),
+        "median_sharpe":   float(np.median(valid_sharpes)) if valid_sharpes else -10.0,
+        "std_sharpe":      float(np.std(valid_sharpes))    if len(valid_sharpes) > 1 else 0.0,
         "median_trades":   int(np.median(path_trades) if path_trades else 0),
         "median_win_rate": float(np.median(path_winrates) if path_winrates else 0.0),
         "median_drawdown": float(np.median(path_drawdowns) if path_drawdowns else 0.0),

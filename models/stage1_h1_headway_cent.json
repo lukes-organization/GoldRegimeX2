@@ -1,20 +1,20 @@
 {
   "params": {
-    "obs_cov": 1.8072759459224417,
-    "trans_cov": 0.0027964521145029423,
+    "obs_cov": 0.5046336688817099,
+    "trans_cov": 0.0010795911916802235,
     "n_states": 3,
     "max_depth": 6,
-    "reg_alpha": 2.341945496642375e-06,
-    "reg_lambda": 0.06857713717420494,
-    "min_child_weight": 40,
-    "learning_rate": 0.051017422721776326,
-    "n_estimators": 150,
-    "subsample": 0.8451981787955006,
-    "colsample_bytree": 0.8845591565433129,
-    "gamma": 7.391392329021222e-05,
-    "scale_pos_weight": 1.401330585742105
+    "reg_alpha": 0.3347784597303453,
+    "reg_lambda": 0.013215525381916495,
+    "min_child_weight": 32,
+    "learning_rate": 0.006952810660356771,
+    "n_estimators": 250,
+    "subsample": 0.7153338228026468,
+    "colsample_bytree": 0.4343130572277933,
+    "gamma": 0.0007865387312623755,
+    "scale_pos_weight": 1.0444078625439002
   },
-  "score": 1.5834138958312878,
+  "score": 2.5254957510520817,
   "tf": "H1",
   "broker": "headway_cent"
 }

@@ -12,8 +12,8 @@ import numpy as np
 # This prevents the rapid-oscillation pattern where HMM switches Bull↔Bear
 # every 1–2 days, causing 700+ trades/OOS-window and DD blowups.
 # M15/M5: unchanged at 2 — faster TFs need quicker confirmation.
-MIN_CONFIRMATION_BARS = {"H1": 3, "M15": 2, "M5": 2}
-MIN_CHOP_CONFIRM_BARS = {"H1": 3, "M15": 2, "M5": 2}
+MIN_CONFIRMATION_BARS = {"H1": 2, "M15": 2, "M5": 2}
+MIN_CHOP_CONFIRM_BARS = {"H1": 4, "M15": 2, "M5": 2}
 
 # Minimum consecutive bars in a NEW (different) regime before regime-reversal
 # exit fires.  H1: raised to 5 to match entry confirmation logic — a single
@@ -24,8 +24,8 @@ MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 3}
 # Thresholds are deliberately strict: XGB test accuracy is 50-52% (next-bar
 # direction), so only the highest-confidence bars have real signal.  Allowing
 # lower thresholds floods the engine with noise trades and destroys performance.
-ENTRY_PROB    = {"H1": 0.55, "M15": 0.55, "M5": 0.52}
-MR_ENTRY_PROB = {"H1": 0.56, "M15": 0.52, "M5": 0.50}
+ENTRY_PROB    = {"H1": 0.575, "M15": 0.55, "M5": 0.52}
+MR_ENTRY_PROB = {"H1": 0.575, "M15": 0.52, "M5": 0.50}
 
 # Maximum bars to hold a single trade before forcing exit
 MAX_HOLD_BARS = {"H1": 24, "M15": 32, "M5": 48}
@@ -36,7 +36,7 @@ PROFIT_EROSION_THRESHOLD = 0.40
 # Minimum HMM self-transition probability for stable regime entry/hold.
 # TF-specific: M5 HMMs naturally have lower persistence due to noise.
 PERSISTENCE_MIN = {
-    "H1": 0.55,
+    "H1": 0.57,
     "M15": 0.55,
     "M5": 0.45,
 }
