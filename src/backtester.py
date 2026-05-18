@@ -17,9 +17,10 @@ ANNUALIZATION_FACTOR = ANNUALIZATION_FACTORS["H1"]   # default
 #     keeping the bulk of mean-reversion opportunities.  The previous 7.0×
 #     threshold matched avg_efficiency 4-6× seen in most trials, blocking
 #     the majority of valid M5 signals and starving the Activity Bonus.
-# H1/M15/default: 1.25× — standard threshold that blocks only the most
-#     illiquid bars while leaving the majority of trend sessions open.
-TF_MIN_EFFICIENCY = {"M5": 4.5}
+# H1: 1.25× — standard minimum (trend sessions rarely blocked)
+# M15: 2.50× — tighter: rejects noisy/choppy M15 spreads
+# M5:  3.50× — strictest: M5 needs wide ATR relative to spread cost
+TF_MIN_EFFICIENCY = {"H1": 1.25, "M15": 2.50, "M5": 3.50}
 
 RISK_PER_TRADE = 0.01
 

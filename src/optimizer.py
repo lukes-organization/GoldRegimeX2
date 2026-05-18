@@ -426,7 +426,6 @@ def _run_single_window(
         oos_score = _score_from_backtest(
             oos_result, tf=tf, account_size=balance, n_bars=oos_bars
         )
-        oos_score = max(oos_score, -1.0)
         if hmm_zeroed:
             oos_score *= 0.5  # XGB ignoring HMM regime = signal quality failure
         if mean_cv_sharpe < -1.0:
