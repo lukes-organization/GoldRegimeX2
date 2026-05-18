@@ -791,6 +791,11 @@ def compute_live_features(
             feature_dict["gmm_vol_cluster"] = 0.0
             df["gmm_vol_cluster"] = 0.0                       # LSTM fallback
 
+    if "synth_vix_zscore" in feature_cols:
+        from src.processor import compute_synth_vix
+        _svix = compute_synth_vix(df)
+        feature_dict["synth_vix_zscore"] = float(_svix.iloc[-1]) if not np.isnan(_svix.iloc[-1]) else 0.0
+
     features_df = pd.DataFrame([feature_dict])[feature_cols]
 
     # Apply the 10-year feature scaler so live values match the training distribution
@@ -814,7 +819,6 @@ def compute_live_features(
     atr_price   = atr_normalized * float(df["Close"].iloc[-1])
     # Return raw (pre-scaler) atr_normalized separately so the live ER filter
     # can compare it against spread_frac without using the scaled value.
-    # raw_df is the full live DataFrame (200 bars) passed to the TCN confidence scorer.
     return features_df, current_state, atr_price, atr_normalized, df
 
 
@@ -1050,61 +1054,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         obs_cov   = None
         trans_cov = None
 
-    # Load optional TCN confidence scorer — absent until --mode train_tcn is run
-    from src.engine_tcn import load_tcn_classifier as _load_tcn_clf
-    tcn_classifier = _load_tcn_clf(tf, broker)
-    if tcn_classifier is not None:
-        logger.info(
-            "TCN confidence model loaded [%s/%s] — seq_len=%d  n_states=%d.",
-            tf, broker, tcn_classifier.seq_len, tcn_classifier.n_states,
-        )
-    else:
-        logger.info(
-            "TCN confidence model not found [%s/%s] — "
-            "Run --mode train_tcn to enable TCN confidence scoring.",
-            tf, broker,
-        )
-
     cfg_tf    = TF_CONFIG[tf.upper()]
     obs_cov   = obs_cov   if obs_cov   is not None else cfg_tf["obs_cov_default"]
     trans_cov = trans_cov if trans_cov is not None else cfg_tf["trans_cov_default"]
-
-    # ── TCN startup health check ───────────────────────────────────────────
-    if tcn_classifier is not None:
-        _hc_ok, _hc_msg = tcn_classifier.health_check()
-        if not _hc_ok:
-            logger.warning(
-                "[TCN HEALTH] FAILED (%s) — TCN disabled. "
-                "Retrain with --mode train_tcn.",
-                _hc_msg,
-            )
-            tcn_classifier = None
-        else:
-            # Quick multiplier probe on real warmup data
-            try:
-                _hc_df = _build_live_df(DEFAULT_SYMBOL, tf_mt5, 150, obs_cov, trans_cov)
-                try:
-                    _hc_gmm, _hc_gscaler = load_gmm_model(tf, broker)
-                    _hc_df["gmm_vol_cluster"] = compute_gmm_vol_cluster(
-                        _hc_df["volatility"].values,
-                        fitted_gmm=_hc_gmm, fitted_scaler=_hc_gscaler,
-                    ).astype(float)
-                except Exception:
-                    _hc_df["gmm_vol_cluster"] = 0.0
-                _hc_mult = tcn_classifier.predict_confidence(_hc_df)
-                if _hc_mult is not None:
-                    logger.info(
-                        "[TCN HEALTH] OK — multiplier=%.2f.",
-                        _hc_mult,
-                    )
-                else:
-                    logger.warning(
-                        "[TCN HEALTH] warmup probe returned None — TCN disabled."
-                    )
-                    tcn_classifier = None
-            except Exception as _hc_exc:
-                logger.warning("[TCN HEALTH] warmup probe error: %s", _hc_exc)
-                tcn_classifier = None
 
     # Session state (persists across bars within a day)
     last_bar_time = None

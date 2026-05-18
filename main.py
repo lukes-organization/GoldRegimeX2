@@ -981,17 +981,6 @@ def main():
                         help="WFA IS window in calendar days (default: H1=365, M15=180, M5=90).")
     parser.add_argument("--test_days",  type=int, default=None,
                         help="WFA OOS step size in calendar days (default: H1=90, M15=60, M5=30).")
-    parser.add_argument("--epochs",     type=int, default=100,
-                        help="TCN training epochs for --mode train_tcn (default 100).")
-    parser.add_argument("--seq_len", type=int, default=100,
-                        help="TCN sequence length in bars (default 100).")
-    parser.add_argument("--temperature", type=float, default=1.5,
-                        help="Temperature for TCN probability calibration (default 1.5). "
-                             ">1.0 softens; 1.0 = raw output; <1.0 sharpens.")
-    parser.add_argument("--fine_tune", action="store_true",
-                        help="Fine-tune an existing TCN on recent data instead of full retraining.")
-    parser.add_argument("--recent_years", type=int, default=2,
-                        help="Years of recent data used for --fine_tune (default 2).")
     parser.add_argument("--fast_wfo", action="store_true",
                         help="Use faster WFO window sizes for --mode optimize and --mode wfa.")
     parser.add_argument("--top_n", type=int, default=10,
