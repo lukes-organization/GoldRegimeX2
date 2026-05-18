@@ -679,6 +679,7 @@ def vectorized_backtest(
     return_trades: bool = False,
     hmm_transmat=None,
     test_mask=None,
+    noise_std: float = 0.0,
 ):
     """Bar-by-bar backtest using SignalEngine for entry/exit decisions.
 
@@ -698,6 +699,7 @@ def vectorized_backtest(
     """
     _ = (prob_threshold, short_threshold, regime_stats, evaluator_config, use_tiered)
     atr_norm    = df["atr_normalized"].values
+    n           = len(df)
 
     # ── RAW ATR CALCULATION (CRITICAL FIX) ───────────────────────────────────
     # Using standard-scaled atr_normalized for SL/TP distances causes negative
@@ -706,6 +708,31 @@ def vectorized_backtest(
     closes = df["Close"].values
     highs  = df["High"].values if "High" in df.columns else closes
     lows   = df["Low"].values  if "Low"  in df.columns else closes
+
+    # ── MONTE CARLO: Price Perturbation ──────────────────────────────────────
+    # Simulates execution slippage and varying broker data feeds.
+    # noise_std=0.0002 alters prices by ~2 pips — passes through to _run_bar_loop
+    # via a lightweight df copy so raw_atr_arr is also recomputed consistently.
+    if noise_std > 0.0:
+        rng     = np.random.default_rng()           # seedless — true randomness per run
+        c_noise = rng.normal(1.0, noise_std, size=n)
+        h_noise = rng.normal(1.0, noise_std, size=n)
+        l_noise = rng.normal(1.0, noise_std, size=n)
+
+        closes  = closes * c_noise
+        highs   = highs  * h_noise
+        lows    = lows   * l_noise
+
+        # Enforce OHLC sanity after perturbation
+        highs = np.maximum(highs, np.maximum(closes, lows))
+        lows  = np.minimum(lows,  np.minimum(closes, highs))
+
+        # Propagate perturbed prices into a df copy that _run_bar_loop will read
+        df = df.copy()
+        df["Close"] = closes
+        df["High"]  = highs
+        df["Low"]   = lows
+
     _tr    = np.maximum(highs - lows,
              np.maximum(np.abs(highs - np.roll(closes, 1)),
                         np.abs(lows  - np.roll(closes, 1))))

@@ -944,13 +944,177 @@ def cmd_sensitivity(args):
     )
 
 
+def cmd_montecarlo(args):
+    """Monte Carlo stress-test for an already-trained model.
+
+    Two tests are run in sequence:
+
+    1. **Trade reshuffling** — the chronological PnL sequence from a baseline
+       backtest is randomly permuted 10,000 times to reveal the worst-case
+       sequence-of-returns risk (95th-pctl MaxDD and Risk of Ruin).
+
+    2. **Price perturbation** — the OHLC prices are perturbed with tiny
+       multiplicative noise (std 0.0002 ≈ 2 pips) and the full bar-loop is
+       re-run 100 times to confirm the strategy survives execution slippage.
+
+    Usage::
+
+        python main.py --mode montecarlo --tf M15 --broker headway_cent --balance 15
+    """
+    import numpy as np
+    from src.monte_carlo import run_trade_reshuffle
+    from src.backtester import vectorized_backtest
+
+    balance = _resolve_balance(args)
+    broker  = args.broker
+    tf      = args.tf.upper()
+    reconfigure_for_tf(tf)
+
+    logger.info("Starting Monte Carlo Stress Test [%s / %s] balance=$%.0f",
+                tf, broker, balance)
+
+    # ── Load models (mirrors cmd_report loading logic) ────────────────────────
+    try:
+        params = get_best_params(balance=balance, broker=broker, tf=tf)
+    except Exception:
+        params = {}
+
+    df = process_pipeline(
+        obs_cov=params.get("obs_cov"), trans_cov=params.get("trans_cov"),
+        save=False, tf=tf,
+    )
+
+    _hmm_path = hmm_model_path(tf, broker)
+    try:
+        model_hmm = load_hmm(_hmm_path)
+        from src.engine_hmm import predict_states
+        states = predict_states(model_hmm, df)
+    except Exception:
+        model_hmm, states, _ = fit_hmm(df, n_states=params.get("n_states", 3))
+
+    try:
+        _feat_scaler = load_feature_scaler(tf=tf, broker=broker)
+    except FileNotFoundError:
+        _feat_scaler = None
+
+    X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
+
+    _xgb_path = get_ensemble_path(tf, broker)
+    if not _xgb_path.exists():
+        _xgb_path = ENSEMBLE_PKL_PATH
+    try:
+        models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
+        if metrics.get("feature_cols") != list(X.columns):
+            raise ValueError("Feature mismatch")
+    except (FileNotFoundError, ValueError):
+        models_xgb, thresholds_xgb, metrics = train_xgb_ensemble(
+            X, y,
+            max_depth=params.get("max_depth", 4),
+            learning_rate=params.get("learning_rate", 0.1),
+            n_estimators=params.get("n_estimators", 200),
+            subsample=params.get("subsample", 0.8),
+            colsample_bytree=params.get("colsample_bytree", 0.8),
+            min_child_weight=params.get("min_child_weight", 5),
+            gamma=params.get("gamma", 1.0),
+            reg_alpha=params.get("reg_alpha", 0.1),
+        )
+
+    _, probabilities = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
+    states_aligned   = states[df.index.isin(df_aligned.index)]
+    split_idx        = metrics.get("split_idx")
+    if split_idx is not None and not (0 < split_idx < len(X)):
+        split_idx = int(len(X) * 0.8)
+
+    # ── 1. Baseline chronological backtest → raw trades ───────────────────────
+    logger.info("Running baseline chronological backtest...")
+    baseline = vectorized_backtest(
+        df_aligned, probabilities, states_aligned,
+        split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
+        hmm_transmat=model_hmm.transmat_,
+        return_trades=True,
+    )
+    baseline_ret = baseline["returns"] if "returns" in baseline else np.array([])
+    # strategy_returns lives under 'returns' or can be recomputed from equity
+    # Use the direct array stored in the result dict
+    _strat_ret = baseline.get("returns",
+                    np.diff(np.log(baseline["equity_values"]),
+                            prepend=np.log(balance)))
+    _active    = _strat_ret[_strat_ret != 0]
+    _ann_factor = {"H1": np.sqrt(252 * 24), "M15": np.sqrt(252 * 96),
+                   "M5":  np.sqrt(252 * 288)}.get(tf, np.sqrt(252 * 24))
+    baseline_sharpe = (
+        _ann_factor * np.mean(_active) / np.std(_active)
+        if len(_active) > 2 and np.std(_active) > 0 else 0.0
+    )
+
+    trades_df = baseline.get("trades_df")
+    if trades_df is None or len(trades_df) == 0:
+        logger.warning("No trades in baseline backtest — Monte Carlo results will be trivial.")
+        trades_list = []
+    else:
+        trades_list = trades_df[["pnl"]].rename(columns={"pnl": "pnl"}).to_dict("records")
+
+    # ── 2. Trade reshuffling (sequence-of-returns risk) ────────────────────────
+    logger.info("Executing Sequence of Returns Reshuffling (10,000 iterations)...")
+    mc_results = run_trade_reshuffle(trades_list, initial_balance=balance)
+
+    # ── 3. Price perturbation (execution / wick risk) ─────────────────────────
+    logger.info("Executing Price Perturbation Simulation (100 iterations at noise_std=0.0002)...")
+    noise_sharpes = []
+    for _ in range(100):
+        _res = vectorized_backtest(
+            df_aligned, probabilities, states_aligned,
+            split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
+            hmm_transmat=model_hmm.transmat_,
+            return_trades=False,
+            noise_std=0.0002,
+        )
+        _nr = _res.get("returns",
+                np.diff(np.log(_res["equity_values"]), prepend=np.log(balance)))
+        _nv = _nr[_nr != 0]
+        if len(_nv) > 2 and np.std(_nv) > 0:
+            noise_sharpes.append(_ann_factor * np.mean(_nv) / np.std(_nv))
+
+    if noise_sharpes:
+        median_noise_sharpe = float(np.median(noise_sharpes))
+        worst_noise_sharpe  = float(np.min(noise_sharpes))
+    else:
+        median_noise_sharpe = worst_noise_sharpe = 0.0
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    logger.info("=== Monte Carlo Stress Test Complete ===")
+    logger.info("Baseline Sharpe:      %.3f", baseline_sharpe)
+    logger.info("Median Noise Sharpe:  %.3f", median_noise_sharpe)
+    logger.info("Worst Noise Sharpe:   %.3f", worst_noise_sharpe)
+    logger.info("Risk of 50%% Ruin:     %.2f%%", mc_results.get("risk_of_ruin_pct", 0.0))
+    logger.info("95th Pctl MaxDD:      %.1f%%", mc_results.get("95th_percentile_dd", 0.0) * 100)
+
+    print(f"\n=== Monte Carlo Stress Test [{tf} / {broker}] ===")
+    print(f"  Baseline Sharpe:      {baseline_sharpe:.3f}")
+    print(f"  Median Noise Sharpe:  {median_noise_sharpe:.3f}")
+    print(f"  Worst  Noise Sharpe:  {worst_noise_sharpe:.3f}")
+    ror = mc_results.get('risk_of_ruin_pct', 0.0)
+    dd95 = mc_results.get('95th_percentile_dd', 0.0) * 100
+    print(f"  Risk of 50% Ruin:     {ror:.2f}%")
+    print(f"  95th Pctl MaxDD:      {dd95:.1f}%")
+    n_trades = len(trades_list)
+    print(f"  Trades in baseline:   {n_trades}")
+    if n_trades == 0:
+        print("  [!] WARNING: No trades — model may need retraining or thresholds are too strict.")
+    if ror > 5.0:
+        print("  [!] WARNING: Risk of Ruin >5% — consider tightening position sizing.")
+    if dd95 > 30.0:
+        print("  [!] WARNING: 95th-pctl MaxDD >30% — sequence risk is elevated.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gold Regime X — Hybrid ML Trading System")
     parser.add_argument(
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
                  "sync_validate", "demo", "live", "audit", "guardian", "listen",
-                 "consolidate", "wfa", "sensitivity", "extract_consensus"],
+                 "consolidate", "wfa", "sensitivity", "extract_consensus",
+                 "montecarlo"],
         required=True,
     )
     parser.add_argument("--trials",   type=int,   default=250)
@@ -1016,6 +1180,7 @@ def main():
         "wfa":           cmd_wfa,
         "sensitivity":   cmd_sensitivity,
         "extract_consensus": cmd_extract_consensus,
+        "montecarlo":    cmd_montecarlo,
     }[args.mode](args)
 
 
