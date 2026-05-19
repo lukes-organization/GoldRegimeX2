@@ -17,20 +17,19 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 9. [Command Reference](#command-reference)
 10. [Signal Logic — Regime-Confirmation](#signal-logic--regime-confirmation)
 11. [Automatic Data Updates](#automatic-data-updates)
-12. [Automatic Data Updates](#automatic-data-updates)
-13. [Sensitivity Analysis](#sensitivity-analysis)
-14. [Interactive Research Notebook](#interactive-research-notebook)
-15. [Risk Management](#risk-management)
-16. [Timeframe Configurations](#timeframe-configurations)
-17. [Performance Metrics & Scoring](#performance-metrics--scoring)
-18. [Optimizer Anti-Overfitting Rules](#optimizer-anti-overfitting-rules)
-19. [Telegram Remote Control](#telegram-remote-control)
-20. [Multi-TF Live Trading](#multi-tf-live-trading)
-21. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
-22. [Walk-Forward Optimization (WFO)](#walk-forward-optimization-wfo)
-23. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
-24. [Troubleshooting](#troubleshooting)
-25. [Security Notes](#security-notes)
+12. [Sensitivity Analysis](#sensitivity-analysis)
+13. [Interactive Research Notebook](#interactive-research-notebook)
+14. [Risk Management](#risk-management)
+15. [Timeframe Configurations](#timeframe-configurations)
+16. [Performance Metrics & Scoring](#performance-metrics--scoring)
+17. [Optimizer Anti-Overfitting Rules](#optimizer-anti-overfitting-rules)
+18. [Telegram Remote Control](#telegram-remote-control)
+19. [Multi-TF Live Trading](#multi-tf-live-trading)
+20. [MQL5 EA (Alternative Execution)](#mql5-ea-alternative-execution)
+21. [Combinatorial Purged CV (CPCV)](#combinatorial-purged-cv-cpcv)
+22. [Walk-Forward Analysis & Staleness Gate](#walk-forward-analysis--staleness-gate)
+23. [Troubleshooting](#troubleshooting)
+24. [Security Notes](#security-notes)
 
 ---
 
@@ -100,7 +99,7 @@ Live Bridge  →  MT5 Market Orders
       │  TF-specific magic numbers: H1=123456, M15=123457, M5=123458
 ```
 
-The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoost hyperparameters (including L1 and L2 regularisation), scoring every trial on **OOS Complex Criterion only** using the Rolling Walk-Forward Optimization (`_run_wfo`) with per-window IS cross-validation. Supports purged 3-fold time-series cross-validation via `--split_method purged_ts`. A `"fast"` WFO mode is available for M5/M15 with a shorter 6-month IS window for quicker intraday regime adaptation. Before each optimization run, `ensure_data_updated()` auto-fetches any missing bars from MT5 so the model always trains on the most recent data.
+The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoost hyperparameters (including L1 and L2 regularisation), scoring every trial on **OOS Complex Criterion only** using **Combinatorial Purged Cross-Validation (CPCV)** with `C(4,2) = 6` combinatorial train/test paths. The dataset is split into 4 chronological blocks; each trial evaluates all 6 path combinations with a TF-specific purge gap (H1: 24 bars, M15: 96 bars, M5: 288 bars) to prevent leakage between adjacent train and test blocks. Stage 1 (`--stage xgb`) uses a fast single IS/OOS hold-out (~5× faster, no CPCV); Stage 2 (`--stage trading`) runs full CPCV warm-started from Stage 1 params. Before each optimization run, `ensure_data_updated()` auto-fetches any missing bars from MT5 so the model always trains on the most recent data.
 
 ---
 
@@ -114,7 +113,7 @@ The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoos
 | `src/signal_engine.py` | **Stateful signal engine** — `SignalEngine`; regime-confirmation entry (persistence + XGBoost prob + synth-VIX Z-score + ATR band); exit on regime reversal, persistence collapse, profit erosion, or max hold |
 | `src/sensitivity.py` | Z-Score sensitivity sweep — Bull/Bear cutoffs 1.5–3.0σ; outputs ranked table + `reports/sensitivity_<TF>_<broker>.csv/json` |
 | `src/backtester.py` | Bar-by-bar backtest via `SignalEngine` — IS/OOS split, broker costs, floating drawdown, MT5 equity curve, MR attribution |
-| `src/optimizer.py` | Rolling WFO optimizer — per-window IS cross-validation; Revised Complex Criterion scoring; `WFO_PARAMS`, `WFO_PARAMS_FAST`, `CV_FOLDS`; per-broker SQLite resume; RAM guard; Telegram heartbeat |
+| `src/optimizer.py` | CPCV optimizer — C(4,2)=6 combinatorial purged paths; Calmar-dominant composite scoring (Calmar×0.45 + Sharpe×0.35 + PF×0.15 + Edge×0.05); `CPCV_N_BLOCKS=4`, `CPCV_K_TEST=2`, `CPCV_PURGE_BARS` per TF; two-stage: `--stage xgb` fast hold-out → `--stage trading` full CPCV; `WFO_PARAMS`/`WFO_PARAMS_FAST` retained for backward-compat (notebook); per-broker SQLite resume; RAM guard; Telegram heartbeat |
 | `notebooks/GoldRegimeX_Explorer.ipynb` | Interactive research notebook — equity explorer, WFO window analysis (standard/fast mode), feature/regime explorer, parameter sensitivity with WFO comparison, CV Path Inspector (Section 6) |
 | `src/risk_manager.py` | AdaptiveRiskManager, CentConverter, DailyEquityGate, broker cost configs |
 | `src/visualizer.py` | 6-chart visual report: regime overlay, equity curve, features, transition matrix, dashboard, MT5 balance/equity |
@@ -889,8 +888,7 @@ The 0.20 multiplier (up from 0.15) aligns with the wider score range (−5 to +5
 | n_states restriction | All TFs: `{3, 4}` |
 | No threshold search | SignalEngine thresholds are hardcoded TF constants — not Optuna parameters |
 | Per-broker study isolation | `study_headway_cent.db` and `study_standard.db` never interfere |
-| Rolling WFO per trial | Every Optuna trial evaluates across all rolling IS/OOS windows — not a single split |
-| IS inner CV | Each WFO window runs TF-dependent inner time-series CV: H1=2 folds, M15=3 folds, M5=4 folds |
+| CPCV per trial | Every Optuna trial evaluates all C(4,2)=6 combinatorial purged paths — not a single IS/OOS split; `CPCV_MAX_FLOAT_DD=0.20` prunes paths with > 20% floating DD |
 | OOS scaler consistency | OOS features are always scaled with the IS-fitted scaler (no data leakage) |
 | State alignment | `states_oos` and `states_is_cv` are re-aligned to `df_aligned.index` after NaN drops |
 | L2 regularisation | `reg_lambda` is searched for all TFs — XGBoost default of 1.0 is no longer forced |
@@ -903,8 +901,10 @@ MIN_OOS_TRADES_HARD = {"M5": 120, "M15": 60, "H1": 20}
 # Soft trade floors (trials below these have score × 0.1):
 TF_MIN_OOS_TRADES   = {"M5": 350, "M15": 140, "H1": 25}
 
-# WFO trial budgets (auto-selected when --trials 250 default is used):
-WFO_TRIALS = {"H1": 60, "M15": 100, "M5": 120}
+# CPCV trial budgets (Stage 2 / joint optimization):
+CPCV_TRIALS = {"H1": 80, "M15": 120, "M5": 200}
+# Stage-1 trial budgets (fast hold-out, no CPCV):
+STAGE1_TRIALS = {"H1": 60, "M15": 100, "M5": 150}
 ```
 
 ### Optuna Search Space per Timeframe
@@ -1017,75 +1017,69 @@ To use the EA:
 
 ---
 
-## Walk-Forward Optimization (WFO)
+## Combinatorial Purged CV (CPCV)
 
-The Optuna optimizer evaluates every trial using **Rolling Walk-Forward Optimization** (`_run_wfo` in `src/optimizer.py`). This is distinct from the post-training `--mode wfa` diagnostic command.
+Both the Optuna optimizer (`--mode optimize`) and the post-training diagnostic (`--mode wfa`) evaluate XGBoost performance using **Combinatorial Purged Cross-Validation (CPCV)** — not rolling Walk-Forward windows. CPCV eliminates serial-correlation leakage by inserting a purge gap at every train/test boundary and exhausts all combinatorial path orderings rather than relying on a single rolling split.
+
+> **Note:** `_run_wfo`, `WFO_PARAMS`, and `WFO_PARAMS_FAST` are retained in `src/optimizer.py` for backward compatibility with the research notebook only. They are not used by the optimizer or `--mode wfa`.
 
 ### How it works
 
 ```
 Full dataset (e.g., 10 years of H1 bars)
   │
-  ├── Window 1: IS=[Y1–Y2]  embargo  OOS=[Y2 Q3+90d]
-  ├── Window 2: IS=[Y1+90d–Y2+90d]  embargo  OOS=[Y2 Q3+180d]
-  ├── Window 3: ...
-  └── Window N
+  Split into N_BLOCKS = 4 equal chronological blocks
   │
-  For each window:
-    1. HMM fitted on IS only (no lookahead)
-    2. IS HMM applied to OOS bars via predict_states
-    3. OOS features scaled with IS-fitted scaler (no data leakage)
-    4. Inner IS cross-validation (TF-dependent folds) for consistency check
-    5. Final XGBoost trained on full IS → backtest on OOS
-    6. Window score = Complex Criterion on OOS results
+  Generate all C(4,2) = 6 train/test path combinations
   │
-  wfo_score = median(window_scores) − 0.20 × std(window_scores)
+  ├── Path 1: Train=[B1,B2]  purge_gap  Test=[B3,B4]
+  ├── Path 2: Train=[B1,B3]  purge_gap  Test=[B2,B4]
+  ├── Path 3: Train=[B1,B4]  purge_gap  Test=[B2,B3]
+  ├── Path 4: Train=[B2,B3]  purge_gap  Test=[B1,B4]
+  ├── Path 5: Train=[B2,B4]  purge_gap  Test=[B1,B3]
+  └── Path 6: Train=[B3,B4]  purge_gap  Test=[B1,B2]
+  │
+  For each path:
+    1. HMM fitted strictly on purged training blocks (no lookahead)
+    2. HMM applied to full dataset → predict_states
+    3. StandardScaler fitted on training rows → applied to full dataset
+    4. XGBoost ensemble trained on training path (train_ratio=1.0)
+    5. Vectorized backtest on test path blocks only
+    6. Path score = Calmar-dominant composite (Calmar×0.45 + Sharpe×0.35 + PF×0.15 + Edge×0.05)
+    7. Paths pruned if floating_max_drawdown > 20% OR n_trades < hard floor
+  │
+  cpcv_score = median(path_scores) − 0.20 × std(path_sharpes)
 ```
 
-### WFO Parameters
+### CPCV Parameters
 
-#### Standard mode (`wfo_mode="standard"`)
+| Parameter | H1 | M15 | M5 |
+|-----------|-----|------|-----|
+| `CPCV_N_BLOCKS` | 4 | 4 | 4 |
+| `CPCV_K_TEST` | 2 | 2 | 2 |
+| Paths per trial `C(4,2)` | 6 | 6 | 6 |
+| `CPCV_PURGE_BARS` (embargo) | 24 bars | 96 bars | 288 bars |
+| `CPCV_MAX_FLOAT_DD` | 20% | 20% | 20% |
+| `MIN_TRADES_PER_PATH` | 15 | 60 | 100 |
+| Stage-2 / joint trials | 80 | 120 | 200 |
+| Stage-1 trials (hold-out) | 60 | 100 | 150 |
 
-| TF | IS window | OOS window | Embargo | Step | Approx. windows (10yr) |
-|----|-----------|------------|---------|------|------------------------|
-| H1 | 8 760 bars (1 yr) | 2 160 bars (90d) | 24 bars | 2 160 | ~23 |
-| M15 | 35 040 bars (1 yr) | 8 640 bars (90d) | 96 bars | 8 640 | ~23 |
-| M5 | 105 120 bars (1 yr) | 25 920 bars (90d) | 288 bars | 25 920 | ~7 |
+### Two-stage optimization flow
 
-#### Fast mode (`wfo_mode="fast"`)
+| Stage | CLI flag | Method | Speed | Output |
+|-------|----------|--------|-------|--------|
+| Stage 1 | `--stage xgb` | Fast single IS/OOS hold-out — no CPCV | ~5× faster | `models/stage1_{tf}_{broker}.json` |
+| Stage 2 | `--stage trading` | Full CPCV — C(4,2)=6 paths, warm-started from Stage 1 | Full | `models/study_{broker}.db` |
+| Joint | *(omit `--stage`)* | Full CPCV from scratch | Full | `models/study_{broker}.db` |
 
-A shorter IS window for quicker intraday regime adaptation. Available via the notebook WFO Mode dropdown or by passing `wfo_mode="fast"` to `_run_wfo` / `make_objective`.
+### CPCV score interpretation
 
-| TF | IS window | OOS window | Embargo | Step |
-|----|-----------|------------|---------|------|
-| H1 | 4 380 bars (6 mo) | 1 080 bars (45d) | 24 bars | 1 080 |
-| M15 | 17 520 bars (6 mo) | 4 320 bars (45d) | 96 bars | 4 320 |
-| M5 | 52 560 bars (6 mo) | 8 640 bars (30d) | 288 bars | 8 640 |
-
-### Inner cross-validation folds
-
-Each WFO window runs an inner time-series CV on the IS data to check for intra-IS consistency before accepting the window score. The fold count is TF-dependent:
-
-| TF | Inner CV folds (`CV_FOLDS`) |
-|----|-----------------------------|
-| H1 | 2 |
-| M15 | 3 |
-| M5 | 4 |
-
-A deeply negative mean IS CV Sharpe (< −1.0) halves the window score to penalise IS noise memorisation.
-
-### Walk-Forward Efficiency (WFE)
-
-```
-WFE = mean(OOS Sharpe across windows) / mean(IS CV Sharpe across windows)
-```
-
-| WFE | Interpretation |
-|-----|----------------|
-| ≥ 0.80 | ✅ Excellent — OOS captures ≥ 80% of IS performance |
-| ≥ 0.50 | 🟡 Acceptable — robust enough for live use |
-| ≥ 0.20 | 🟠 Marginal — consider broader regularization |
-| < 0.20 | 🔴 Poor — strong overfitting signal; re-optimise |
+| cpcv_score | Interpretation |
+|------------|----------------|
+| ≥ +1.0 | ✅ Excellent — strong consistent performance across all 6 paths |
+| ≥ +0.3 | 🟡 Acceptable — robust enough for live deployment |
+| ≥ 0.0 | 🟠 Marginal — consider additional regularisation |
+| < 0.0 | 🔴 Poor — inconsistent paths; re-optimise with more trials |
 
 ---
 

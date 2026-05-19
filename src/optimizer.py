@@ -607,20 +607,23 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
 
         # ── n_states ──────────────────────────────────────────────────────────
+        # M5/M15 fixed at 3 (Bull/Bear/Chop) — Chop-High/ChopLow 4th state
+        # adds noise on short timeframes where the extra regime boundary is
+        # learned from too few intraday bars.
         if tf_up in ("M5", "M15"):
-            n_states = trial.suggest_int("n_states", 3, 4)
+            n_states = 3
         else:  # H1
             n_states = trial.suggest_int("n_states", 3, 4)
 
         # ── XGBoost params ────────────────────────────────────────────────────
         if tf_up == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 4)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.1,  log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 1e-6, 0.1,  log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.001, 0.1,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.001, 0.1,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
-            learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
-            n_estimators     = trial.suggest_int("n_estimators", 200, 600, step=50)
-            subsample        = trial.suggest_float("subsample", 0.55, 0.85)
+            learning_rate    = trial.suggest_float("learning_rate", 0.02, 0.10, log=True)
+            n_estimators     = trial.suggest_int("n_estimators", 50, 400, step=50)
+            subsample        = trial.suggest_float("subsample", 0.5, 0.85)
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.8)
         elif tf_up == "H1":
             max_depth        = trial.suggest_int("max_depth", 4, 8)             # raised ceiling
@@ -796,17 +799,21 @@ def make_objective_stage1(
             obs_cov   = trial.suggest_float("obs_cov",   0.5,  5.0,  log=True)
             trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
 
-        n_states = trial.suggest_int("n_states", 3, 4)
+        # M5/M15 fixed at 3 states — same reasoning as full CPCV objective
+        if tf_up in ("M5", "M15"):
+            n_states = 3
+        else:  # H1
+            n_states = trial.suggest_int("n_states", 3, 4)
 
         # ── XGBoost params (same ranges as full CPCV objective) ───────────────
         if tf_up == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 4)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.1,  log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 1e-6, 0.1,  log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.001, 0.1,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.001, 0.1,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
-            learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
-            n_estimators     = trial.suggest_int("n_estimators", 200, 600, step=50)
-            subsample        = trial.suggest_float("subsample", 0.55, 0.85)
+            learning_rate    = trial.suggest_float("learning_rate", 0.02, 0.10, log=True)
+            n_estimators     = trial.suggest_int("n_estimators", 50, 400, step=50)
+            subsample        = trial.suggest_float("subsample", 0.5, 0.85)
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.8)
         elif tf_up == "H1":
             max_depth        = trial.suggest_int("max_depth", 4, 8)

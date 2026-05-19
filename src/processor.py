@@ -576,16 +576,34 @@ def process_pipeline(
     # ── Synthetic VIX (Williams VIX Fix) ────────────────────────────────────
     df["synth_vix_zscore"] = compute_synth_vix(df)
 
-    # Time-of-Day Gating (Session Filter)
-    # Drop Asian-session bars (00:00-07:59 UTC and 18:00-23:59 UTC) after all
-    # rolling indicators are computed so their math remains intact. This forces
-    # HMM/XGB training and backtesting onto London/NY high-liquidity hours only.
-    active_hours = df.index.hour.isin(range(8, 18))
-    df = df.loc[active_hours].copy()
-    logger.info(
-        "Session filter [%s]: %d rows retained after London/NY gating (08:00-17:59 UTC).",
-        tf, len(df),
-    )
+    # ── Cyclical time features ─────────────────────────────────────────────────
+    # Encode time-of-day as continuous cyclic variables bounded [-1, 1].
+    # Computed after all rolling indicators so NaN drops do not shift bar times.
+    # Picked up automatically by get_feature_cols() in engine_xgb via _EXTERNAL_ASSETS.
+    _hour_frac = df.index.hour + df.index.minute / 60.0
+    df["hour_sin"]   = np.sin(2 * np.pi * _hour_frac / 24)
+    df["hour_cos"]   = np.cos(2 * np.pi * _hour_frac / 24)
+    df["minute_sin"] = np.sin(2 * np.pi * df.index.minute / 60)
+    df["minute_cos"] = np.cos(2 * np.pi * df.index.minute / 60)
+
+    # ── Time-of-Day Gating (Session Filter — H1 only) ───────────────────────
+    # H1: drop Asian-session bars (00:00-07:59 UTC and 18:00-23:59 UTC) after
+    # all rolling indicators are computed so their math remains intact.
+    # M5/M15: no session filter -- model learns intraday patterns via cyclical
+    # time features (hour_sin/cos, minute_sin/cos) instead.
+    if tf.upper() == "H1":
+        active_hours = df.index.hour.isin(range(8, 18))
+        df = df.loc[active_hours].copy()
+        logger.info(
+            "Session filter [%s]: %d rows retained after London/NY gating (08:00-17:59 UTC).",
+            tf, len(df),
+        )
+    else:
+        logger.info(
+            "Session filter [%s]: skipped -- full 24h data retained (%d rows); "
+            "time-of-day encoded via hour_sin/cos, minute_sin/cos.",
+            tf, len(df),
+        )
 
     logger.info(
         "Pipeline [%s] complete: %d rows, columns: %s",

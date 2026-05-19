@@ -170,6 +170,8 @@ class SignalEngine:
 
         # ── Mean-reversion entry: Chop (state >= 2) ───────────────────────────
         elif state >= 2 and atr_band_position is not None:
+            if self.tf in ("M5", "M15"):
+                return None  # Chop/MR entries disabled for M5/M15 — 3-state HMM only trades Bull/Bear
             if bars >= MIN_CHOP_CONFIRM_BARS.get(self.tf, 2):
                 if atr_band_position < 0.1 and synth_vix_zscore >= MIN_MR_ZSCORE.get(self.tf, 1.5) and mr_prob_req_buy:
                     return {"signal": "MR_BUY", "size_multiplier": MR_SIZE_MULTIPLIER}
