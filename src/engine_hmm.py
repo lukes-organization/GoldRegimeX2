@@ -5,6 +5,7 @@ from pathlib import Path
 from hmmlearn.hmm import GaussianHMM
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from scipy.signal import medfilt
 from src.logger import setup_logger, log_regime_transition
 
 logger = setup_logger(__name__)
@@ -18,6 +19,11 @@ MODEL_PATH = Path("models/hmm_model.pkl")
 # M15: 0.15 — moderate; 15-min noise warrants some smoothing but less than H1.
 # M5: 0.10 — flexible; scalping benefits from faster regime detection.
 TF_TRANS_BOOST = {"H1": 0.25, "M15": 0.15, "M5": 0.10}
+
+# Median-filter kernel size applied to raw HMM states after fitting/prediction.
+# Eliminates 1-bar and 2-bar regime flips that create noise in the XGB feature.
+# H1 already benefits from a large transition boost so a smaller kernel suffices.
+_MEDFILT_KERNEL = {"H1": 3, "M15": 5, "M5": 5}
 
 
 def get_model_path(tf: str, broker: str = "headway_cent") -> Path:
@@ -186,6 +192,13 @@ def fit_hmm(
     raw_states = model.predict(X)
 
     states, state_names = _sort_states(model, raw_states, n_states)
+
+    # ── HMM State Smoothing ───────────────────────────────────────────────────
+    # Apply median filter *after* state remapping so it smooths semantically
+    # consistent labels (0=Bull, 1=Bear, …) rather than arbitrary HMM indices.
+    kernel = _MEDFILT_KERNEL.get(tf.upper(), 5)
+    states = medfilt(states.astype(np.float64), kernel_size=kernel).astype(np.int32)
+
     _log_transition_matrix(model, state_names)
 
     transitions = np.where(np.diff(states) != 0)[0] + 1
@@ -198,7 +211,7 @@ def fit_hmm(
     return model, states, state_names
 
 
-def predict_states(model: GaussianHMM, df: pd.DataFrame) -> np.ndarray:
+def predict_states(model: GaussianHMM, df: pd.DataFrame, tf: str = "H1") -> np.ndarray:
     X_raw = df[["kalman_return", "volatility", "rsi_slope"]].values
     # Reuse the scaler fitted during training so the live/validation observation
     # space matches the space the HMM was fitted on.  Old models without this
@@ -221,7 +234,14 @@ def predict_states(model: GaussianHMM, df: pd.DataFrame) -> np.ndarray:
         remap = {int(sorted_idx[0]): 1, int(sorted_idx[-1]): 0}
         remap[middle_by_vol[0]] = 2  # Chop_Low  (lower vol)
         remap[middle_by_vol[1]] = 3  # Chop_High (higher vol)
-    return np.array([remap.get(s, s) for s in raw])
+    states = np.array([remap.get(s, s) for s in raw], dtype=np.int32)
+
+    # ── HMM State Smoothing ───────────────────────────────────────────────────
+    kernel = _MEDFILT_KERNEL.get(tf.upper(), 5)
+    if len(states) >= kernel:
+        states = medfilt(states.astype(np.float64), kernel_size=kernel).astype(np.int32)
+
+    return states
 
 
 def save_model(model: GaussianHMM, path: Path = MODEL_PATH):

@@ -199,6 +199,109 @@ def fetch_cross_asset_bars(
 # Primary entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Raw CSV path mapping — mirrors TF_CONFIG["raw_path"] in processor.py.
+# Used by ensure_data_updated to know which file to append into.
+_RAW_CSV_PATHS: dict[str, Path] = {
+    "H1":  Path("data/raw/XAU_1h_data.csv"),
+    "M15": Path("data/raw/XAU_15m_data.csv"),
+    "M5":  Path("data/raw/XAU_5m_data.csv"),
+}
+
+
+def ensure_data_updated(tf: str, symbol: str = "XAUUSD") -> None:
+    """Check if the local raw CSV for *tf* is stale; if so, fetch and append
+    the missing bars from MT5.
+
+    The function is intentionally non-fatal: if MT5 is unavailable (e.g. the
+    terminal is not running) it logs a warning and returns so the rest of the
+    pipeline can continue with existing data.
+
+    The raw CSV format is semicolon-delimited with header:
+        Date;Open;High;Low;Close;Volume
+    where Date is ``%Y.%m.%d %H:%M`` (matching what ``load_raw_data`` expects).
+    """
+    from datetime import datetime, timezone
+
+    tf_key = tf.upper()
+    file_path = _RAW_CSV_PATHS.get(tf_key)
+    if file_path is None:
+        logger.warning("[SYNC] Unknown TF '%s' — skipping data update check.", tf)
+        return
+    if not file_path.exists():
+        logger.warning("[SYNC] Raw CSV not found at %s — skipping.", file_path)
+        return
+
+    # Read last known timestamp
+    try:
+        df_existing = pd.read_csv(
+            file_path, sep=";", parse_dates=["Date"], date_format="%Y.%m.%d %H:%M",
+        )
+        df_existing.set_index("Date", inplace=True)
+        df_existing.sort_index(inplace=True)
+        last_dt_naive = df_existing.index[-1].to_pydatetime()
+    except Exception as exc:
+        logger.warning("[SYNC] Could not read %s: %s — skipping.", file_path, exc)
+        return
+
+    last_dt_utc = last_dt_naive.replace(tzinfo=timezone.utc)
+    utc_now = datetime.now(timezone.utc)
+
+    # Skip if data is younger than one bar interval
+    _tf_seconds = {"H1": 3600, "M15": 900, "M5": 300}
+    lag_s = (utc_now - last_dt_utc).total_seconds()
+    if lag_s < _tf_seconds.get(tf_key, 3600):
+        logger.info(
+            "[SYNC] %s data is fresh (lag=%.0f s). No update needed.", tf_key, lag_s,
+        )
+        return
+
+    logger.info("[SYNC] %s data is stale by %.0f s — fetching from MT5.", tf_key, lag_s)
+
+    # Connect and fetch
+    if not connect_mt5():
+        logger.warning("[SYNC] MT5 unavailable — proceeding with existing data.")
+        return
+
+    try:
+        import MetaTrader5 as mt5
+        tf_map = _get_tf_map()
+        rates = mt5.copy_rates_range(symbol, tf_map[tf_key], last_dt_utc, utc_now)
+    finally:
+        disconnect_mt5()
+
+    if rates is None or len(rates) == 0:
+        logger.info("[SYNC] MT5 returned no new bars for %s %s.", symbol, tf_key)
+        return
+
+    df_new = pd.DataFrame(rates)
+    df_new["time"] = pd.to_datetime(df_new["time"], unit="s", utc=True)
+    df_new.set_index("time", inplace=True)
+    df_new.index = df_new.index.tz_localize(None)  # strip tz — CSV has naive datetimes
+
+    # Drop the currently open (incomplete) bar
+    df_new = df_new.iloc[:-1]
+
+    # Keep only rows strictly newer than the last known bar
+    df_new = df_new[df_new.index > last_dt_naive]
+
+    if len(df_new) == 0:
+        logger.info("[SYNC] %s %s is already up to date.", symbol, tf_key)
+        return
+
+    # Rename to match CSV column convention
+    df_new = df_new.rename(columns={
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "tick_volume": "Volume",
+    })
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df_new.columns]
+    df_new = df_new[cols]
+    df_new.index.name = "Date"
+
+    # Append — header=False so column names are not written again; sep matches original
+    df_new.to_csv(file_path, mode="a", header=False, sep=";", date_format="%Y.%m.%d %H:%M")
+    logger.info("[SYNC] Appended %d new %s bars to %s.", len(df_new), tf_key, file_path)
+
+
 def sync_mt5_data(
     symbol: str = DEFAULT_SYMBOL,
     tf: str = "H1",

@@ -576,6 +576,17 @@ def process_pipeline(
     # ── Synthetic VIX (Williams VIX Fix) ────────────────────────────────────
     df["synth_vix_zscore"] = compute_synth_vix(df)
 
+    # Time-of-Day Gating (Session Filter)
+    # Drop Asian-session bars (00:00-07:59 UTC and 18:00-23:59 UTC) after all
+    # rolling indicators are computed so their math remains intact. This forces
+    # HMM/XGB training and backtesting onto London/NY high-liquidity hours only.
+    active_hours = df.index.hour.isin(range(8, 18))
+    df = df.loc[active_hours].copy()
+    logger.info(
+        "Session filter [%s]: %d rows retained after London/NY gating (08:00-17:59 UTC).",
+        tf, len(df),
+    )
+
     logger.info(
         "Pipeline [%s] complete: %d rows, columns: %s",
         tf, len(df), list(df.columns),

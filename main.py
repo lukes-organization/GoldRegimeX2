@@ -268,6 +268,16 @@ def cmd_optimize(args):
 
     for tf in tfs:
         reconfigure_for_tf(tf)
+
+        # ── Auto-sync raw CSV from MT5 before reading parquet ────────────────
+        # If the terminal is running, appends any missing bars to the raw CSV.
+        # Silently skipped when MT5 is unavailable (e.g. running headless).
+        try:
+            from src.mt5_sync import ensure_data_updated
+            ensure_data_updated(tf=tf, symbol="XAUUSD")
+        except Exception as _sync_exc:
+            logger.warning("Auto-sync skipped (%s). Continuing with existing data.", _sync_exc)
+
         logger.info(
             "Optimizing [%s] broker=%s balance=$%.0f trials=%d wfo_mode=%s stage=%s",
             tf, broker, balance, args.trials, wfo_mode, stage or "joint",
