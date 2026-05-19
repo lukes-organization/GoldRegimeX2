@@ -1,6 +1,6 @@
 # Gold Regime X
 
-A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hidden Markov Models for regime detection, XGBoost for signal classification, a **TCN confidence scorer** for dynamic threshold adjustment, and a stateful **Regime-Confirmation Signal Engine** that gates live trades on regime persistence, XGBoost probability, and Bollinger Band position. Designed for live execution through MetaTrader 5 on both **Headway Cent** (micro) and **Standard** accounts, with full Telegram remote control, health monitoring, and automatic TCN maintenance.
+A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hidden Markov Models for regime detection, XGBoost for signal classification, and a stateful **Regime-Confirmation Signal Engine** that gates live trades on regime persistence, XGBoost probability, synth-VIX Z-score, and dynamic ATR band position. Designed for live execution through MetaTrader 5 on both **Headway Cent** (micro) and **Standard** accounts, with full Telegram remote control and health monitoring.
 
 ---
 
@@ -16,8 +16,8 @@ A hybrid machine learning trading system for **XAUUSD (Gold)** that combines Hid
 8. [Complete Workflow — Start to Live Trading](#complete-workflow--start-to-live-trading)
 9. [Command Reference](#command-reference)
 10. [Signal Logic — Regime-Confirmation](#signal-logic--regime-confirmation)
-11. [TCN Confidence Scorer](#tcn-confidence-scorer)
-12. [Automatic Data Updates & TCN Maintenance](#automatic-data-updates--tcn-maintenance)
+11. [Automatic Data Updates](#automatic-data-updates)
+12. [Automatic Data Updates](#automatic-data-updates)
 13. [Sensitivity Analysis](#sensitivity-analysis)
 14. [Interactive Research Notebook](#interactive-research-notebook)
 15. [Risk Management](#risk-management)
@@ -47,7 +47,15 @@ GaussianHMM (k-means prior init, Baum-Welch EM)
       │  Observation features: [kalman_return, volatility, rsi_slope]
       │  All StandardScaler-normalised before fit
       ▼
-Regime Labels  Bull=0  Bear=1  Chop=2  Chop_High=3 (n_states=4)
+Regime Labels  Bull=0  Bear=1  Chop=2  [Chop_High=3]  (n_states 3–4, optimised per TF)
+      │  Median filter smoothing applied post-prediction
+      │    kernel: H1=3 bars, M15=5 bars, M5=5 bars
+      │    prevents rapid state oscillation between consecutive bars
+      │
+      ▼
+Session Filter  →  London/NY overlap only  08:00–17:59 UTC
+      │  Applied after all rolling indicators are computed
+      │  Off-session bars excluded from training and inference
       │
       ▼
 GMM Volatility Cluster  →  quiet / normal / volatile label
@@ -55,29 +63,25 @@ GMM Volatility Cluster  →  quiet / normal / volatile label
       ▼
 XGBoost Three-Model Volatility Ensemble
       │  Base features (always):
-      │    [hmm_state, gmm_vol_cluster, rsi_slope,
+      │    [hmm_0, hmm_1, hmm_2 [, hmm_3]  ← OHE, one column per HMM state
+      │     gmm_vol_cluster, rsi_slope,
       │     atr_normalized, prev_log_return]
       │  External features (optional, added when masters exist):
       │    usdchf_log_return, xagusd_log_return,
-      │    xtiusd_log_return, synth_vix_zscore*
+      │    xtiusd_log_return, synth_vix_zscore*, atr_band_position*
       │  Low / Med / High ATR bucket → separate XGBoost model
-      │  * synth_vix_zscore is computed from price (no CSV needed)
+      │  * computed from XAUUSD price — no external CSV needed
       │
       ▼
       ▼
 SignalEngine — Regime Confirmation
       │  update_regime() tracks consecutive bars in current state
       │  should_enter(): bars ≥ 2, XGBoost prob ≥ TF threshold, P(stay) ≥ TF floor
-      │  MR entry: BB ≤ 0.30 (buy) or BB ≥ 0.70 (sell) in Chop state
+      │  MR entry: ATR band < 0.10 (buy) or ATR band > 0.90 (sell) in Chop state
       │
       ▼
-TCN Confidence Scorer (optional, loads automatically)
-      │  4× dilated causal Conv1D → GlobalAveragePooling → Dense(32) → sigmoid
-      │  Scores the current signal bar from 100-bar context sequences
-      │  Outputs a confidence multiplier [0.7, 1.3]:
-      │    multiplier < 0.85 → effective XGBoost prob ×1.10 (boosts entry)
-      │    multiplier ≥ 0.85 → no boost
-      │    multiplier = 1.0  → no adjustment (TCN not loaded)
+TCN Confidence Scorer — **removed**
+      │    (XGBoost probability gate is the direct signal quality filter)
       │
       ▼
 IS / OOS Backtest
@@ -96,7 +100,7 @@ Live Bridge  →  MT5 Market Orders
       │  TF-specific magic numbers: H1=123456, M15=123457, M5=123458
 ```
 
-The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoost hyperparameters (including L1 and L2 regularisation), scoring every trial on **OOS Complex Criterion only** using the Rolling Walk-Forward Optimization (`_run_wfo`) with per-window IS cross-validation. Supports purged 3-fold time-series cross-validation via `--split_method purged_ts`. A `"fast"` WFO mode is available for M5/M15 with a shorter 6-month IS window for quicker intraday regime adaptation.
+The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoost hyperparameters (including L1 and L2 regularisation), scoring every trial on **OOS Complex Criterion only** using the Rolling Walk-Forward Optimization (`_run_wfo`) with per-window IS cross-validation. Supports purged 3-fold time-series cross-validation via `--split_method purged_ts`. A `"fast"` WFO mode is available for M5/M15 with a shorter 6-month IS window for quicker intraday regime adaptation. Before each optimization run, `ensure_data_updated()` auto-fetches any missing bars from MT5 so the model always trains on the most recent data.
 
 ---
 
@@ -104,27 +108,26 @@ The **Optuna optimizer** searches Kalman parameters, HMM state count, and XGBoos
 
 | File | Purpose |
 |------|---------|
-| `src/processor.py` | Kalman filter, log returns, RSI, ATR, GMM vol cluster, per-TF config |
-| `src/engine_hmm.py` | GaussianHMM with k-means prior init; TF persistence boost |
-| `src/engine_xgb.py` | XGBoost volatility ensemble; three vol-bucket models (Low/Med/High ATR); `compute_regime_stats()` for metadata; ONNX export |
-| `src/engine_tcn.py` | **TCN confidence scorer** — `SignalConfidenceTCN`, 4× dilated causal Conv1D, `load_tcn_classifier()`, `get_tcn_dir()`; outputs multiplier [0.7, 1.3] used by `SignalEngine` |
-| `src/signal_engine.py` | **Stateful signal engine** — `SignalEngine`; regime-confirmation entry (persistence + XGBoost prob + BB confluence); exit on regime reversal, persistence collapse, profit erosion, or max hold |
+| `src/processor.py` | Kalman filter, log returns, RSI, ATR, GMM vol cluster, per-TF config; **London/NY session gating** (08:00–17:59 UTC, applied after all rolling indicators) |
+| `src/engine_hmm.py` | GaussianHMM with k-means prior init; TF persistence boost; **median-filter state smoothing** (kernel H1=3, M15/M5=5) to prevent rapid state oscillation |
+| `src/engine_xgb.py` | XGBoost volatility ensemble; three vol-bucket models (Low/Med/High ATR); **`hmm_state` OHE** (`hmm_0`/`hmm_1`/`hmm_2`[`/hmm_3`]) in `prepare_features`; **`atr_band_position`** feature; `compute_regime_stats()` for metadata; ONNX export |
+| `src/signal_engine.py` | **Stateful signal engine** — `SignalEngine`; regime-confirmation entry (persistence + XGBoost prob + synth-VIX Z-score + ATR band); exit on regime reversal, persistence collapse, profit erosion, or max hold |
 | `src/sensitivity.py` | Z-Score sensitivity sweep — Bull/Bear cutoffs 1.5–3.0σ; outputs ranked table + `reports/sensitivity_<TF>_<broker>.csv/json` |
 | `src/backtester.py` | Bar-by-bar backtest via `SignalEngine` — IS/OOS split, broker costs, floating drawdown, MT5 equity curve, MR attribution |
 | `src/optimizer.py` | Rolling WFO optimizer — per-window IS cross-validation; Revised Complex Criterion scoring; `WFO_PARAMS`, `WFO_PARAMS_FAST`, `CV_FOLDS`; per-broker SQLite resume; RAM guard; Telegram heartbeat |
 | `notebooks/GoldRegimeX_Explorer.ipynb` | Interactive research notebook — equity explorer, WFO window analysis (standard/fast mode), feature/regime explorer, parameter sensitivity with WFO comparison, CV Path Inspector (Section 6) |
 | `src/risk_manager.py` | AdaptiveRiskManager, CentConverter, DailyEquityGate, broker cost configs |
 | `src/visualizer.py` | 6-chart visual report: regime overlay, equity curve, features, transition matrix, dashboard, MT5 balance/equity |
-| `src/mt5_sync.py` | MT5 data downloader |
+| `src/mt5_sync.py` | MT5 data downloader; **`ensure_data_updated()`** — auto-fetches missing bars before each optimization run |
 | `src/validator.py` | Pre-live validation gate — SignalEngine inference + Sharpe threshold + spread-payoff erosion warning |
 | `src/mt5_trader.py` | Live execution loop: bar detection, XGBoost inference, `SignalEngine` regime-confirmation entry/exit, order placement, ATR trailing exits, M5 scalp recycling |
 | `src/notifier.py` | Telegram message sender |
 | `src/auditor.py` | MT5 deal history report |
 | `src/data_updater.py` | **Weekly MT5 data pull** — `WeeklyDataUpdater` appends fresh XAUUSD bars to raw CSVs every Sunday |
-| `src/tcn_maintenance.py` | **Hourly TCN staleness monitor** — `TCNMaintenanceScheduler`; auto-retrains stale models via background subprocess |
-| `src/guardian.py` | Multi-TF rolling health monitor + **daily TCN staleness check + auto-retrain** |
+| `src/guardian.py` | Multi-TF rolling health monitor — fires Telegram alert when rolling Sharpe drops below threshold |
 | `src/remote_control.py` | Telegram long-polling bot for remote commands |
 | `src/data_consolidator.py` | USDCHF master file builder |
+| `src/monte_carlo.py` | Monte Carlo simulation on trained models — distribution of expected return/drawdown outcomes |
 | `main.py` | CLI entry point for all modes |
 | `mql5/GoldRegimeX.mq5` | MT5 Expert Advisor with ONNX inference (alternative to Python bridge) |
 
@@ -225,7 +228,7 @@ The processor enriches each XAUUSD bar with cross-asset log returns. Export each
 | US500 | S&P 500 — equity/gold correlation | `US500_H1.csv` / `US500_M15_*.csv` / `US500_M5_*.csv` | `US500_master[_M15/_M5].csv` |
 | USDJPY | JPY safe-haven proxy | `USDJPY_H1.csv` / `USDJPY_M15_*.csv` / `USDJPY_M5_*.csv` | `USDJPY_master[_M15/_M5].csv` |
 
-All masters live in `data/processed/`. The `synth_vix_zscore` feature (Williams VIX Fix) is computed directly from XAUUSD price — no external file needed.
+All masters live in `data/processed/`. The `synth_vix_zscore` feature (Williams VIX Fix) and `atr_band_position` feature (dynamic ATR band position, 0 = lower band, 1 = upper band) are both computed directly from XAUUSD price — no external file is needed for either.
 
 ```bash
 python main.py --mode consolidate
@@ -272,46 +275,48 @@ python main.py --mode consolidate
 
 ### Phase 1 — Build and optimise the model
 
+Model optimisation uses a **two-stage workflow** for best results. Stage 1 is a fast XGB-only
+exploration (∼5× faster, no CPCV) that saves the best params to `models/stage1_{tf}_{broker}.json`.
+Stage 2 runs the full CPCV optimization warm-started from those params. Both stages are safe to
+interrupt and resume. Run `--mode train` after both stages to commit the final model to disk.
+
 ```bash
-# 1. Process raw CSV into features (Kalman, log returns, RSI, ATR, GMM cluster)
+# --- Preparation ---
 python main.py --mode process --tf H1
 
-# 2. Optimise hyperparameters (Kalman params, HMM states, XGBoost regularisation)
-#    Runs Optuna and saves every trial to models/study_headway_cent.db
-#    Safe to interrupt and resume — --trials is a TOTAL target, not incremental
-python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --trials 400
+# NOTE: ensure_data_updated() runs automatically at the start of every optimize run
+# to fetch any bars missing since your last CSV export — MT5 must be connected.
 
-# 3. Train the final model with the best Optuna parameters
-#    Trains HMM + XGBoost; saves model files
+# === STAGE 1: Fast XGB Exploration (no CPCV, ~5x faster) ===
+# Explores the hyperparameter landscape with a single IS/OOS split.
+# Saves best params to models/stage1_h1_headway_cent.json.
+python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --stage xgb --trials 60
+
+# === STAGE 2: Full CPCV Optimization (warm-started from Stage 1) ===
+# Runs C(4,2)=6 CPCV path evaluation, seeded from Stage 1 params.
+# Saves all trials to models/study_headway_cent.db.
+python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --stage trading --trials 130
+
+# === COMMIT: Train Final Model ===
+# Reads best params from study DB, trains GaussianHMM + XGBoost 3-vol-bucket ensemble.
+# Saves: hmm_model_H1_headway_cent.pkl + xgb_ensemble_H1_headway_cent.pkl
 python main.py --mode train --tf H1 --broker headway_cent --balance 15
 
-# 4. (Optional) Run Z-Score sensitivity analysis to confirm the TF cutoff is optimal
+# --- Optional post-training checks ---
 python main.py --mode sensitivity --tf H1 --broker headway_cent --balance 15
-
-# 5. (Optional) Generate 6-chart visual report to review IS/OOS performance
-python main.py --mode report --tf H1 --broker headway_cent --balance 15
-
-# 6. (Optional) Export model to ONNX for the MQL5 EA
-python main.py --mode export --tf H1 --broker headway_cent
+python main.py --mode montecarlo  --tf H1 --broker headway_cent --balance 15
+python main.py --mode report      --tf H1 --broker headway_cent --balance 15
+python main.py --mode compare     --tf H1,M15,M5 --broker headway_cent --balance 15
+python main.py --mode export      --tf H1 --broker headway_cent
 ```
 
-### Phase 2 — Train the TCN confidence scorer
 
-The TCN must be trained **after** the HMM+XGBoost model exists — it scores signal quality using the same processed features plus derived columns.
-
-```bash
-# Full training (first time — ~10–20 min):
-python main.py --mode train_tcn --tf H1 --broker headway_cent \
-    --epochs 100 --temperature 1.5
-```
-
-The model saves to `models/tcn/H1_headway_cent/`. Subsequent `--mode live` runs load it automatically. If no TCN model exists, the live bridge runs with no TCN boost (all XGBoost probs are used as-is).
-
-### Phase 3 — Validate before going live
+### Phase 2 — Validate before going live
 
 ```bash
-# Download last 6 months of live MT5 data and check rolling Sharpe
-# Use --period 6m or 8m for H1 — 3m produces very few trades
+# Download live MT5 data and check rolling Sharpe against trained model.
+# Use --period 6m for H1 and M15; --period 3m for M5.
+# --period 12m available for a deeper H1 look-back.
 python main.py --mode sync_validate --tf H1 --broker headway_cent --balance 15 --period 6m
 ```
 
@@ -323,7 +328,7 @@ python main.py --mode sync_validate --tf H1 --broker headway_cent --balance 15 -
 
 FAIL exits with code 1 and blocks the live script.
 
-### Phase 4 — Walk-Forward Analysis (optional but recommended)
+### Phase 3 — Walk-Forward Analysis (optional but recommended)
 
 ```bash
 python main.py --mode wfa --tf H1 --broker headway_cent --balance 15
@@ -331,7 +336,7 @@ python main.py --mode wfa --tf H1 --broker headway_cent --balance 15
 
 Checks that the model generalises across time periods. WFE ≥ 60% = robust.
 
-### Phase 5 — Demo test
+### Phase 4 — Demo test
 
 Connect MT5 to a **demo account** and run:
 
@@ -341,7 +346,7 @@ python main.py --mode demo --tf H1 --broker headway_cent --balance 15
 
 This sends **real orders** to MT5 (no simulation). Use it to verify lot sizes, TP/SL placement, and session limits before risking real money.
 
-### Phase 6 — Go live
+### Phase 5 — Go live
 
 Connect MT5 to your **live account** and run:
 
@@ -354,35 +359,31 @@ Type `YES` when prompted. The live loop:
 1. Detects each newly completed bar (polls every 5 s)
 2. Fetches 200 bars for Kalman / HMM warm-up
 3. Runs Kalman → GMM → HMM → XGBoost inference
-4. Loads TCN; computes confidence multiplier (boosts effective XGBoost prob if multiplier < 0.85)
-5. `SignalEngine.update_regime()` + `should_enter()` — checks persistence, XGBoost prob, BB position
-6. Applies session limits, margin check, spread viability guard
-7. Places IOC market orders with ATR-based SL and staged TPs (ATR multiples)
-8. Logs closed P&L in real USD after every trade
-9. Every hour: runs TCN staleness check; every Sunday: appends fresh bars to raw CSVs
+4. `SignalEngine.update_regime()` + `should_enter()` — checks persistence, XGBoost prob, synth-VIX Z-score, ATR band position
+5. Applies session limits (08:00–17:59 UTC), margin check, spread viability guard
+6. Places IOC market orders with ATR-based SL and staged TPs (ATR multiples)
+7. Logs closed P&L in real USD after every trade
+8. Every Sunday: appends fresh bars to raw CSVs (WeeklyDataUpdater)
 
 > **Important:** Remove the GoldRegimeX.mq5 EA from any XAUUSD chart before starting the same-TF Python bridge — they share the same magic number.
 
-### Phase 7 — Ongoing maintenance
+### Phase 6 — Ongoing maintenance
 
 ```bash
 # Weekly (M5) / monthly (M15, H1):
 python main.py --mode sync_validate --tf H1 --broker headway_cent --balance 15 --period 6m
 python main.py --mode wfa           --tf H1 --broker headway_cent --balance 15
 
-# Re-optimise + retrain if sync_validate fails or WFE < 50%:
-python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --trials 400
+# If sync_validate fails or WFE < 50% — re-run the two-stage optimize + retrain:
+# Stage 1: re-run fast XGB exploration (resumes existing study, adds trials on top)
+python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --stage xgb --trials 60
+# Stage 2: re-run full CPCV (warm-started from updated Stage 1 params)
+python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --stage trading --trials 130
+# Commit: retrain final model with new best params
 python main.py --mode train    --tf H1 --broker headway_cent --balance 15
-
-# Fine-tune TCN on last 2 years (faster than full retrain):
-python main.py --mode train_tcn --tf H1 --broker headway_cent \
-    --epochs 20 --fine_tune --recent_years 2
-
-# Or full TCN retrain if fine-tune isn't improving results:
-python main.py --mode train_tcn --tf H1 --broker headway_cent --epochs 100
 ```
 
-The [Guardian](#telegram-remote-control) auto-retrains the TCN every 7 days while running. The live bridge also checks staleness hourly without interrupting trading.
+The [Guardian](#telegram-remote-control) runs a continuous rolling Sharpe health check and fires Telegram alerts if performance degrades.
 
 ---
 
@@ -398,9 +399,8 @@ python main.py --mode <MODE> [OPTIONS]
 |------|-------------|
 | `consolidate` | Merge `*USDCHF*.csv` files in `data/raw/` into per-TF USDCHF masters |
 | `process` | Process raw CSV → features (Kalman, log returns, RSI, ATR, GMM cluster) |
-| `optimize` | Run / resume Optuna hyperparameter search (OOS Complex Criterion scoring) |
+| `optimize` | Run / resume Optuna hyperparameter search (OOS Complex Criterion scoring). Supports `--stage xgb` (fast XGB exploration) → `--stage trading` (full CPCV, warm-started) two-stage workflow |
 | `train` | Train HMM + XGBoost; show IS/OOS breakdown |
-| `train_tcn` | Train TCN confidence scorer; supports full training, fine-tune, temperature |
 | `sensitivity` | Z-Score sensitivity sweep (Bull/Bear cutoffs 1.5–3.0) on trained models |
 | `compare` | Side-by-side OOS comparison across TFs ranked by Complex Criterion |
 | `export` | Export XGBoost ensemble → ONNX for MQL5 EA |
@@ -410,8 +410,10 @@ python main.py --mode <MODE> [OPTIONS]
 | `demo` | Run live execution loop on MT5 demo account (no YES prompt) |
 | `live` | Run live execution loop on MT5 live account (requires YES confirmation) |
 | `audit` | Generate and Telegram-send daily MT5 deal report |
-| `guardian` | Continuous rolling Sharpe health monitor + daily TCN auto-retrain |
+| `guardian` | Continuous rolling Sharpe health monitor + Telegram alerts |
 | `listen` | Start Telegram remote control bot (with nightly 23:55 summary) |
+| `montecarlo` | Monte Carlo simulation on trained models — return/drawdown outcome distribution |
+| `extract_consensus` | Extract consensus best parameters across Optuna trials |
 
 ### All Options
 
@@ -420,18 +422,14 @@ python main.py --mode <MODE> [OPTIONS]
 | `--tf` | str | `H1` | Timeframe: `H1`, `M15`, `M5` (or comma-separated for `compare`/`guardian`) |
 | `--broker` | str | `standard` | `headway_cent` or `standard` |
 | `--balance` | float | 15 | Account size in **real USD** |
-| `--trials` | int | 250 | Total Optuna trial target. Recommended: M5=1000, M15=600, H1=400 |
+| `--trials` | int | 250 | Total Optuna trial target (joint mode). Recommended joint: H1=400, M15=600, M5=1000. Two-stage: see `--stage` |
+| `--stage` | str | `None` | Two-stage optimize: `xgb` = Stage 1 fast XGB exploration (no CPCV, ∼5× faster, saves `stage1_{tf}_{broker}.json`); `trading` = Stage 2 full CPCV warm-started from Stage 1. Omit to run standard joint optimization |
 | `--period` | str | `3m` | Lookback for MT5 sync: `3m`, `6m`, `12m` |
 | `--interval` | int | 3600 | Guardian check interval in seconds |
 | `--profit_target` | float | 4.0 on M5 | Quick-profit close in USD per position. Pass `0` to disable on M5 |
 | `--skip_stale_check` | flag | off | Bypass model-staleness gate on `live`/`demo` |
 | `--train_days` | int | TF default | WFA IS window in calendar days (H1=365, M15=180, M5=90) |
 | `--test_days` | int | TF default | WFA OOS step in calendar days (H1=90, M15=60, M5=30) |
-| `--epochs` | int | 100 | TCN training epochs for `train_tcn` |
-| `--seq_len` | int | 100 | TCN input sequence length in bars |
-| `--temperature` | float | 1.5 | TCN sigmoid temperature. >1.0 softens confidence; <1.0 sharpens |
-| `--fine_tune` | flag | off | Adapt existing TCN to recent data instead of full retrain |
-| `--recent_years` | int | 2 | Years of recent data to use when `--fine_tune` is set |
 | `--n_jobs` | int | 1 | Parallel Optuna workers (advanced) |
 
 > **Note:** `--balance` is always in **real USD**. For a Headway Cent account with $15, pass `--balance 15` — the bridge handles the ×100 display conversion internally.
@@ -440,13 +438,25 @@ python main.py --mode <MODE> [OPTIONS]
 
 **H1 — Headway Cent (first time):**
 ```bash
+# One-time setup
 python main.py --mode consolidate
 python main.py --mode process        --tf H1
-python main.py --mode optimize       --tf H1 --broker headway_cent --balance 15 --trials 400
+
+# Stage 1: Fast XGB exploration (no CPCV) — saves stage1_h1_headway_cent.json
+python main.py --mode optimize       --tf H1 --broker headway_cent --balance 15 --stage xgb --trials 60
+
+# Stage 2: Full CPCV optimization (warm-started from Stage 1)
+python main.py --mode optimize       --tf H1 --broker headway_cent --balance 15 --stage trading --trials 130
+
+# Commit: Train final model with best params
 python main.py --mode train          --tf H1 --broker headway_cent --balance 15
+
+# Optional checks
 python main.py --mode sensitivity    --tf H1 --broker headway_cent --balance 15
-python main.py --mode train_tcn      --tf H1 --broker headway_cent --epochs 100
+python main.py --mode montecarlo     --tf H1 --broker headway_cent --balance 15
 python main.py --mode report         --tf H1 --broker headway_cent --balance 15
+
+# Validate + go live
 python main.py --mode sync_validate  --tf H1 --broker headway_cent --balance 15 --period 6m
 python main.py --mode wfa            --tf H1 --broker headway_cent --balance 15
 python main.py --mode demo           --tf H1 --broker headway_cent --balance 15
@@ -456,12 +466,24 @@ python main.py --mode live           --tf H1 --broker headway_cent --balance 15
 **M15 — Headway Cent:**
 ```bash
 python main.py --mode process        --tf M15
-python main.py --mode optimize       --tf M15 --broker headway_cent --balance 15 --trials 600
+
+# Stage 1: Fast XGB exploration — saves stage1_m15_headway_cent.json
+python main.py --mode optimize       --tf M15 --broker headway_cent --balance 15 --stage xgb --trials 100
+
+# Stage 2: Full CPCV optimization (warm-started from Stage 1)
+python main.py --mode optimize       --tf M15 --broker headway_cent --balance 15 --stage trading --trials 200
+
+# Commit: Train final model with best params
 python main.py --mode train          --tf M15 --broker headway_cent --balance 15
+
+# Optional checks
 python main.py --mode sensitivity    --tf M15 --broker headway_cent --balance 15
-python main.py --mode train_tcn      --tf M15 --broker headway_cent --epochs 100
+python main.py --mode montecarlo     --tf M15 --broker headway_cent --balance 15
 python main.py --mode report         --tf M15 --broker headway_cent --balance 15
-python main.py --mode sync_validate  --tf M15 --broker headway_cent --balance 15 --period 3m
+
+# Validate + go live
+python main.py --mode sync_validate  --tf M15 --broker headway_cent --balance 15 --period 6m
+python main.py --mode wfa            --tf M15 --broker headway_cent --balance 15
 python main.py --mode demo           --tf M15 --broker headway_cent --balance 15
 python main.py --mode live           --tf M15 --broker headway_cent --balance 15
 ```
@@ -469,12 +491,24 @@ python main.py --mode live           --tf M15 --broker headway_cent --balance 15
 **M5 — Headway Cent:**
 ```bash
 python main.py --mode process        --tf M5
-python main.py --mode optimize       --tf M5 --broker headway_cent --balance 15 --trials 1000
+
+# Stage 1: Fast XGB exploration — saves stage1_m5_headway_cent.json
+python main.py --mode optimize       --tf M5 --broker headway_cent --balance 15 --stage xgb --trials 150
+
+# Stage 2: Full CPCV optimization (warm-started from Stage 1)
+python main.py --mode optimize       --tf M5 --broker headway_cent --balance 15 --stage trading --trials 300
+
+# Commit: Train final model with best params
 python main.py --mode train          --tf M5 --broker headway_cent --balance 15
+
+# Optional checks
 python main.py --mode sensitivity    --tf M5 --broker headway_cent --balance 15
-python main.py --mode train_tcn      --tf M5 --broker headway_cent --epochs 100
+python main.py --mode montecarlo     --tf M5 --broker headway_cent --balance 15
 python main.py --mode report         --tf M5 --broker headway_cent --balance 15
+
+# Validate + go live
 python main.py --mode sync_validate  --tf M5 --broker headway_cent --balance 15 --period 3m
+python main.py --mode wfa            --tf M5 --broker headway_cent --balance 15
 python main.py --mode demo           --tf M5 --broker headway_cent --balance 15
 python main.py --mode live           --tf M5 --broker headway_cent --balance 15
 ```
@@ -487,23 +521,25 @@ python main.py --mode live           --tf M5 --broker headway_cent --balance 15
 
 The live signal gate is the `SignalEngine` class (`src/signal_engine.py`). It is stateful — it tracks how many consecutive bars the current HMM regime has persisted, whether a trade is open, and what regime the trade was entered in.
 
-**Entry requires all three conditions to pass simultaneously:**
+> **Note on HMM state encoding:** XGBoost receives the HMM regime as one-hot encoded columns (`hmm_0`, `hmm_1`, `hmm_2` for n_states=3; `hmm_0`–`hmm_3` for n_states=4) rather than a single integer. This prevents the model from treating states as ordinal (0 < 1 < 2) and allows each regime to have an independent feature weight.
 
-1. **Regime has persisted** — at least 2 consecutive bars in the same regime (Bull, Bear, or Chop)
-2. **XGBoost probability** ≥ TF-specific threshold
-3. **HMM self-transition probability** ≥ TF-specific persistence floor
+**Trend entry conditions (all must pass):**
 
-| TF | XGBoost entry threshold | Persistence floor | MR entry prob |
-|----|------------------------|-------------------|---------------|
-| H1 | 0.58 | 0.65 | 0.55 |
-| M15 | 0.55 | 0.55 | 0.52 |
-| M5 | 0.52 | 0.45 | 0.50 |
+1. **Regime has persisted** — at least 2 consecutive bars in the same regime (Bull or Bear)
+2. **synth_vix_zscore** ≥ `MIN_TREND_ZSCORE` for this TF (volatility expansion confirmation)
+3. **XGBoost probability** ≥ TF threshold (H1 only; M15/M5 bypass the XGB gate)
+4. **ATR band position** within valid range (trend: < 0.80 for BUY, > 0.20 for SELL)
+5. **HMM self-transition probability** ≥ TF persistence floor
 
-**TCN boost:** if the TCN multiplier is < 0.85, the effective XGBoost probability is multiplied by 1.10 before checking against the threshold.
+| TF | XGBoost threshold | Persistence floor | `MIN_TREND_ZSCORE` | `MIN_MR_ZSCORE` |
+|----|-------------------|-------------------|--------------------|-----------------|
+| H1 | 0.575 | 0.57 | 0.5 | 1.0 |
+| M15 | bypass (0.0) | 0.55 | 1.0 | 1.5 |
+| M5 | bypass (0.0) | 0.45 | 1.5 | 2.0 |
 
 #### Mean Reversion entries (Chop state ≥ 2)
 
-MR entries require BB position at an extreme: BB ≤ 0.30 → MR_BUY; BB ≥ 0.70 → MR_SELL. MR positions use 75% of the standard lot size.
+MR entries require ATR band position at an extreme: ATR band < 0.10 → MR_BUY; ATR band > 0.90 → MR_SELL. MR positions use 75% of the standard lot size. `synth_vix_zscore ≥ MIN_MR_ZSCORE` is also required.
 
 #### Exit conditions
 
@@ -523,10 +559,12 @@ A trade fires when **all** of the following pass:
 | Gate | Requirement |
 |------|-------------|
 | Regime confirmed | ≥ 2 consecutive bars in regime |
-| XGBoost prob | ≥ TF threshold (boosted by TCN if multiplier < 0.85) |
+| synth_vix_zscore | ≥ `MIN_TREND_ZSCORE` for this TF |
+| XGBoost prob | ≥ TF threshold (H1 only; M15/M5 bypass) |
+| ATR band | trend: position < 0.80 (BUY) or > 0.20 (SELL) |
 | Persistence | P(stay in state) ≥ TF floor |
 | Direction | BUY only in Bull (0); SELL only in Bear (1); Chop → MR only |
-| BB confluence (MR) | MR_BUY: BB ≤ 0.30; MR_SELL: BB ≥ 0.70 |
+| ATR band (MR) | MR_BUY: ATR band < 0.10; MR_SELL: ATR band > 0.90 |
 | Session limit | Under daily trade cap for this TF |
 | Margin check | Sufficient free margin for the lot size |
 | Spread viability | TP1 ≥ spread × ratio (1.5× cent / 3.0× standard) |
@@ -535,13 +573,13 @@ A trade fires when **all** of the following pass:
 
 ### Mean Reversion in Chop — Live Safety Gates
 
-MR signals are gated by the engine's persistence check (P(stay in Chop state) ≥ TF floor) and BB extremity, matching the backtester exactly.
+MR signals are gated by the engine's persistence check (P(stay in Chop state) ≥ TF floor), ATR band extremity (< 0.10 / > 0.90), and `synth_vix_zscore ≥ MIN_MR_ZSCORE`, matching the backtester exactly.
 
 ### Logic Audit
 
 Every bar that does not fire a trade, the bridge logs a structured reason:
 
-`[LOGIC AUDIT] BULL | state=0  prob=0.510  bars=1  P(stay)=0.82  BB=0.44  tcn=0.97`
+`[LOGIC AUDIT] BULL | state=0  prob=0.510  bars=1  P(stay)=0.82  vix_z=0.87  atr_band=0.44`
 
 ### Spread Viability Guard
 
@@ -603,114 +641,24 @@ Both gates reset at UTC midnight.
 6. **Chop-exit** — all positions closed at market if HMM shifts to Chop mid-trade
 7. **M5 recycle** — after scalp target close, re-entry is allowed on the same bar if regime unchanged and daily cap not hit
 
----
+## Automatic Data Updates
 
-## TCN Confidence Scorer
+### Pre-Optimisation Sync (`ensure_data_updated`)
 
-The TCN watches the last 100 bars of market context and outputs a **confidence multiplier** used by the `SignalEngine`. Unlike the old LSTM ensemble, the TCN never blocks trades outright — it only adjusts entry difficulty by boosting the effective XGBoost probability when the multiplier is below 0.85.
+`src/mt5_sync.py` exposes `ensure_data_updated(tf, symbol)`, which is called automatically at the **start of every `--mode optimize` run** for each requested timeframe. It:
 
-### Architecture
+1. Reads the last timestamp from the corresponding raw CSV file (`data/raw/XAU_*_data.csv`)
+2. Calculates how many bars are missing up to the current time
+3. Fetches only the missing bars from MT5 using `copy_rates_range`
+4. Appends new rows in semicolon-delimited format, matching the existing CSV structure
+5. Skips silently if MT5 is unavailable — optimization continues with existing data
 
-```
-Input (100 bars, 8 features)
-  → Conv1D(64, kernel=3, dilation=1, padding=causal, relu)  + Dropout(0.3)
-  → Conv1D(64, kernel=3, dilation=2, padding=causal, relu)  + Dropout(0.3)
-  → Conv1D(64, kernel=3, dilation=4, padding=causal, relu)  + Dropout(0.3)
-  → Conv1D(64, kernel=3, dilation=8, padding=causal, relu)
-  → GlobalAveragePooling1D
-  → Dense(32, relu) + Dropout(0.2)
-  → Dense(1, sigmoid)   ← raw confidence [0, 1]
-  → temperature calibration
-  → multiplier = 1.3 − (confidence × 0.6)   ← maps to [0.7, 1.3]
-```
-
-**Causal padding** ensures no future bar data leaks into the prediction. Each dilation doubles the receptive field without extra parameters.
-
-Input features: `log_return`, `kalman_return`, `volatility`, `rsi`, `rsi_slope`, `atr_normalized`, `gmm_vol_cluster`, `usdchf_log_return`.
-
-### Confidence multiplier mapping
-
-| Raw confidence | Multiplier | Effect on SignalEngine |
-|---------------|------------|------------------------|
-| 1.0 (very confident) | **0.70** | Multiplier < 0.85 → XGBoost prob boosted ×1.10 |
-| 0.67 | **1.00** | No boost applied |
-| 0.0 (very uncertain) | **1.30** | No boost (multiplier ≥ 0.85) |
-
-The TCN multiplier is passed directly to `SignalEngine.should_enter()`. When it is below 0.85, the effective XGBoost probability is multiplied by 1.10 before comparing against the entry threshold — making entry easier in high-confidence conditions.
-
-### Temperature scaling
-
-Raw sigmoid outputs are calibrated via temperature scaling before the multiplier mapping:
-
-```
-logit    = log(raw_conf / (1 − raw_conf + ε))
-calibrated = sigmoid(logit / T)
-```
-
-| Temperature T | Effect |
-|--------------|--------|
-| > 1.0 (default 1.5) | Softens distribution — model is more honest about uncertainty |
-| 1.0 | No change from raw output |
-| < 1.0 | Sharpens — pushes confidence toward 0 or 1 |
-
-### Training targets
-
-The TCN is trained on a **regime-persistence target**, not price direction or profit:
-
-| Target | Condition |
-|--------|-----------|
-| **1** (confident) | HMM regime at `current_bar + forward_window` is the **same** as the regime at `current_bar` — the regime is stable and the signal can be trusted |
-| **0** (uncertain) | HMM regime has **changed** by `current_bar + forward_window` — the signal should be treated cautiously |
-
-The forward window is TF-dependent: H1 = 5 bars (~5 hours), M15 = 12 bars (~3 hours), M5 = 24 bars (~2 hours). A high-confidence prediction (target→1) lowers the multiplier below 0.85, boosting entry probability in the `SignalEngine`.
-
-### Training commands
+This ensures the model always trains on the most recent bars without requiring a manual data export before each optimization cycle.
 
 ```bash
-# Full training (first time — ~10–20 min):
-python main.py --mode train_tcn --tf H1 --broker headway_cent \
-    --epochs 100 --temperature 1.5
-
-# Fine-tune on last 2 years (recommended for weekly maintenance — ~5 min):
-python main.py --mode train_tcn --tf H1 --broker headway_cent \
-    --epochs 20 --fine_tune --recent_years 2
-
-# Custom sequence length:
-python main.py --mode train_tcn --tf H1 --broker headway_cent \
-    --epochs 100 --seq_len 50
-
-# Custom temperature (sharper multiplier distribution):
-python main.py --mode train_tcn --tf H1 --broker headway_cent \
-    --epochs 100 --temperature 1.2
+# Sync happens automatically — just run:
+python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --trials 400
 ```
-
-### TCN model files
-
-```
-models/tcn/
-├── H1_headway_cent/
-│   ├── tcn_confidence_model.keras
-│   ├── tcn_feature_scaler.pkl
-│   └── tcn_metadata.json        ← trained_at, seq_len, n_features, temperature
-├── M15_headway_cent/  …
-└── M5_headway_cent/   …
-```
-
-The `load_tcn_classifier()` helper returns `None` silently if no model has been trained yet — the live bridge runs with no TCN boost applied.
-
-### Important: train TCN after HMM, not before
-
-```bash
-# CORRECT order:
-python main.py --mode train     --tf H1 --broker headway_cent --balance 15   # HMM first
-python main.py --mode train_tcn --tf H1 --broker headway_cent                # TCN second
-```
-
-The TCN learns from HMM regime labels. If the HMM is re-optimised on new params, state assignments may shift — retrain the TCN afterward.
-
----
-
-## Automatic Data Updates & TCN Maintenance
 
 ### Weekly Data Updater (`WeeklyDataUpdater`)
 
@@ -718,28 +666,13 @@ The TCN learns from HMM regime labels. If the HMM is re-optimised on new params,
 
 1. Fetches the last ~2 weeks of XAUUSD bars from MT5 for each active TF (H1: 336 bars, M15: 1344, M5: 4032)
 2. Deduplicates by timestamp and appends only new rows to the raw CSV training files
-3. Writes a `data/raw/.last_auto_update` marker so `TCNMaintenanceScheduler` can detect the refresh
+3. Writes a `data/raw/.last_auto_update` marker
 
 No manual action is required. The updater is a no-op on non-Sunday days and won't re-run within the same week.
 
-### Hourly TCN Maintenance (`TCNMaintenanceScheduler`)
-
-`src/tcn_maintenance.py` runs automatically inside the live loop **once per hour**. It:
-
-1. Reads `tcn_metadata.json` for each active TF — checks model age (no weights loaded; fast)
-2. If any model is **≥ 7 days old** or was never trained, launches a fine-tune subprocess:
-   ```bash
-   python main.py --mode train_tcn --tf <TF> --broker <broker> \
-       --epochs 20 --fine_tune --recent_years 2 --temperature 1.5
-   ```
-3. Also triggers a full retrain cycle when `WeeklyDataUpdater` marks a fresh data pull
-4. Uses a lock file (`models/tcn/.retrain_in_progress`) to prevent concurrent retrains
-
-A stale lock older than 2 hours is cleaned up automatically.
-
 ### Guardian daily check
 
-When `--mode guardian` is running it also performs a **daily TCN staleness check** (independent of the live loop's hourly check). If any TF's model is stale, the guardian fires the same background retrain subprocess and sends a Telegram notification.
+When \--mode guardian\ is running it performs a **daily model health check**. If rolling Sharpe degrades or models appear stale, the guardian fires an alert via Telegram.
 
 ---
 
@@ -855,7 +788,7 @@ Minimum lot is always **0.01**. All lots rounded to 2 decimal places.
 |-----------|-----|-----|-----|
 | Kalman `obs_cov` default | 0.05 | 4.0 | 1.0 |
 | Bars/day (annualisation) | 288 | 96 | 24 |
-| HMM `n_states` search space | `{4}` only | 3–4 | 3–4 |
+| HMM `n_states` search space | 3–4 | 3–4 | 3–4 |
 | HMM persistence gate (training) | ≥ 0.65 | ≥ 0.65 | ≥ 0.65 |
 | IS/OOS split | 65% / 35% | 65% / 35% | **70% / 30%** |
 | Min OOS trades (hard floor) | **120** | **60** | 20 |
@@ -869,13 +802,10 @@ Minimum lot is always **0.01**. All lots rounded to 2 decimal places.
 | DailyEquityGate loss | 5% | 5% | 5% |
 | DailyEquityGate profit lock | **20%** | **10%** | **10%** |
 | Model staleness gate | 14 days | 30 days | 30 days |
-| TCN staleness gate | 7 days | 7 days | 7 days |
 | M5 optimisation freshness gate | **120 h** | — | — |
 | Recommended `--trials` | 1000 | 600 | 400 |
 
-> **M5 `n_states` restriction:** n_states=3 is always degenerate for M5 — Bull/Chop collapse to identical means, producing 500K+ HMM transitions. n_states=2 has no Chop state and causes counter-trend signals. Optimizer uses `{4}` only.
->
-> **H1/M15 `n_states` restriction:** n_states=2 is banned — with only Bull/Bear states every bar is signal-eligible, creating excessive counter-trend noise. Minimum is 3.
+> **`n_states` restriction (all TFs):** All timeframes search `{3, 4}`. n_states=2 is banned on all TFs — with only Bull/Bear states every bar is signal-eligible, creating excessive counter-trend noise. n_states=3 gives Bull/Bear/Chop; n_states=4 adds a `Chop_High` state for volatile chop regimes. The optimal count is selected by Optuna per study.
 
 ---
 
@@ -956,7 +886,7 @@ The 0.20 multiplier (up from 0.15) aligns with the wider score range (−5 to +5
 | IS/OOS generalisation | If IS Sharpe > 0.1 and OOS/IS Sharpe < 0.35 → score **−50.0** |
 | HMM persistence gate | Any self-transition < 0.65 → score **−100.0** |
 | M5 activity bonus | OOS trades > 300 → score × 1.2; OOS trades < 150 → score × 0.5 |
-| n_states restriction | M5: `{4}`; H1/M15: `{3, 4}` |
+| n_states restriction | All TFs: `{3, 4}` |
 | No threshold search | SignalEngine thresholds are hardcoded TF constants — not Optuna parameters |
 | Per-broker study isolation | `study_headway_cent.db` and `study_standard.db` never interfere |
 | Rolling WFO per trial | Every Optuna trial evaluates across all rolling IS/OOS windows — not a single split |
@@ -985,12 +915,12 @@ WFO_TRIALS = {"H1": 60, "M15": 100, "M5": 120}
 | `n_estimators` | 50 – 400 (step 50) | 100 – 500 (step 50) | 200 – 600 (step 50) |
 | `max_depth` | 3 – 7 | 3 – 7 | 2 – 4 |
 | `min_child_weight` | 5 – 100 | 3 – 30 | 5 – 25 |
-| `reg_alpha` (L1) | 1e-6 – 0.3 | 0.05 – 5.0 | 1.0 – 30.0 |
-| `reg_lambda` (L2) | **0.1 – 10.0** | **0.5 – 15.0** | **1.0 – 30.0** |
+| `reg_alpha` (L1) | 1e-6 – 0.5 | 1e-6 – 0.1 | 1e-6 – 0.1 |
+| `reg_lambda` (L2) | **0.01 – 2.0** | **1e-6 – 0.1** | **1e-6 – 0.1** |
 | `subsample` | 0.5 – 0.9 | 0.5 – 0.9 | 0.55 – 0.85 |
 | `colsample_bytree` | 0.4 – 0.9 | 0.5 – 1.0 | 0.4 – 0.8 |
 
-> ⚠️ **Delete the study DB** whenever a fundamental parameter changes (e.g. after adding a new feature, changing n_states search space, or altering the score function). Old trials bias the surrogate model.
+> ⚠️ **Delete the study DB** whenever a fundamental parameter changes (e.g. after adding a new feature, changing n_states search space, altering the score function, enabling OHE for `hmm_state`, or adding session gating). Old trials bias the surrogate model.
 >
 > ```bash
 > del models\study_headway_cent.db
@@ -1024,8 +954,6 @@ python main.py --mode guardian --tf M5,M15,H1 --period 3m \
 ```
 
 Every hour: validates rolling Sharpe for each TF — fires Telegram alert if below 0.6.
-
-**Daily TCN check** (built into the guardian loop): reads `trained_at` from each TCN model's metadata JSON (no weights loaded — fast). If any model is older than 7 days, fires auto-retrain as a background subprocess and Telegrams the result.
 
 ### Audit — On-demand deal report
 
@@ -1184,11 +1112,11 @@ python main.py --mode wfa --tf H1 --broker headway_cent --balance 15
 
 ### Model Staleness Gate
 
-| TF | Max HMM/XGB model age | Max TCN model age |
-|----|----------------------|-------------------|
-| M5 | 14 days | 7 days |
-| M15 | 30 days | 7 days |
-| H1 | 30 days | 7 days |
+| TF | Max HMM/XGB model age |
+|----|-----------------------|
+| M5 | 14 days |
+| M15 | 30 days |
+| H1 | 30 days |
 
 M5 has an additional **5-day optimisation freshness gate**: `m5_meta_<broker>.json` must exist and be < 120 hours old before going live.
 
@@ -1206,16 +1134,12 @@ python main.py --mode wfa           --tf M5 --broker headway_cent --balance 15
 # If needed:
 python main.py --mode optimize      --tf M5 --broker headway_cent --balance 15 --trials 1000
 python main.py --mode train         --tf M5 --broker headway_cent --balance 15
-python main.py --mode train_tcn     --tf M5 --broker headway_cent --epochs 20 --fine_tune
 
 # Monthly (H1 / M15):
 python main.py --mode wfa       --tf H1 --broker headway_cent --balance 15
 python main.py --mode optimize  --tf H1 --broker headway_cent --balance 15 --trials 400
 python main.py --mode train     --tf H1 --broker headway_cent --balance 15
-python main.py --mode train_tcn --tf H1 --broker headway_cent --epochs 20 --fine_tune
 ```
-
-The live bridge handles TCN fine-tuning automatically (every 7 days in background). Manual retraining above is only needed after a full HMM/XGBoost re-optimise.
 
 ---
 
@@ -1231,10 +1155,6 @@ The live bridge handles TCN fine-tuning automatically (every 7 days in backgroun
 | Validation FAIL every day | Model stale or data ends before sync window | Export fresh CSV from MT5, re-run full pipeline |
 | No signals firing | XGBoost prob or persistence below thresholds | Check `[LOGIC AUDIT]` logs for `prob=` and `P(stay)=` values; consider re-training |
 | No entry after regime change | `bars_in_regime` < 2 | Engine waits for confirmation — normal on first bar of a new regime |
-| TCN multiplier always ~1.3 (hardening) | TCN undertrained or wrong features | Retrain: `--mode train` then `--mode train_tcn --epochs 100` |
-| `[TCN HEALTH] FAILED` at startup | Corrupt model file | Delete `models/tcn/<TF>_<broker>/` and retrain |
-| `ValueError: Input shape (None, 100, 4)` | TCN trained without deriving features | Fixed in current version — retrain TCN |
-| `TCN auto-retrain triggered` in logs | Model ≥ 7 days old | Normal — background fine-tune fires automatically |
 | WFA shows many ❌ folds | Model curve-fits specific years | Loosen regularisation, increase trials, add more training data |
 | `Order failed: retcode=10006` | No broker connection | Check MT5 connection indicator |
 | `Order failed: retcode=10015` | Price moved past deviation | Will retry next bar; elevated deviation auto-applies on high-vol |
@@ -1282,14 +1202,7 @@ models/
 ├── xgb_model_H1_headway_cent.onnx               ← MQL5 EA uses this
 ├── study_headway_cent.db               ← Optuna trials (per-broker, never shared)
 ├── study_standard.db
-├── m5_meta_headway_cent.json           ← M5 optimisation freshness gate
-└── tcn/
-    ├── H1_headway_cent/
-    │   ├── tcn_confidence_model.keras
-    │   ├── tcn_feature_scaler.pkl
-    │   └── tcn_metadata.json           ← trained_at, seq_len, n_features, temperature
-    ├── M15_headway_cent/  …
-    └── M5_headway_cent/   …
+└── m5_meta_headway_cent.json           ← M5 optimisation freshness gate
 ```
 
 Without this fix, the notebook's loaded probabilities came from a single global XGBoost model instead of the three vol-bucket models used by the optimizer and live trader, making Section 2 equity curves and Section 3 WFO scores inconsistent with production results.

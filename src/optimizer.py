@@ -113,10 +113,10 @@ SEARCH_SPACES = {
     "M15": {
         "obs_cov":           (0.5,   5.0,  "log"),
         "trans_cov":         (0.001, 0.03, "log"),
-        "n_states":          (4,     4,    "cat"),
+        "n_states":          (3,     4,    "int"),
         "max_depth":         (3,     7,    "int"),
-        "reg_alpha":         (0.05,  2.0,  "log"),
-        "reg_lambda":        (0.5,   5.0,  "log"),
+        "reg_alpha":         (1e-6,  0.1,  "log"),   # lowered: allow hmm OHE signal through
+        "reg_lambda":        (1e-6,  0.1,  "log"),   # lowered: allow hmm OHE signal through
         "min_child_weight":  (3,     30,   "int"),
         "learning_rate":     (0.005, 0.2,  "log"),
         "n_estimators":      (100,   500,  "int"),
@@ -128,10 +128,10 @@ SEARCH_SPACES = {
     "M5": {
         "obs_cov":           (0.05,  5.0,  "log"),
         "trans_cov":         (0.001, 0.1,  "log"),
-        "n_states":          (4,     4,    "cat"),
+        "n_states":          (3,     4,    "int"),
         "max_depth":         (2,     4,    "int"),
-        "reg_alpha":         (0.5,   5.0,  "log"),
-        "reg_lambda":        (0.5,   10.0, "log"),
+        "reg_alpha":         (1e-6,  0.1,  "log"),   # lowered: allow hmm OHE signal through
+        "reg_lambda":        (1e-6,  0.1,  "log"),   # lowered: allow hmm OHE signal through
         "min_child_weight":  (5,     25,   "int"),
         "learning_rate":     (0.01,  0.15, "log"),
         "n_estimators":      (200,   600,  "int"),
@@ -607,18 +607,16 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
 
         # ── n_states ──────────────────────────────────────────────────────────
-        if tf_up == "M5":
-            n_states = trial.suggest_categorical("n_states", [4])
-        elif tf_up == "H1":
+        if tf_up in ("M5", "M15"):
             n_states = trial.suggest_int("n_states", 3, 4)
-        else:  # M15
-            n_states = trial.suggest_categorical("n_states", [4])
+        else:  # H1
+            n_states = trial.suggest_int("n_states", 3, 4)
 
         # ── XGBoost params ────────────────────────────────────────────────────
         if tf_up == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 4)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-3, 1.0,  log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.1,  2.0,  log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.1,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 1e-6, 0.1,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
             learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 200, 600, step=50)
@@ -635,8 +633,8 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.9)
         else:  # M15
             max_depth        = trial.suggest_int("max_depth", 3, 7)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-4, 1.0,  log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0,  log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.1,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 1e-6, 0.1,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 3, 30)
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)
@@ -798,18 +796,13 @@ def make_objective_stage1(
             obs_cov   = trial.suggest_float("obs_cov",   0.5,  5.0,  log=True)
             trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
 
-        if tf_up == "M5":
-            n_states = trial.suggest_categorical("n_states", [4])
-        elif tf_up == "H1":
-            n_states = trial.suggest_int("n_states", 3, 4)
-        else:
-            n_states = trial.suggest_categorical("n_states", [4])
+        n_states = trial.suggest_int("n_states", 3, 4)
 
         # ── XGBoost params (same ranges as full CPCV objective) ───────────────
         if tf_up == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 4)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-3, 1.0,  log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.1,  2.0,  log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.1,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 1e-6, 0.1,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
             learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 200, 600, step=50)
@@ -826,8 +819,8 @@ def make_objective_stage1(
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.9)
         else:  # M15
             max_depth        = trial.suggest_int("max_depth", 3, 7)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-4, 1.0,  log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0,  log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.1,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 1e-6, 0.1,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 3, 30)
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)
