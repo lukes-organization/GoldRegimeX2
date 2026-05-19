@@ -25,6 +25,8 @@ import numpy as np
 import optuna
 import pandas as pd
 
+from sklearn.metrics import log_loss
+from sklearn.model_selection import TimeSeriesSplit
 from src.processor import kalman_smooth
 from src.engine_hmm import fit_hmm, predict_states
 from src.engine_xgb import (
@@ -397,10 +399,17 @@ def _run_single_window(
     except Exception as exc:
         return _fail(f"XGB train: {exc}")
 
-    # Detect if XGBoost zeroed out hmm_state — a signal of over-regularisation
-    # that breaks the HMM→XGB regime connection entirely.
-    hmm_state_imp = ens_metrics.get("feature_importance", {}).get("hmm_state", 1.0)
-    hmm_zeroed    = (float(hmm_state_imp) == 0.0)
+    # Detect if XGBoost zeroed out the regime signal — a sign of over-regularisation
+    # that breaks the HMM→XGB connection.  For M5/M15 regime is OHE (state_0/1/2);
+    # for H1 it is the raw integer hmm_state.
+    feat_imp = ens_metrics.get("feature_importance", {})
+    if tf.upper() in ("M5", "M15"):
+        _regime_cols      = ("state_0", "state_1", "state_2")
+        regime_importance = sum(feat_imp.get(c, 0.0) for c in _regime_cols)
+        hmm_zeroed        = (regime_importance == 0.0)
+    else:
+        regime_importance = feat_imp.get("hmm_state", 1.0)
+        hmm_zeroed        = (float(regime_importance) == 0.0)
 
     _, probs_oos = get_predictions_ensemble(models_w, thresh_w, X_oos)
 
@@ -426,8 +435,15 @@ def _run_single_window(
         oos_score = _score_from_backtest(
             oos_result, tf=tf, account_size=balance, n_bars=oos_bars
         )
-        if hmm_zeroed:
-            oos_score *= 0.5  # XGB ignoring HMM regime = signal quality failure
+        if tf.upper() in ("M5", "M15"):
+            # Graduated penalty: combined OHE importance < 1% → ×0.5; ==0 → ×0.25
+            if regime_importance < 0.01:
+                oos_score *= 0.5
+            if regime_importance == 0.0:
+                oos_score *= 0.5  # cumulative: 75% total reduction
+        else:
+            if hmm_zeroed:
+                oos_score *= 0.5  # XGB ignoring HMM regime = signal quality failure
         if mean_cv_sharpe < -1.0:
             oos_score *= 0.5
 
@@ -859,24 +875,83 @@ def make_objective_stage1(
             scale_pos_weight=scale_pos_weight,
         )
 
-        try:
-            result = _run_single_window(
-                df_is=df_is, df_oos=df_oos,
-                n_states=int(n_states), tf=tf,
-                balance=account_size, broker=broker,
-                xgb_kwargs=xgb_kwargs,
-                n_cv_folds=n_cv_folds,
-                oos_bars=oos_bars,
-            )
-        except Exception as exc:
-            logger.warning("Stage1[%s] trial %d error: %s", tf, trial.number, exc)
-            return -50.0
+        # ── Stage-1 scoring: 5-fold TS log-loss for M5/M15, backtest for H1 ───
+        # M5/M15: optimise pure predictive accuracy via averaged XGB log-loss
+        # across 5 TimeSeriesSplit folds on the IS data.
+        #
+        # Why folds instead of a single hold-out:
+        #   A single 90-day OOS window can fall entirely in a ranging period
+        #   where gold direction is near-50/50, making every trial return
+        #   log_loss ≈ ln(2) = 0.693 regardless of hyperparameters.  Five
+        #   folds spanning the full 10-year IS window cover both trending and
+        #   ranging regimes — the mean log-loss becomes informative.
+        #
+        # HMM is fitted once on IS (unchanged — keeps Stage-1 fast).
+        # A 6-bar embargo is dropped from each val fold start to prevent the
+        # forward-looking binary target from leaking across the fold boundary.
+        _STAGE1_N_FOLDS  = 5
+        _STAGE1_EMBARGO  = 6   # bars — matches the target horizon in prepare_features
+        _STAGE1_MIN_BARS = 500  # minimum training bars per fold
+        if tf_up in ("M5", "M15"):
+            try:
+                _hmm, _states_is, _ = fit_hmm(df_is, n_states=int(n_states), tf=tf)
+                X_is_s, y_is_s, _, _ = prepare_features(df_is, _states_is, tf=tf)
+                if len(X_is_s) < _STAGE1_MIN_BARS * 2:
+                    return -50.0
 
-        score = result.get("oos_score", -50.0)
-        trial.set_user_attr("oos_sharpe", float(result.get("oos_sharpe", -10.0)))
-        trial.set_user_attr("oos_trades", int(result.get("oos_n_trades", 0)))
-        trial.set_user_attr("oos_fdd",    float(result.get("oos_fdd", 1.0)))
-        return score
+                tscv       = TimeSeriesSplit(n_splits=_STAGE1_N_FOLDS)
+                fold_losses: list = []
+                for _tr_idx, _val_idx in tscv.split(X_is_s):
+                    # Drop first `embargo` bars of val to prevent forward-return leakage
+                    _val_idx = _val_idx[_STAGE1_EMBARGO:]
+                    if len(_tr_idx) < _STAGE1_MIN_BARS or len(_val_idx) < 100:
+                        continue
+                    X_tr   = X_is_s.iloc[_tr_idx]
+                    y_tr   = y_is_s.iloc[_tr_idx]
+                    X_val  = X_is_s.iloc[_val_idx]
+                    y_val  = y_is_s.iloc[_val_idx]
+                    try:
+                        _fm, _ft, _ = train_xgb_ensemble(
+                            X_tr, y_tr, train_ratio=1.0, **xgb_kwargs
+                        )
+                        _, _probs = get_predictions_ensemble(_fm, _ft, X_val)
+                        fold_losses.append(log_loss(y_val, _probs))
+                    except Exception:
+                        pass
+
+                if not fold_losses:
+                    return -50.0
+                ll = float(np.mean(fold_losses))
+                trial.set_user_attr("log_loss",    round(ll, 5))
+                trial.set_user_attr("n_cv_folds",  len(fold_losses))
+                trial.set_user_attr("is_bars",     int(len(X_is_s)))
+                logger.info(
+                    "Stage1[%s] trial %d: mean_log_loss=%.5f over %d folds",
+                    tf, trial.number, ll, len(fold_losses),
+                )
+                return -ll  # Optuna direction=maximize → minimise log-loss
+            except Exception as exc:
+                logger.warning("Stage1[%s] trial %d error: %s", tf, trial.number, exc)
+                return -50.0
+        else:
+            try:
+                result = _run_single_window(
+                    df_is=df_is, df_oos=df_oos,
+                    n_states=int(n_states), tf=tf,
+                    balance=account_size, broker=broker,
+                    xgb_kwargs=xgb_kwargs,
+                    n_cv_folds=n_cv_folds,
+                    oos_bars=oos_bars,
+                )
+            except Exception as exc:
+                logger.warning("Stage1[%s] trial %d error: %s", tf, trial.number, exc)
+                return -50.0
+
+            score = result.get("oos_score", -50.0)
+            trial.set_user_attr("oos_sharpe", float(result.get("oos_sharpe", -10.0)))
+            trial.set_user_attr("oos_trades", int(result.get("oos_n_trades", 0)))
+            trial.set_user_attr("oos_fdd",    float(result.get("oos_fdd", 1.0)))
+            return score
 
     return objective
 

@@ -731,12 +731,25 @@ def compute_live_features(
     atr_normalized  = float(df["atr_normalized"].iloc[-1])
     prev_log_return = float(df["log_return"].iloc[-2])
 
-    feature_dict = {
-        "hmm_state":       float(current_state),
+    # M5/M15: HMM state is one-hot encoded to match the OHE training pipeline.
+    # A causal rolling median (window=5) smooths transient state flips before
+    # encoding — identical logic to prepare_features() in engine_xgb.py.
+    # H1: retain the raw integer hmm_state for backward compatibility.
+    feature_dict: dict = {
         "rsi_slope":       rsi_slope,
         "atr_normalized":  atr_normalized,
         "prev_log_return": prev_log_return,
     }
+    if tf.upper() in ("M5", "M15"):
+        _states_series  = pd.Series(states.astype(int))
+        _smoothed_state = int(
+            _states_series.rolling(window=5, min_periods=1).median().iloc[-1]
+        )
+        feature_dict["state_0"] = int(_smoothed_state == 0)
+        feature_dict["state_1"] = int(_smoothed_state == 1)
+        feature_dict["state_2"] = int(_smoothed_state == 2)
+    else:
+        feature_dict["hmm_state"] = float(current_state)
 
     if "usdchf_log_return" in feature_cols:
         if mt5 is not None:
@@ -800,6 +813,32 @@ def compute_live_features(
         from src.processor import compute_dynamic_atr_bands
         _atr_bands = compute_dynamic_atr_bands(df)
         feature_dict["atr_band_position"] = float(_atr_bands.iloc[-1]) if not np.isnan(_atr_bands.iloc[-1]) else 0.5
+
+    # ── Cyclical time features ────────────────────────────────────────────────
+    if any(c in feature_cols for c in ("hour_sin", "hour_cos", "minute_sin", "minute_cos")):
+        _ts        = df.index[-1]
+        _hour_frac = _ts.hour + _ts.minute / 60.0
+        if "hour_sin"   in feature_cols:
+            feature_dict["hour_sin"]   = float(np.sin(2 * np.pi * _hour_frac / 24))
+        if "hour_cos"   in feature_cols:
+            feature_dict["hour_cos"]   = float(np.cos(2 * np.pi * _hour_frac / 24))
+        if "minute_sin" in feature_cols:
+            feature_dict["minute_sin"] = float(np.sin(2 * np.pi * _ts.minute / 60))
+        if "minute_cos" in feature_cols:
+            feature_dict["minute_cos"] = float(np.cos(2 * np.pi * _ts.minute / 60))
+
+    # Runtime assertion: live feature keys must exactly match training columns.
+    # A mismatch means the model was retrained with a different feature set and
+    # the live path has not been updated — catch this before XGBoost sees garbage.
+    _live_keys  = set(feature_dict.keys())
+    _train_cols = set(feature_cols)
+    if _live_keys != _train_cols:
+        _missing = _train_cols - _live_keys
+        _extra   = _live_keys  - _train_cols
+        raise ValueError(
+            f"Live/training feature mismatch — missing: {_missing}, extra: {_extra}. "
+            f"Retrain the model or update compute_live_features()."
+        )
 
     features_df = pd.DataFrame([feature_dict])[feature_cols]
 

@@ -68,13 +68,23 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     """Return the feature column list for this DataFrame.
 
     Starts from FEATURE_COLS (base set including gmm_vol_cluster), then:
+    - For M5/M15 (after OHE): replaces hmm_state with state_0, state_1, state_2.
     - Drops gmm_vol_cluster if not present (old parquet without GMM).
     - Appends any external asset log returns and synth_vix that are present
       and >50% non-null (graceful degradation when masters are absent).
     """
     cols = []
     for c in FEATURE_COLS:
-        if c == GMM_FEATURE:
+        if c == "hmm_state":
+            # OHE path (M5/M15): state_* columns replace the integer hmm_state.
+            # H1 fall-through: hmm_state column still present as integer.
+            if "state_0" in df.columns:
+                for sc in ("state_0", "state_1", "state_2"):
+                    if sc in df.columns:
+                        cols.append(sc)
+            elif c in df.columns:
+                cols.append(c)
+        elif c == GMM_FEATURE:
             if c in df.columns and df[c].notna().mean() > 0.5:
                 cols.append(c)
         else:
@@ -110,6 +120,27 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
     """
     df = df.copy()
     df["hmm_state"] = hmm_states
+
+    # ── One-hot encode HMM states for M5/M15 (causal rolling median) ─────────
+    # Use a backward-looking window so no future state information leaks into
+    # training.  The integer hmm_state is replaced by state_0/1/2 indicator
+    # columns that XGBoost treats as unordered categories, preventing false
+    # ordinal ranking (state 2 > state 1 > state 0).
+    if tf.upper() in ("M5", "M15"):
+        df["hmm_state_smoothed"] = (
+            df["hmm_state"]
+            .rolling(window=5, min_periods=1)
+            .median()
+            .astype(int)
+        )
+        df.drop("hmm_state", axis=1, inplace=True)
+        df = pd.get_dummies(df, columns=["hmm_state_smoothed"], prefix="state", dtype=int)
+        # Ensure all 3 columns exist even when a state never appears in this window
+        for _i in range(3):
+            _col = f"state_{_i}"
+            if _col not in df.columns:
+                df[_col] = 0
+
     df["prev_log_return"] = df["log_return"].shift(1)
 
     # Pure directional target: label 1 when the next 6-bar cumulative return is
