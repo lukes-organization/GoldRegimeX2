@@ -59,10 +59,16 @@ def run_sensitivity(
     if z_range is None:
         z_range = np.arange(1.5, 3.1, 0.25)  # 1.5 .. 3.0 in 0.25 steps
 
-    # Determine which Z value the current TF override uses
-    from src.signal_evaluator import _TF_CUTOFF_OVERRIDES, _DEFAULT_CONFIG
-    _tf_ovr = _TF_CUTOFF_OVERRIDES.get(tf.upper(), {})
-    current_z = abs(_tf_ovr.get("Z_CUTOFF_BULL", _DEFAULT_CONFIG["Z_CUTOFF_BULL"]))
+    # Phase 3 (updated): Z overrides are now threaded through evaluator_config
+    # → vectorized_backtest → _run_bar_loop → SignalEngine.should_enter via
+    # z_cutoff_bull / z_cutoff_bear, so each Z value genuinely changes entry
+    # decisions.  The logger.warning below is intentionally removed.
+
+    # Determine reference Z using current SignalEngine MIN_TREND_ZSCORE.
+    # signal_evaluator was removed in the SignalEngine refactor; Z-score
+    # thresholds now live in signal_engine.MIN_TREND_ZSCORE.
+    from src.signal_engine import MIN_TREND_ZSCORE
+    current_z = float(MIN_TREND_ZSCORE.get(tf.upper(), 1.0))
 
     logger.info(
         "Sensitivity analysis [%s/%s] balance=$%.0f  mode=%s",
@@ -76,6 +82,7 @@ def run_sensitivity(
     for z in z_range:
         z = float(round(z, 2))
         cfg_override = {"Z_CUTOFF_BULL": z, "Z_CUTOFF_BEAR": -z}
+        logger.info("Sensitivity override active [%s]: bull=%.2f bear=%.2f", tf, z, -z)
 
         result = vectorized_backtest(
             df_aligned, probabilities, states_aligned,

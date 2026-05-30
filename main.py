@@ -35,6 +35,7 @@ from src.optimizer import (
     WFO_PARAMS, WFO_PARAMS_FAST,
     run_optimization_stage1,
     CPCV_N_BLOCKS, CPCV_K_TEST, _N_PATHS,
+    resolve_n_states as _optimizer_resolve_n_states,
 )
 from src.backtester import vectorized_backtest, format_payout
 from src.visualizer import generate_full_report
@@ -46,6 +47,17 @@ logger = setup_logger("main")
 def _resolve_balance(args) -> float:
     """--balance takes precedence over --min_cap."""
     return args.balance if args.balance is not None else args.min_cap
+
+
+def resolve_n_states(tf: str, params: dict) -> int:
+    """Return the canonical n_states for *tf* in both optimize and train paths.
+
+    M5 and M15 are fixed at 3 (Bull/Bear/Chop) so CPCV and training always
+    produce identical HMM structures.  H1 is Optuna-tuned (default 3).
+    """
+    if tf.upper() in ("M5", "M15"):
+        return 3
+    return int(params.get("n_states", 3))
 
 
 _M5_EXPIRY_HOURS   = 120   # 5 days
@@ -111,7 +123,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         broker=broker,
     )
     model_hmm, states, state_map = fit_hmm(
-        df, n_states=params.get("n_states", TF_CONFIG[tf].get("n_states_default", 3))
+        df, n_states=resolve_n_states(tf, params)
     )
     X, y, df_aligned, feature_scaler = prepare_features(df, states, tf=tf)
     save_feature_scaler(feature_scaler, tf=tf, broker=broker)
@@ -661,7 +673,7 @@ def cmd_report(args):
         n = model_hmm.n_components
         state_names = {2: STATE_NAMES_2, 3: STATE_NAMES_3, 4: STATE_NAMES_4}.get(n, STATE_NAMES_3)
     except Exception:
-        model_hmm, states, state_names = fit_hmm(df, n_states=params.get("n_states", 3))
+        model_hmm, states, state_names = fit_hmm(df, n_states=resolve_n_states(tf, params))
 
     # Load the saved feature scaler so the report uses identical scaling to training
     try:
@@ -908,7 +920,7 @@ def cmd_sensitivity(args):
         states = predict_states(model_hmm, df)
     except Exception:
         logger.warning("No saved HMM found for %s/%s — fitting fresh.", tf, broker)
-        model_hmm, states, _ = fit_hmm(df, n_states=params.get("n_states", 3))
+        model_hmm, states, _ = fit_hmm(df, n_states=resolve_n_states(tf, params))
 
     try:
         _feat_scaler = load_feature_scaler(tf=tf, broker=broker)
@@ -1000,7 +1012,7 @@ def cmd_montecarlo(args):
         from src.engine_hmm import predict_states
         states = predict_states(model_hmm, df)
     except Exception:
-        model_hmm, states, _ = fit_hmm(df, n_states=params.get("n_states", 3))
+        model_hmm, states, _ = fit_hmm(df, n_states=resolve_n_states(tf, params))
 
     try:
         _feat_scaler = load_feature_scaler(tf=tf, broker=broker)

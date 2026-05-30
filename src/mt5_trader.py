@@ -43,7 +43,7 @@ from src.engine_xgb import (
     get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
 )
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
-from src.signal_engine import SignalEngine
+from src.signal_engine import SignalEngine, should_apply_prob_gate
 
 logger = setup_logger(__name__)
 
@@ -1496,14 +1496,16 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
 
             # ── 9. Signal routing — regime-confirmation engine ────────────
 
-            # STRICT PROBABILITY GUARD: Reject weak signals immediately
+            # PROBABILITY GATE: H1 only — M15/M5 bypass via should_apply_prob_gate().
+            # XGB probabilities cluster near 50-55% on short TFs; a strict gate
+            # there produces a dead zone that blocks valid signals.
             _thresh_long  = TF_PROB_THRESHOLD.get(tf.upper(), 0.55)
             _thresh_short = TF_SHORT_THRESHOLD.get(tf.upper(), 0.45)
 
-            if _thresh_short < prob < _thresh_long:
+            if should_apply_prob_gate(tf) and _thresh_short < prob < _thresh_long:
                 logger.info(
-                    "Signal rejected: prob=%.3f is within the noise zone (%.2f - %.2f).",
-                    prob, _thresh_short, _thresh_long,
+                    "Signal rejected [%s]: prob=%.3f in noise zone (%.2f - %.2f).",
+                    tf, prob, _thresh_short, _thresh_long,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -1517,45 +1519,59 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             _atr_bands = compute_dynamic_atr_bands(live_df)
             _atr_band_val = float(_atr_bands.iloc[-1]) if not np.isnan(_atr_bands.iloc[-1]) else 0.5
 
-            regime_info = signal_engine.update_regime(hmm_state, model_hmm.transmat_)
-            entry = signal_engine.should_enter(
-                regime_info, prob, _svix_val, _atr_band_val,
+            # ── Single policy call via evaluate_bar (Phase 2) ─────────────────
+            # evaluate_bar calls update_regime internally and enforces M15/M5
+            # specialization gates (_m15_entry_ok, dynamic_prob_threshold).
+            _row_ctx = {
+                "hmm_state":         hmm_state,
+                "prob":              prob,
+                "synth_vix_zscore":  _svix_val,
+                "atr_band_position": _atr_band_val,
+            }
+            _entry_decision = signal_engine.evaluate_bar(
+                _row_ctx, None, {"tf": tf, "hmm_transmat": model_hmm.transmat_}
             )
-
-            if entry is None:
+            if not _entry_decision.enter:
                 regime_desc = ("BULL" if hmm_state == BULL_STATE
                                else "BEAR" if hmm_state == BEAR_STATE
                                else "CHOP")
                 logger.info(
-                    "[LOGIC AUDIT] %s | state=%d  prob=%.3f  bars=%d  P(stay)=%.2f  vix_z=%.2f  atr_band=%.2f",
+                    "[LOGIC AUDIT] %s | state=%d  prob=%.3f  bars=%d  P(stay)=%.2f  vix_z=%.2f  atr_band=%.2f  reason=%s",
                     regime_desc, hmm_state, prob,
-                    regime_info["bars_in_regime"], regime_info["stability"],
-                    _svix_val, _atr_band_val,
+                    signal_engine.bars_in_regime,
+                    _get_transition_prob(model_hmm, hmm_state),
+                    _svix_val, _atr_band_val, _entry_decision.reason,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            _sig_str    = entry["signal"]
-            _size_mult  = entry["size_multiplier"]
+            # Map SignalDecision back to signal string for downstream execution code.
+            _is_mr    = "mr" in _entry_decision.reason.lower()
+            _dir_int  = _entry_decision.direction
+            if _dir_int == 1:
+                _sig_str = "MR_BUY"  if _is_mr else "BUY"
+            else:
+                _sig_str = "MR_SELL" if _is_mr else "SELL"
+            _size_mult = _entry_decision.position_size_multiplier
 
             if _sig_str == "BUY":
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
                 signal_type = "trend"
                 logger.info("[SIGNAL] BUY (trend) | prob=%.3f | bars=%d | P(stay)=%.2f",
-                            prob, regime_info["bars_in_regime"], regime_info["stability"])
+                            prob, signal_engine.bars_in_regime, _get_transition_prob(model_hmm, hmm_state))
             elif _sig_str == "SELL":
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
                 signal_type = "trend"
                 logger.info("[SIGNAL] SELL (trend) | prob=%.3f | bars=%d | P(stay)=%.2f",
-                            prob, regime_info["bars_in_regime"], regime_info["stability"])
+                            prob, signal_engine.bars_in_regime, _get_transition_prob(model_hmm, hmm_state))
             elif _sig_str == "MR_BUY":
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
                 signal_type = "mean_reversion"
                 logger.info("[SIGNAL] MR_BUY | prob=%.3f | BB=%.2f | bars=%d",
-                            prob, _bb_pos, regime_info["bars_in_regime"])
+                            prob, _bb_pos, signal_engine.bars_in_regime)
                 if gmm_cluster == 2:
                     logger.warning(
                         "[MR WARNING] High-vol environment (GMM cluster=2) — "
@@ -1566,7 +1582,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 order_type  = mt5.ORDER_TYPE_SELL
                 signal_type = "mean_reversion"
                 logger.info("[SIGNAL] MR_SELL | prob=%.3f | BB=%.2f | bars=%d",
-                            prob, _bb_pos, regime_info["bars_in_regime"])
+                            prob, _bb_pos, signal_engine.bars_in_regime)
                 if gmm_cluster == 2:
                     logger.warning(
                         "[MR WARNING] High-vol environment (GMM cluster=2) — "

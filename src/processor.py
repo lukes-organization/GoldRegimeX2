@@ -493,6 +493,44 @@ def compute_dynamic_atr_bands(df: pd.DataFrame, period: int = 20, multiplier: fl
     return position.rename("atr_band_position")
 
 
+def add_specialized_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add causal M15/M5 specialization features (Phase 3).
+
+    All features are computed with backward-looking windows only — no
+    lookahead leakage.  Returns a copy of *df* with new columns appended.
+
+    New columns:
+        atr_14               short-window ATR moving average (14 bars)
+        atr_100              long-window ATR moving average (100 bars)
+        atr_expansion_ratio  atr_14 / atr_100  (>1 = expanding volatility)
+        realized_vol_ratio   short realised vol (20) / long realised vol (100)
+        atr_slope            5-bar finite difference of atr_normalized
+        minutes_from_london_open  offset from 08:00 UTC
+        minutes_from_ny_open      offset from 13:30 UTC
+    """
+    out = df.copy()
+
+    out["atr_14"]  = out["atr_normalized"].rolling(14,  min_periods=14).mean()
+    out["atr_100"] = out["atr_normalized"].rolling(100, min_periods=100).mean()
+    out["atr_expansion_ratio"] = out["atr_14"] / out["atr_100"].replace(0, np.nan)
+
+    rv_short = out["log_return"].rolling(20,  min_periods=20).std()
+    rv_long  = out["log_return"].rolling(100, min_periods=100).std()
+    out["realized_vol_ratio"] = rv_short / rv_long.replace(0, np.nan)
+
+    out["atr_slope"] = out["atr_normalized"].diff(5)
+
+    # Session proximity features (UTC)
+    minutes = out.index.hour * 60 + out.index.minute
+    london_open = 8 * 60
+    ny_open     = 13 * 60 + 30
+    out["minutes_from_london_open"] = minutes - london_open
+    out["minutes_from_ny_open"]     = minutes - ny_open
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+
 def process_pipeline(
     obs_cov: float = None,
     trans_cov: float = None,
@@ -585,6 +623,10 @@ def process_pipeline(
     df["hour_cos"]   = np.cos(2 * np.pi * _hour_frac / 24)
     df["minute_sin"] = np.sin(2 * np.pi * df.index.minute / 60)
     df["minute_cos"] = np.cos(2 * np.pi * df.index.minute / 60)
+
+    # Phase 3: M15/M5 specialization features (atr_expansion_ratio,
+    # realized_vol_ratio, atr_slope, minutes_from_london_open, etc.)
+    df = add_specialized_features(df)
 
     # ── Time-of-Day Gating (Session Filter — H1 only) ───────────────────────
     # H1: drop Asian-session bars (00:00-07:59 UTC and 18:00-23:59 UTC) after

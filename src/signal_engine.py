@@ -5,6 +5,8 @@ exits on regime reversal, persistence collapse, profit erosion, or max hold.
 Replaces Z-Score and RCEV evaluation logic.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 
 # Minimum consecutive bars in a regime before entry is allowed.
@@ -62,13 +64,49 @@ PERSISTENCE_MIN = {
 MR_SIZE_MULTIPLIER = 0.75
 
 
+def should_apply_prob_gate(tf: str) -> bool:
+    """Return True when the XGBoost probability gate should be enforced.
+
+    H1: probability check required (XGB signal is meaningful at hourly scale).
+    M15/M5: bypass — XGB probabilities cluster near 50-55% on noisy short TFs;
+            strict gates produce a dead zone that suppresses valid signals.
+
+    This single function is the canonical source used by both backtester and
+    live trader, eliminating ad hoc per-module guards.
+    """
+    return tf.upper() == "H1"
+
+
+@dataclass
+class SignalDecision:
+    """Unified trading decision returned by SignalEngine.evaluate_bar().
+
+    Both backtest and live paths consume this object, ensuring identical
+    policy logic regardless of execution environment.
+    """
+    enter: bool
+    exit: bool
+    direction: int                  # +1 = long, -1 = short, 0 = flat
+    confidence: float               # XGBoost probability of upward move
+    regime: str                     # human-readable regime label
+    reason: str                     # short tag explaining the decision
+    position_size_multiplier: float
+    sl_atr_multiple: float
+    tp_atr_multiple: float
+
+
 class SignalEngine:
     """Stateful signal engine for one live/backtest session.
 
     Call ``update_regime()`` every bar, then ``should_enter()`` or
     ``should_exit()`` depending on current trade state.  Reset the engine
     when the session ends or at the start of a new backtest run.
+
+    The ``evaluate_bar()`` method provides a unified high-level interface
+    that returns a :class:`SignalDecision` for both backtest and live paths.
     """
+
+    _REGIME_LABELS = {0: "Bull", 1: "Bear", 2: "Chop", 3: "Chop_High"}
 
     def __init__(self, tf: str = "H1"):
         self.tf = tf.upper()
@@ -78,6 +116,135 @@ class SignalEngine:
         self.entry_regime: int | None = None
         self.bars_in_trade: int = 0
         self._reversal_bars: int = 0   # consecutive bars in non-entry regime
+        self._probs_window: list = []  # rolling XGB prob history for M5 dynamic threshold
+
+    # ── Unified high-level API (Phase 2) ──────────────────────────────────────
+
+    def evaluate_bar(
+        self,
+        row: dict,
+        current_position: dict | None,
+        tf_config: dict,
+    ) -> "SignalDecision":
+        """Evaluate a single bar and return a unified SignalDecision.
+
+        *row* must contain: hmm_state, prob, synth_vix_zscore, atr_band_position,
+        and optionally: persistence, atr_normalized, cur_pnl, max_fav_pnl,
+        bars_in_trade.
+
+        *current_position* is None when flat, or a dict with keys:
+          ``direction``, ``cur_pnl``, ``max_fav_pnl``, ``bars_in_trade``.
+
+        *tf_config* is a dict with at minimum key ``"tf"``.
+
+        This method calls ``update_regime()``, ``should_enter()``, and
+        ``should_exit()`` in the correct order, keeping this class as the
+        single owner of entry/exit policy for both backtest and live.
+        """
+        hmm_transmat = tf_config.get("hmm_transmat")
+        state   = int(row.get("hmm_state", self.current_regime or 0))
+        prob    = float(row.get("prob", 0.5))
+        vix_z   = float(row.get("synth_vix_zscore", 0.0))
+        atr_bnd = float(row.get("atr_band_position", 0.5))
+        regime_label = self._REGIME_LABELS.get(state, f"state_{state}")
+
+        regime_info = self.update_regime(state, hmm_transmat)
+
+        # ── Exit check first (if in a position) ───────────────────────────────
+        if current_position:
+            cur_pnl       = float(current_position.get("cur_pnl", 0.0))
+            max_fav_pnl   = float(current_position.get("max_fav_pnl", 0.0))
+            bars_in_trade = int(current_position.get("bars_in_trade", 0))
+            exit_now, reason = self.should_exit(
+                regime_info, cur_pnl, max_fav_pnl, bars_in_trade
+            )
+            if exit_now:
+                return SignalDecision(
+                    enter=False, exit=True, direction=0, confidence=prob,
+                    regime=regime_label, reason=reason,
+                    position_size_multiplier=1.0,
+                    sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                )
+
+        # ── Entry check (if flat) ──────────────────────────────────────────────
+        if not current_position:
+            # Rolling probability window for M5 dynamic threshold.
+            self._probs_window.append(prob)
+            if len(self._probs_window) > 200:
+                self._probs_window.pop(0)
+
+            # Phase 3 — M5: only enter on top-10% probability bars in the window.
+            if self.tf == "M5" and len(self._probs_window) >= 30:
+                _dyn_th = self.dynamic_prob_threshold(
+                    np.array(self._probs_window), percentile=90.0
+                )
+                if prob < _dyn_th:
+                    return SignalDecision(
+                        enter=False, exit=False, direction=0, confidence=prob,
+                        regime=regime_label, reason="m5_prob_below_dynamic_threshold",
+                        position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                    )
+
+            entry = self.should_enter(regime_info, prob, vix_z, atr_bnd,
+                                      z_cutoff_bull=tf_config.get("z_cutoff_bull"),
+                                      z_cutoff_bear=tf_config.get("z_cutoff_bear"))
+
+            # Phase 3 — M15: continuation quality gate.
+            # Neutral fallbacks (1.0) pass the gate when features are absent
+            # (e.g. live tick before process_pipeline re-run); the gate is
+            # fully active once atr_expansion_ratio / realized_vol_ratio are
+            # in the processed data.
+            if entry and self.tf == "M15":
+                _stability = float(hmm_transmat[state, state]) if hmm_transmat is not None else 0.70
+                _m15_row = {
+                    "regime_duration":    row.get("regime_duration", self.bars_in_regime),
+                    "persistence":        _stability,
+                    "synth_vix_zscore":   vix_z,
+                    "atr_expansion_ratio": float(row.get("atr_expansion_ratio", 1.0)),
+                    "realized_vol_ratio":  float(row.get("realized_vol_ratio", 1.0)),
+                }
+                if not self._m15_entry_ok(_m15_row, tf_config):
+                    return SignalDecision(
+                        enter=False, exit=False, direction=0, confidence=prob,
+                        regime=regime_label, reason="m15_gate_rejected",
+                        position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                    )
+
+            # Phase 4 — meta-label gate (no-op unless use_meta_label=True in tf_config).
+            if entry and tf_config.get("use_meta_label", False):
+                _meta_model = tf_config.get("meta_model")
+                if _meta_model is None:
+                    tf_config["use_meta_label"] = False  # disable for this session
+                else:
+                    import pandas as _pd
+                    _meta_X = _pd.DataFrame([row])
+                    _meta_prob = float(_meta_model.predict_proba(_meta_X)[0, 1])
+                    if _meta_prob < float(tf_config.get("meta_min_prob", 0.55)):
+                        return SignalDecision(
+                            enter=False, exit=False, direction=0, confidence=prob,
+                            regime=regime_label, reason="meta_label_reject",
+                            position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                        )
+
+            if entry:
+                sig  = entry["signal"]
+                direction = 1 if sig in ("BUY", "MR_BUY") else -1
+                return SignalDecision(
+                    enter=True, exit=False,
+                    direction=direction,
+                    confidence=prob,
+                    regime=regime_label,
+                    reason=f"entry_{sig.lower()}",
+                    position_size_multiplier=entry.get("size_multiplier", 1.0),
+                    sl_atr_multiple=tf_config.get("sl_atr_multiple", 2.0),
+                    tp_atr_multiple=tf_config.get("tp_atr_multiple", 1.5),
+                )
+
+        return SignalDecision(
+            enter=False, exit=False, direction=0, confidence=prob,
+            regime=regime_label, reason="no_signal",
+            position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+        )
 
     # ── Core API ──────────────────────────────────────────────────────────────
 
@@ -121,6 +288,8 @@ class SignalEngine:
         xgb_prob: float,
         synth_vix_zscore: float,
         atr_band_position: float,
+        z_cutoff_bull: float | None = None,
+        z_cutoff_bear: float | None = None,
     ) -> dict | None:
         """Evaluate entry conditions utilizing Z-scores, Dynamic ATR bands, and conditional probabilities.
 
@@ -129,6 +298,11 @@ class SignalEngine:
         M15/M5: Z-score/ATR-band only — probability check bypassed (defaults to
             0.0 = always True) to avoid the dual-constraint dead zone caused by
             XGB probabilities clustering near 50–55% on noisy lower timeframes.
+
+        z_cutoff_bull / z_cutoff_bear: optional per-call overrides for the
+            minimum synth_vix_zscore required for Bull/Bear trend entry.  When
+            provided they supersede MIN_TREND_ZSCORE for this call only.  Used
+            by sensitivity analysis to sweep effective Z thresholds.
         """
         if self.in_trade:
             return None
@@ -140,6 +314,12 @@ class SignalEngine:
         bars = regime_info["bars_in_regime"]
         stability = regime_info["stability"]
 
+        # Effective Z thresholds — caller override takes precedence.
+        trend_z_bull = (float(z_cutoff_bull) if z_cutoff_bull is not None
+                        else MIN_TREND_ZSCORE.get(self.tf, 1.0))
+        trend_z_bear = (abs(float(z_cutoff_bear)) if z_cutoff_bear is not None
+                        else MIN_TREND_ZSCORE.get(self.tf, 1.0))
+
         # H1 requires probability checks; M15/M5 bypass this (default 0.0 = always True)
         prob_req_buy      = eff_buy  >= ENTRY_PROB.get(self.tf, 0.0)
         prob_req_sell     = eff_sell >= ENTRY_PROB.get(self.tf, 0.0)
@@ -150,7 +330,7 @@ class SignalEngine:
         if state == 0:
             if (
                 bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
-                and synth_vix_zscore >= MIN_TREND_ZSCORE.get(self.tf, 1.0)
+                and synth_vix_zscore >= trend_z_bull
                 and prob_req_buy
                 and atr_band_position < ATR_BAND_TREND_MAX
                 and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
@@ -161,7 +341,7 @@ class SignalEngine:
         elif state == 1:
             if (
                 bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
-                and synth_vix_zscore >= MIN_TREND_ZSCORE.get(self.tf, 1.0)
+                and synth_vix_zscore >= trend_z_bear
                 and prob_req_sell
                 and atr_band_position > ATR_BAND_TREND_MIN
                 and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
@@ -238,3 +418,43 @@ class SignalEngine:
         self.entry_regime = None
         self.bars_in_trade = 0
         self._reversal_bars = 0
+        self._probs_window = []
+
+    # ── Phase 3: M15/M5 specialization helpers ────────────────────────────────
+
+    def dynamic_prob_threshold(
+        self, probs_window: np.ndarray, percentile: float = 90.0
+    ) -> float:
+        """Compute a rolling dynamic probability threshold for M5 entries.
+
+        Uses the top *percentile* of recent XGB probabilities as the bar
+        threshold, adapting to the current signal distribution rather than
+        relying on a fixed value.  Falls back to 0.55 when fewer than 30
+        observations are available (cold-start guard).
+        """
+        if len(probs_window) < 30:
+            return 0.55
+        return float(np.percentile(probs_window, percentile))
+
+    def _m15_entry_ok(self, row: dict, cfg: dict) -> bool:
+        """Continuation entry gate specific to M15.
+
+        All five conditions must pass:
+          1. Regime has persisted for at least m15_min_regime_bars bars.
+          2. HMM self-transition probability >= m15_min_persistence.
+          3. Short-term ATR is expanded relative to the long-term baseline.
+          4. Synthetic VIX z-score confirms volatility is rising.
+          5. Realised volatility ratio confirms short-term expansion.
+        """
+        return (
+            float(row.get("regime_duration", 0))
+                >= float(cfg.get("m15_min_regime_bars", 4))
+            and float(row.get("persistence", 0.0))
+                >= float(cfg.get("m15_min_persistence", 0.55))
+            and float(row.get("atr_expansion_ratio", 0.0))
+                >= float(cfg.get("m15_min_atr_expansion", 1.0))
+            and float(row.get("synth_vix_zscore", 0.0))
+                >= float(cfg.get("m15_min_vix_z", 0.5))
+            and float(row.get("realized_vol_ratio", 0.0))
+                >= float(cfg.get("m15_min_rv_ratio", 1.0))
+        )

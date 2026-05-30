@@ -408,6 +408,8 @@ def _run_bar_loop(
     return_trades: bool = False,
     test_mask=None,
     raw_atr_arr=None,
+    z_cutoff_bull: float | None = None,
+    z_cutoff_bear: float | None = None,
 ) -> tuple:
     from src.signal_engine import SignalEngine
 
@@ -434,6 +436,19 @@ def _run_bar_loop(
     atr_band_arr   = (df_aligned["atr_band_position"].values
                       if "atr_band_position" in df_aligned.columns
                       else np.full(n, 0.5, dtype=np.float64))
+    # Phase 3 specialization features — present after add_specialized_features;
+    # fall back to None when absent (row_ctx will use neutral defaults via .get()).
+    _regime_dur_arr = (df_aligned["regime_duration"].values
+                       if "regime_duration" in df_aligned.columns else None)
+    _atr_exp_arr    = (df_aligned["atr_expansion_ratio"].values
+                       if "atr_expansion_ratio" in df_aligned.columns else None)
+    _rv_ratio_arr   = (df_aligned["realized_vol_ratio"].values
+                       if "realized_vol_ratio" in df_aligned.columns else None)
+    _tf_cfg_bt = {
+        "tf": tf, "hmm_transmat": hmm_transmat,
+        "z_cutoff_bull": z_cutoff_bull,
+        "z_cutoff_bear": z_cutoff_bear,
+    }
 
     # ── Raw ATR fallback (if not pre-computed by caller) ─────────────────────
     if raw_atr_arr is None:
@@ -475,7 +490,6 @@ def _run_bar_loop(
     COOLDOWN_PERIOD = 3     # bars locked after any trade exit (all TFs)
 
     for i in range(n):
-        regime_info  = engine.update_regime(int(states[i]), hmm_transmat)
         _in_test     = test_mask is None or bool(test_mask[i])
         current_prob = float(probabilities[i])
 
@@ -573,9 +587,20 @@ def _run_bar_loop(
                 (signal_type == "mean_reversion" and _hmm_now <  CHOP_STATE)
             )
 
-            engine_exit, _exit_reason = engine.should_exit(
-                regime_info, cur_pnl, max_fav_pnl, bars_in_trade
-            )
+            # Policy exit decision via evaluate_bar (Phase 2).
+            # pos_ctx carries end-of-bar P&L so profit_erosion check is accurate.
+            _pos_ctx = {
+                "direction": direction, "cur_pnl": cur_pnl,
+                "max_fav_pnl": max_fav_pnl, "bars_in_trade": bars_in_trade,
+            }
+            _row_ctx_exit = {
+                "hmm_state": _hmm_now, "prob": current_prob,
+                "synth_vix_zscore": float(vix_zscore_arr[i]),
+                "atr_band_position": float(atr_band_arr[i]),
+            }
+            _bar_decision  = engine.evaluate_bar(_row_ctx_exit, _pos_ctx, _tf_cfg_bt)
+            engine_exit    = _bar_decision.exit
+            _exit_reason   = _bar_decision.reason
 
             _scalp_hit = (
                 _tf_up == "M5"
@@ -623,10 +648,26 @@ def _run_bar_loop(
 
         else:
             if cooldown_bars == 0 and _in_test:
-                valid_long  = current_prob >= prob_thresh
-                valid_short = current_prob <= short_thresh
+                # evaluate_bar is the single policy entry point (Phase 2).
+                # It calls update_regime internally and applies should_apply_prob_gate
+                # correctly for each TF (H1 gates on prob; M15/M5 bypass).
+                _row_ctx_entry = {
+                    "hmm_state":         int(states[i]),
+                    "prob":              current_prob,
+                    "synth_vix_zscore":  float(vix_zscore_arr[i]),
+                    "atr_band_position": float(atr_band_arr[i]),
+                }
+                # Attach Phase 3 specialization features when available in df.
+                if _regime_dur_arr is not None:
+                    _row_ctx_entry["regime_duration"] = float(_regime_dur_arr[i])
+                if _atr_exp_arr is not None:
+                    _row_ctx_entry["atr_expansion_ratio"] = float(_atr_exp_arr[i])
+                if _rv_ratio_arr is not None:
+                    _row_ctx_entry["realized_vol_ratio"] = float(_rv_ratio_arr[i])
 
-                if valid_long or valid_short:
+                _bar_decision = engine.evaluate_bar(_row_ctx_entry, None, _tf_cfg_bt)
+
+                if _bar_decision.enter:
                     # ── Spread Efficiency Guard ────────────────────────────────
                     # Reject the signal if the bar's raw ATR cannot cover the
                     # broker spread by the required multiple.  Mirrors the live
@@ -636,38 +677,33 @@ def _run_bar_loop(
                     if (_bar_atr / spread_cost) < _min_eff:
                         continue
 
-                    entry = engine.should_enter(regime_info, current_prob, float(vix_zscore_arr[i]), float(atr_band_arr[i]))
+                    direction     = _bar_decision.direction
+                    size_mult     = _bar_decision.position_size_multiplier
+                    in_trade      = True
+                    signals[i]    = direction
+                    sizes_arr[i]  = size_mult
+                    trade_entry_i = i
+                    signal_type   = "mean_reversion" if "mr" in _bar_decision.reason else "trend"
 
-                    if entry:
-                        _dir = 1 if entry["signal"] in ("BUY", "MR_BUY") else -1
-                        if (_dir == 1 and valid_long) or (_dir == -1 and valid_short):
-                            direction     = _dir
-                            size_mult     = entry["size_multiplier"]
-                            in_trade      = True
-                            signals[i]    = direction
-                            sizes_arr[i]  = size_mult
-                            trade_entry_i = i
-                            signal_type   = "mean_reversion" if "MR" in entry["signal"] else "trend"
+                    # ── Raw ATR-based SL/TP at entry ─────────────────────────
+                    entry_price = float(closes[i])
+                    entry_atr   = max(float(raw_atr_arr[i]), 1e-6)
 
-                            # ── Raw ATR-based SL/TP at entry ─────────────────
-                            entry_price = float(closes[i])
-                            entry_atr   = max(float(raw_atr_arr[i]), 1e-6)
+                    _regime_key = "chop" if int(states[i]) >= CHOP_STATE else "trend"
+                    _sl_tp      = _tp_sl_cfg.get(_regime_key, _tp_sl_cfg["trend"])
+                    sl_dist     = _sl_tp["sl_mult"]  * entry_atr
+                    tp1_dist    = _sl_tp["tp1_mult"] * entry_atr
 
-                            _regime_key = "chop" if int(states[i]) >= CHOP_STATE else "trend"
-                            _sl_tp      = _tp_sl_cfg.get(_regime_key, _tp_sl_cfg["trend"])
-                            sl_dist     = _sl_tp["sl_mult"]  * entry_atr
-                            tp1_dist    = _sl_tp["tp1_mult"] * entry_atr
+                    if direction == 1:
+                        current_sl = entry_price - sl_dist
+                        tp1_level  = entry_price + tp1_dist
+                    else:
+                        current_sl = entry_price + sl_dist
+                        tp1_level  = entry_price - tp1_dist
 
-                            if direction == 1:
-                                current_sl = entry_price - sl_dist
-                                tp1_level  = entry_price + tp1_dist
-                            else:
-                                current_sl = entry_price + sl_dist
-                                tp1_level  = entry_price - tp1_dist
-
-                            engine.on_trade_entered(int(states[i]))
-                            costs_arr[i]        = spread_cost * size_mult
-                            strategy_returns[i] = -spread_cost * size_mult
+                    engine.on_trade_entered(int(states[i]))
+                    costs_arr[i]        = spread_cost * size_mult
+                    strategy_returns[i] = -spread_cost * size_mult
 
     return signals, strategy_returns, gross_returns, costs_arr, sizes_arr, trades
 
@@ -683,7 +719,7 @@ def vectorized_backtest(
     prob_threshold: float = None,   # noqa: ARG001 — kept for backward compat
     short_threshold: float = None,  # noqa: ARG001 — kept for backward compat
     regime_stats: dict = None,      # noqa: ARG001 — kept for backward compat
-    evaluator_config: dict = None,  # noqa: ARG001 — kept for backward compat
+    evaluator_config: dict = None,  # Z_CUTOFF_BULL/Z_CUTOFF_BEAR passed to SignalEngine
     use_tiered: bool = False,       # noqa: ARG001 — kept for backward compat
     return_trades: bool = False,
     hmm_transmat=None,
@@ -700,13 +736,19 @@ def vectorized_backtest(
         account_size: Account balance in USD.
         broker: Broker profile key from ``BROKER_CONFIGS``.
         tf: Timeframe string used for correct annualization ("H1", "M15", "M5").
-        prob_threshold/short_threshold/regime_stats/evaluator_config/use_tiered:
+        prob_threshold/short_threshold/regime_stats/use_tiered:
             Retained for backward compatibility — ignored by the SignalEngine path.
+        evaluator_config: optional dict with Z_CUTOFF_BULL / Z_CUTOFF_BEAR keys;
+            when present, these override SignalEngine’s MIN_TREND_ZSCORE for the
+            entire backtest run (used by sensitivity Z-sweep).
         return_trades: When True, add ``'trades_df'`` to the result.
         hmm_transmat: HMM transition matrix — passed to SignalEngine for
                       persistence-collapse exit detection.
     """
-    _ = (prob_threshold, short_threshold, regime_stats, evaluator_config, use_tiered)
+    _ = (prob_threshold, short_threshold, regime_stats, use_tiered)
+    # Extract optional Z overrides from evaluator_config for sensitivity sweeps.
+    z_bull = evaluator_config.get("Z_CUTOFF_BULL") if evaluator_config else None
+    z_bear = evaluator_config.get("Z_CUTOFF_BEAR") if evaluator_config else None
     atr_norm    = df["atr_normalized"].values
     n           = len(df)
 
@@ -753,6 +795,7 @@ def vectorized_backtest(
         tf=tf, broker=broker, account_size=account_size,
         split_idx=split_idx, return_trades=return_trades,
         test_mask=test_mask, raw_atr_arr=raw_atr_arr,
+        z_cutoff_bull=z_bull, z_cutoff_bear=z_bear,
     )
 
     _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)

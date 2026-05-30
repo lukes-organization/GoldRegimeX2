@@ -23,6 +23,9 @@ _CONTINUOUS_COLS = [
     "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
     "us500_log_return", "usdjpy_log_return", "synth_vix_zscore",
     "atr_band_position",
+    # Phase 3 specialization features (present after add_specialized_features)
+    "atr_expansion_ratio", "realized_vol_ratio", "atr_slope",
+    "minutes_from_london_open", "minutes_from_ny_open",
 ]
 
 # All optional external-asset feature columns (log returns + synth_vix + cyclic time)
@@ -31,6 +34,9 @@ _EXTERNAL_ASSETS = [
     "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
     "synth_vix_zscore", "atr_band_position",
     "hour_sin", "hour_cos", "minute_sin", "minute_cos",
+    # Phase 3 specialization features
+    "atr_expansion_ratio", "realized_vol_ratio", "atr_slope",
+    "minutes_from_london_open", "minutes_from_ny_open",
 ]
 
 # LSTM context feature columns added when a trained LSTM context model is present.
@@ -44,6 +50,24 @@ def get_ensemble_path(tf: str, broker: str = "headway_cent") -> Path:
     Falls back to the generic models/xgb_ensemble_H1.pkl (then ENSEMBLE_PKL_PATH) if absent.
     """
     return Path(f"models/xgb_ensemble_{tf.upper()}_{broker}.pkl")
+
+
+def load_meta_model(path: Path):
+    """Load an optional meta-label XGBoost model from *path* (Phase 4).
+
+    Returns None when the artifact is absent so callers can fall back to
+    primary-only mode without crashing.  The meta model gates entries with
+    a second-stage confidence filter on top of the primary direction model.
+
+    Args:
+        path: Path to the joblib-serialised meta-label model artifact.
+
+    Returns:
+        Loaded model object, or None if the file does not exist.
+    """
+    if not path.exists():
+        return None
+    return joblib.load(path)
 
 # Base features always present; gmm_vol_cluster and usdchf_log_return are
 # added conditionally when the columns are present in the processed DataFrame.
@@ -96,6 +120,68 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     return cols
 
 
+# ── TBM Configuration — aligned with TP_SL_CONFIG in backtester.py ─────────
+# tp_mult: fraction of ATR for upper barrier (matches tp1_mult "trend" config)
+# sl_mult: fraction of ATR for lower barrier (matches sl_mult "trend" config)
+# horizon: max bars before time-barrier label = 0 (ambiguous, excluded)
+_TBM_CONFIG = {
+    "H1":  {"tp_mult": 1.5, "sl_mult": 2.0, "horizon": 6},
+    "M15": {"tp_mult": 1.2, "sl_mult": 2.0, "horizon": 12},
+    "M5":  {"tp_mult": 0.8, "sl_mult": 1.5, "horizon": 18},
+}
+
+
+def _compute_triple_barrier_labels(
+    closes: np.ndarray,
+    atr: np.ndarray,
+    tp_mult: float,
+    sl_mult: float,
+    horizon: int,
+) -> np.ndarray:
+    """Compute Triple Barrier Method labels (López de Prado, AFML Ch. 3).
+
+    For each bar i, scans the next `horizon` bars to determine which barrier
+    is touched first:
+        +1  upper barrier hit (entry_close * (1 + tp_mult * atr_pct)) — profit
+        -1  lower barrier hit (entry_close * (1 - sl_mult * atr_pct)) — loss
+         0  time barrier (neither barrier touched in horizon bars) — ambiguous
+
+    Args:
+        closes:   Close price array (raw, not log-transformed).
+        atr:      ATR array in price units (raw ATR, not normalised by price).
+        tp_mult:  Upper barrier as multiple of ATR.
+        sl_mult:  Lower barrier as multiple of ATR (positive value → subtract).
+        horizon:  Max look-forward bars before time barrier fires.
+
+    Returns:
+        labels: int8 array of {-1, 0, +1} aligned with closes.
+                The last `horizon` bars are set to 0 because there are
+                insufficient future bars to evaluate barriers.
+    """
+    n = len(closes)
+    labels = np.zeros(n, dtype=np.int8)
+
+    for i in range(n - horizon):
+        entry = closes[i]
+        if entry <= 0 or np.isnan(entry):
+            continue
+        atr_frac = atr[i] / entry if entry > 0 else 0.0
+        upper = entry * (1.0 + tp_mult * atr_frac)
+        lower = entry * (1.0 - sl_mult * atr_frac)
+
+        for j in range(1, horizon + 1):
+            future_close = closes[i + j]
+            if future_close >= upper:
+                labels[i] = 1
+                break
+            elif future_close <= lower:
+                labels[i] = -1
+                break
+        # If neither barrier hit: labels[i] stays 0 (time barrier — ambiguous)
+
+    return labels
+
+
 def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=None, tf: str = "H1"):
     """Build the XGBoost feature matrix from a featurised DataFrame.
 
@@ -129,7 +215,7 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
     if tf.upper() in ("M5", "M15"):
         df["hmm_state_smoothed"] = (
             df["hmm_state"]
-            .rolling(window=5, min_periods=1)
+            .rolling(window=2, min_periods=1)
             .median()
             .astype(int)
         )
@@ -143,15 +229,53 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
 
     df["prev_log_return"] = df["log_return"].shift(1)
 
-    # Pure directional target: label 1 when the next 6-bar cumulative return is
-    # positive.  A positive margin pollutes y=0 with flat/chop bars, causing the
-    # backtester to fire catastrophic SELL signals during low-volatility regimes.
-    # Spread protection is enforced downstream by the Spread Efficiency Guard in
-    # backtester._run_bar_loop (TF_MIN_EFFICIENCY).
-    horizon           = 6
-    MIN_PROFIT_MARGIN = 0.0
-    future_returns    = df["log_return"].rolling(window=horizon).sum().shift(-horizon)
-    y = (future_returns > MIN_PROFIT_MARGIN).astype(int).rename("target")
+    # TF-specific target: label 1 when the *next N bars* cumulative return
+    # exceeds a minimum profit margin.
+    #
+    # Horizon rationale:
+    #   H1 : 6 bars =  6 hours -- regime moves are well-defined at this scale.
+    #   M15: 12 bars = 3 hours -- 6-bar window too noisy (90-min window near
+    #        random walk); 12 bars averages over more regime structure.
+    #   M5 : 18 bars = 1.5 hours -- same logic applied to finer granularity.
+    #
+    # Minimum profit margin rationale:
+    #   Near-zero forward returns are statistically indistinguishable from noise
+    #   (bid-ask spread + slippage).  A small TF-specific margin moves the
+    #   decision boundary away from the near-flat zone, reducing ambiguous
+    #   labels that carry zero predictive information.
+    #   H1 : 0.0000 (spread is negligible relative to 6-hour moves)
+    #   M15: 0.0002 (~2 pips gold, ~= half the typical gold spread)
+    #   M5 : 0.0001 (~1 pip gold)
+    tf_up  = (tf or "H1").upper()
+    _tbm   = _TBM_CONFIG.get(tf_up, _TBM_CONFIG["H1"])
+
+    # Compute raw ATR in price units for barrier placement.
+    # Uses 14-bar ATR on absolute price moves (not the normalised feature).
+    _raw_atr = (
+        df["Close"]
+        .pct_change()
+        .abs()
+        .rolling(14, min_periods=1)
+        .mean()
+        .bfill()
+        .values
+        * df["Close"].values        # convert fraction → price units
+    )
+
+    _tbm_labels = _compute_triple_barrier_labels(
+        closes  = df["Close"].values,
+        atr     = _raw_atr,
+        tp_mult = _tbm["tp_mult"],
+        sl_mult = _tbm["sl_mult"],
+        horizon = _tbm["horizon"],
+    )
+
+    # Map +1/-1 → 1/0 for binary classification; exclude ambiguous (0) labels
+    y = pd.Series(
+        np.where(_tbm_labels == 1, 1, np.where(_tbm_labels == -1, 0, np.nan)),
+        index=df.index,
+        name="target",
+    )
 
     feature_cols = get_feature_cols(df)
     X = df[feature_cols]
@@ -244,7 +368,7 @@ def train_xgb(
         es_idx = int(len(X_train) * 0.85)
         X_t, y_t = X_train.iloc[:es_idx], y_train.iloc[:es_idx]
         X_v, y_v = X_train.iloc[es_idx:], y_train.iloc[es_idx:]
-        model.set_params(early_stopping_rounds=15)
+        model.set_params(early_stopping_rounds=50)
         model.fit(X_t, y_t, eval_set=[(X_v, y_v)], verbose=False)
         X_eval, y_eval = X_v, y_v
 

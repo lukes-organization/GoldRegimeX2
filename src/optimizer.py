@@ -25,7 +25,7 @@ import numpy as np
 import optuna
 import pandas as pd
 
-from sklearn.metrics import log_loss
+from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from src.processor import kalman_smooth
 from src.engine_hmm import fit_hmm, predict_states
@@ -192,6 +192,42 @@ def _align_hmm_states(model, states: np.ndarray) -> np.ndarray:
     return np.vectorize(remap.get)(states)
 
 
+def _aligned_states_from_prepare(
+    df_full: pd.DataFrame,
+    all_states: np.ndarray,
+    df_all_aligned: pd.DataFrame,
+) -> np.ndarray:
+    """Return states aligned 1:1 with df_all_aligned index.
+
+    Works correctly for H1 (integer hmm_state), M15, and M5 (OHE state_*)
+    because it filters directly on the original states array by index position,
+    independent of whether hmm_state is present or OHE-encoded in df_all_aligned.
+
+    Raises ValueError when alignment length does not match, preventing silent
+    row-count mismatches in CPCV path scoring.
+    """
+    aligned_mask = df_full.index.isin(df_all_aligned.index)
+    aligned_states = np.asarray(all_states)[aligned_mask]
+    if len(aligned_states) != len(df_all_aligned):
+        raise ValueError(
+            f"State alignment mismatch: states={len(aligned_states)} "
+            f"rows={len(df_all_aligned)}"
+        )
+    return aligned_states
+
+
+def resolve_n_states(tf: str, params: dict) -> int:
+    """Return the canonical n_states for *tf*.
+
+    M5 and M15 are fixed at 3 (Bull/Bear/Chop) across optimize and train paths
+    so that CPCV and training always produce identical HMM structures.
+    H1 reads n_states from *params* (Optuna-tuned value, default 3).
+    """
+    if tf.upper() in ("M5", "M15"):
+        return 3
+    return int(params.get("n_states", 3))
+
+
 def _make_purged_inner_cv_splits(
     X: pd.DataFrame, n_splits: int, embargo_bars: int = 24
 ) -> list:
@@ -271,6 +307,46 @@ def _score_from_backtest(
 def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = "H1") -> float:
     """Backward-compatible scoring wrapper — delegates to _score_from_backtest."""
     return _score_from_backtest(result, tf=tf)
+
+
+def composite_score(metrics: dict) -> float:
+    """Weighted composite score with stability penalties (Phase 3).
+
+    Combines deflated Sharpe, Calmar, profit factor, and expectancy with
+    optional penalties for low trade count, path instability, and cost erosion.
+    Used by Phase 3 optimizer tuning; backward-compatible (penalties default 0).
+    """
+    base = (
+        0.40 * float(metrics.get("deflated_sharpe", metrics.get("sharpe", 0.0))) +
+        0.30 * float(metrics.get("calmar", 0.0)) +
+        0.20 * float(metrics.get("profit_factor", 1.0) - 1.0) +
+        0.10 * float(metrics.get("expectancy", 0.0))
+    )
+    penalties = 0.0
+    penalties += float(metrics.get("trade_count_penalty", 0.0))
+    penalties += float(metrics.get("path_instability_penalty", 0.0))
+    penalties += float(metrics.get("cost_erosion_penalty", 0.0))
+    return base - penalties
+
+
+def compute_regime_duration(states: np.ndarray) -> np.ndarray:
+    """Compute consecutive bars spent in the current regime at each bar.
+
+    Returns an int32 array of the same length as *states* where value[i]
+    is the run-length of the current regime up to and including bar i.
+    Used as a causal feature for M15/M5 continuation entry gates.
+    """
+    dur = np.zeros(len(states), dtype=np.int32)
+    run = 0
+    prev = None
+    for i, s in enumerate(states):
+        if prev is None or s != prev:
+            run = 1
+        else:
+            run += 1
+        dur[i] = run
+        prev = s
+    return dur
 
 
 # ── Config hash guard ──────────────────────────────────────────────────────────
@@ -890,7 +966,9 @@ def make_objective_stage1(
         # A 6-bar embargo is dropped from each val fold start to prevent the
         # forward-looking binary target from leaking across the fold boundary.
         _STAGE1_N_FOLDS  = 5
-        _STAGE1_EMBARGO  = 6   # bars — matches the target horizon in prepare_features
+        # Embargo must match the forward-return horizon used to create labels in
+        # prepare_features._TF_HORIZON — see engine_xgb.py.
+        _STAGE1_EMBARGO  = {"H1": 6, "M15": 12, "M5": 18}.get(tf_up, 6)
         _STAGE1_MIN_BARS = 500  # minimum training bars per fold
         if tf_up in ("M5", "M15"):
             try:
@@ -900,7 +978,7 @@ def make_objective_stage1(
                     return -50.0
 
                 tscv       = TimeSeriesSplit(n_splits=_STAGE1_N_FOLDS)
-                fold_losses: list = []
+                fold_aucs: list = []
                 for _tr_idx, _val_idx in tscv.split(X_is_s):
                     # Drop first `embargo` bars of val to prevent forward-return leakage
                     _val_idx = _val_idx[_STAGE1_EMBARGO:]
@@ -910,26 +988,32 @@ def make_objective_stage1(
                     y_tr   = y_is_s.iloc[_tr_idx]
                     X_val  = X_is_s.iloc[_val_idx]
                     y_val  = y_is_s.iloc[_val_idx]
+                    # Skip folds with only one class (TBM can exclude entire
+                    # stretches of one direction in low-volatility regimes)
+                    if y_val.nunique() < 2 or y_tr.nunique() < 2:
+                        continue
                     try:
                         _fm, _ft, _ = train_xgb_ensemble(
                             X_tr, y_tr, train_ratio=1.0, **xgb_kwargs
                         )
                         _, _probs = get_predictions_ensemble(_fm, _ft, X_val)
-                        fold_losses.append(log_loss(y_val, _probs))
+                        fold_aucs.append(roc_auc_score(y_val, _probs))
                     except Exception:
                         pass
 
-                if not fold_losses:
+                if not fold_aucs:
                     return -50.0
-                ll = float(np.mean(fold_losses))
-                trial.set_user_attr("log_loss",    round(ll, 5))
-                trial.set_user_attr("n_cv_folds",  len(fold_losses))
+                auc = float(np.mean(fold_aucs))
+                trial.set_user_attr("mean_auc",   round(auc, 5))
+                trial.set_user_attr("n_cv_folds",  len(fold_aucs))
                 trial.set_user_attr("is_bars",     int(len(X_is_s)))
                 logger.info(
-                    "Stage1[%s] trial %d: mean_log_loss=%.5f over %d folds",
-                    tf, trial.number, ll, len(fold_losses),
+                    "Stage1[%s] trial %d: mean_auc=%.5f over %d folds",
+                    tf, trial.number, auc, len(fold_aucs),
                 )
-                return -ll  # Optuna direction=maximize → minimise log-loss
+                # Return AUC - 0.5 so score is ~0 for random, positive for learning.
+                # Optuna maximises → higher AUC wins.
+                return auc - 0.5
             except Exception as exc:
                 logger.warning("Stage1[%s] trial %d error: %s", tf, trial.number, exc)
                 return -50.0
@@ -1569,8 +1653,16 @@ def execute_cpcv(
                 X_tr, y_tr, train_ratio=1.0, **xgb_kwargs
             )
 
-            # Penalise immediately if the model zeroed out hmm_state
-            if float(ens_metrics.get("feature_importance", {}).get("hmm_state", 1.0)) == 0.0:
+            # Penalise immediately if the model zeroed out regime signal.
+            # For M15/M5, HMM state is OHE → check state_0/1/2; for H1 check hmm_state.
+            feat_imp_cpcv = ens_metrics.get("feature_importance", {})
+            if tf.upper() in ("M5", "M15"):
+                _regime_imp = sum(
+                    feat_imp_cpcv.get(c, 0.0) for c in ("state_0", "state_1", "state_2")
+                )
+            else:
+                _regime_imp = float(feat_imp_cpcv.get("hmm_state", 1.0))
+            if _regime_imp == 0.0:
                 return {
                     "cpcv_score": -50.0, "n_valid_paths": 0,
                     "median_sharpe": -10.0, "std_sharpe": 0.0,
@@ -1579,11 +1671,20 @@ def execute_cpcv(
 
             # 5. Get predictions and backtest on the OOS test paths
             _, probs_all = get_predictions_ensemble(models_ens, thresholds, X_all)
-            states_all_al = df_all_aligned["hmm_state"].values
+            # Use _aligned_states_from_prepare so M15/M5 (OHE removes hmm_state
+            # column from df_all_aligned) never cause a KeyError here.
+            states_all_al = _aligned_states_from_prepare(df_full, all_states, df_all_aligned)
 
             test_df     = df_all_aligned.iloc[test_mask_al]
             test_probs  = probs_all[test_mask_al]
             test_states = states_all_al[test_mask_al]
+
+            # Phase 3: add regime_duration feature for M15/M5 so _m15_entry_ok
+            # receives the accurate run-length for each bar in the test window.
+            if tf.upper() in ("M15", "M5"):
+                _reg_dur = compute_regime_duration(test_states)
+                test_df = test_df.copy()
+                test_df["regime_duration"] = _reg_dur
 
             # ── Regime oscillation guard ──────────────────────────────────
             # If the HMM state sequence has more than 20% transition bars
@@ -1620,7 +1721,20 @@ def execute_cpcv(
                 continue
 
             n_valid_paths += 1
-            path_scores.append(_score_result(path_result, broker=broker, tf=tf))
+            # Phase 3: use composite_score for M15/M5 (multi-metric objective
+            # with stability penalties); _score_result for H1.
+            if tf.upper() in ("M15", "M5"):
+                _calmar = (path_result.get("total_return", 0.0) /
+                           max(path_result.get("max_drawdown", 1e-6), 1e-6))
+                _cs_metrics = {
+                    "sharpe":        path_result.get("sharpe_ratio", 0.0),
+                    "calmar":        float(np.clip(_calmar, -5.0, 5.0)),
+                    "profit_factor": path_result.get("profit_factor", 1.0),
+                    "expectancy":    path_result.get("expected_payoff", 0.0),
+                }
+                path_scores.append(composite_score(_cs_metrics))
+            else:
+                path_scores.append(_score_result(path_result, broker=broker, tf=tf))
             path_sharpes.append(path_result.get("sharpe_ratio", 0.0))
             path_trades.append(n_trades)
             path_winrates.append(float(path_result.get("win_rate", 0.0)))

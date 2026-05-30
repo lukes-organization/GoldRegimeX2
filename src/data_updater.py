@@ -19,9 +19,10 @@ from src.logger import setup_logger
 logger = setup_logger(__name__)
 
 # Raw CSV file paths per timeframe (semicolon-delimited, same format as MT5 export)
+# Canonical paths — must match processor.TF_CONFIG["M15"]["raw_path"] exactly.
 _TF_RAW_FILES = {
     "H1":  Path("data/raw/XAU_1h_data.csv"),
-    "M15": Path("data/raw/XAU_m15_data.csv"),
+    "M15": Path("data/raw/XAU_15m_data.csv"),   # was XAU_m15_data.csv — unified with processor
     "M5":  Path("data/raw/XAU_5m_data.csv"),
 }
 

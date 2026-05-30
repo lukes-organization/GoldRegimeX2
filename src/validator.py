@@ -125,6 +125,9 @@ def run_validation(
     account_size: float = 15.0,
     obs_cov: float = None,
     trans_cov: float = None,
+    period: str | None = None,  # TODO: filter validation window to last N months
+                                # (e.g. '3m', '6m'). Currently accepted for guardian
+                                # API compatibility; the full synced CSV is always used.
 ) -> dict:
     """Validate the saved models against recent synced MT5 data.
 
