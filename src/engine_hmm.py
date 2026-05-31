@@ -97,27 +97,19 @@ def _classify_hmm_states(
 ) -> tuple[np.ndarray, dict, dict]:
     """Map raw HMM state IDs to canonical TREND / MEAN_REVERSION / VOLATILITY_SHOCK IDs.
 
-    Classification is deterministic from per-state statistics so different IS
-    windows always produce semantically consistent labels, eliminating the
-    return-sorted Bull/Bear/Chop ordering that was sensitive to mean-return
-    magnitude.
-
-    Priority order:
-        1. SHOCK:  vol_mean > _SHOCK_VOL_THR  AND  ret_disp > _SHOCK_DISP_THR
-        2. TREND:  persistence > _TREND_PERSIST  AND  entropy < _TREND_ENTROPY
-        3. MR:     all remaining states
-
-    Tie-breaking when no state meets a hard criterion:
-        - No SHOCK found: state with highest (vol_mean + ret_disp) → SHOCK
-        - No TREND found: state with highest persistence (among non-SHOCK) → TREND
-        - Remaining: MEAN_REVERSION (includes all extra states in 4-state HMMs)
+    State labels are assigned independently from per-state descriptors, with no
+    forced one-of-each constraint. This allows valid outcomes such as:
+      - multiple TREND states,
+      - multiple SHOCK states,
+      - no MEAN_REVERSION state in a specific fit.
 
     Returns:
-        remapped   — int32 array aligned with raw_states using canonical IDs
+        remapped    — int32 array aligned with raw_states using canonical IDs
         state_names — {canonical_id: label}
         remap       — {raw_state_id: canonical_id} stored on model as _regime_remap
     """
     eps = 1e-12
+    raw_counts = {int(i): int(np.sum(raw_states == i)) for i in range(n_states)}
     per_state: dict[int, dict] = {}
     for i in range(n_states):
         pers  = float(model.transmat_[i, i])
@@ -125,70 +117,81 @@ def _classify_hmm_states(
         ent   = float(-np.sum(row * np.log2(row)))
         vol_m = float(model.means_[i, 1])
         ret_d = float(np.sqrt(max(float(model.covars_[i, 0, 0]), 0.0)))
+        # Volatility proxy combines latent vol feature mean and return dispersion.
+        vol_p = float(max(abs(vol_m), ret_d))
         per_state[i] = {
             "persistence": pers, "entropy": ent,
             "vol_mean": vol_m,   "ret_disp": ret_d,
+            "volatility": vol_p,
         }
 
-    assigned: dict[int, str] = {}
-    remaining = list(range(n_states))
+    def _classify_state(stats: dict) -> str:
+        if (
+            stats["persistence"] >= _TREND_PERSIST
+            and stats["entropy"] <= _TREND_ENTROPY
+        ):
+            return REGIME_TREND
+        if (
+            stats["volatility"] >= _SHOCK_VOL_THR
+            or stats["ret_disp"] >= _SHOCK_DISP_THR
+        ):
+            return REGIME_SHOCK
+        return REGIME_MR
 
-    # ── Step 1: assign VOLATILITY_SHOCK ──────────────────────────────────────
-    shock_cands = [
-        i for i in remaining
-        if per_state[i]["vol_mean"] > _SHOCK_VOL_THR
-        and per_state[i]["ret_disp"] > _SHOCK_DISP_THR
-    ]
-    if shock_cands:
-        shock_id = max(shock_cands,
-                       key=lambda i: per_state[i]["vol_mean"] + per_state[i]["ret_disp"])
-    else:
-        shock_id = max(remaining,
-                       key=lambda i: per_state[i]["vol_mean"] + per_state[i]["ret_disp"])
-    assigned[shock_id] = REGIME_SHOCK
-    remaining.remove(shock_id)
+    assigned: dict[int, str] = {i: _classify_state(per_state[i]) for i in range(n_states)}
 
-    # ── Step 2: assign TREND ──────────────────────────────────────────────────
-    trend_cands = [
-        i for i in remaining
-        if per_state[i]["persistence"] > _TREND_PERSIST
-        and per_state[i]["entropy"] < _TREND_ENTROPY
-    ]
-    if trend_cands:
-        trend_id = max(trend_cands, key=lambda i: per_state[i]["persistence"])
-    else:
-        trend_id = max(remaining, key=lambda i: per_state[i]["persistence"])
-    assigned[trend_id] = REGIME_TREND
-    remaining.remove(trend_id)
-
-    # ── Step 3: remaining states → MEAN_REVERSION ────────────────────────────
-    for i in remaining:
-        assigned[i] = REGIME_MR
-
-    # Build raw→canonical remap
-    remap: dict[int, int] = {
+    # Mapping used for the currently predicted raw state sequence.
+    old_remap: dict[int, int] = {
         raw: CANONICAL_REGIME_ID[label] for raw, label in assigned.items()
     }
+    remapped = np.array([old_remap.get(int(s), 1) for s in raw_states], dtype=np.int32)
 
-    # Permute model internals so canonical ID 0 addresses the TREND state etc.
-    # For n_states > 3 with multiple MR states this is best-effort.
-    perm = list(range(n_states))   # identity fallback
-    for raw, can in remap.items():
-        if can < n_states:
-            perm[can] = raw
+    # Best-effort permutation: choose a representative raw state for each
+    # canonical bucket so model.transmat_[0/1/2] remains semantically meaningful.
+    groups: dict[int, list[int]] = {0: [], 1: [], 2: []}
+    for raw, can in old_remap.items():
+        groups[int(can)].append(int(raw))
+
+    reps: dict[int, int] = {}
+    for can_id in (0, 1, 2):
+        cand = groups.get(can_id, [])
+        if cand:
+            reps[can_id] = max(cand, key=lambda s: raw_counts.get(int(s), 0))
+
+    perm: list[int] = []
+    used: set[int] = set()
+    for can_id in (0, 1, 2):
+        r = reps.get(can_id)
+        if r is not None and r not in used:
+            perm.append(int(r))
+            used.add(int(r))
+            continue
+        for raw in range(n_states):
+            if raw not in used:
+                perm.append(int(raw))
+                used.add(int(raw))
+                break
+
+    if len(perm) < n_states:
+        for raw in range(n_states):
+            if raw not in used:
+                perm.append(int(raw))
+                used.add(int(raw))
+
+    remap: dict[int, int] = old_remap
     try:
-        # Validate perm is a valid permutation before applying
         if sorted(perm) == list(range(n_states)):
-            model.means_     = model.means_[perm]
-            model.covars_    = model.covars_[perm]
-            model.transmat_  = model.transmat_[np.ix_(perm, perm)]
+            model.means_ = model.means_[perm]
+            model.covars_ = model.covars_[perm]
+            model.transmat_ = model.transmat_[np.ix_(perm, perm)]
             model.startprob_ = model.startprob_[perm]
-            # After permutation raw IDs shift — rebuild remap from scratch
-            remap = {i: CANONICAL_REGIME_ID[assigned[perm[i]]] for i in range(n_states)}
+            remap = {
+                int(new_idx): old_remap.get(int(old_idx), 1)
+                for new_idx, old_idx in enumerate(perm)
+            }
     except (IndexError, ValueError):
-        pass   # non-injective perm (4-state with 2 MR); keep original order
+        remap = old_remap
 
-    remapped = np.array([remap.get(int(s), 1) for s in raw_states], dtype=np.int32)
     state_names: dict[int, str] = {
         CANONICAL_REGIME_ID[lbl]: lbl
         for lbl in (REGIME_TREND, REGIME_MR, REGIME_SHOCK)
@@ -210,9 +213,10 @@ def _save_regime_diagnostics(
         can_id = remap.get(raw_id, raw_id)
         label  = STATE_NAMES.get(can_id, f"state_{raw_id}")
         row    = np.clip(model.transmat_[raw_id], eps, 1.0)
-        states_info[str(can_id)] = {
+        states_info[f"raw_state_{raw_id}"] = {
             "label":             label,
             "raw_id":            raw_id,
+            "canonical_id":      int(can_id),
             "persistence":       round(float(model.transmat_[raw_id, raw_id]), 6),
             "entropy_bits":      round(float(-np.sum(row * np.log2(row))), 6),
             "vol_mean_scaled":   round(float(model.means_[raw_id, 1]), 6),
@@ -307,6 +311,11 @@ def fit_hmm(
     random_state: int = 42,
     tf: str = "H1",
 ):
+    if int(n_states) != 3:
+        raise ValueError(
+            f"fit_hmm[{tf}]: n_states must be 3 (canonical contract), got {n_states}."
+        )
+
     X_raw = df[["kalman_return", "volatility", "rsi_slope"]].values
     # Normalise all three features to zero mean / unit variance so that
     # rsi_slope (typical range ±5) cannot dominate the regime classification
@@ -384,6 +393,11 @@ def predict_states(model: GaussianHMM, df: pd.DataFrame, tf: str = "H1") -> np.n
 
     Falls back to legacy return-sorted ordering for pre-rebuild model files.
     """
+    if int(getattr(model, "n_components", 0)) != 3:
+        raise ValueError(
+            f"predict_states[{tf}]: expected model.n_components == 3, got {getattr(model, 'n_components', None)}."
+        )
+
     X_raw = df[["kalman_return", "volatility", "rsi_slope"]].values
     scaler = getattr(model, "_obs_scaler", None)
     X = scaler.transform(X_raw) if scaler is not None else X_raw

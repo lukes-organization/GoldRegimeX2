@@ -21,15 +21,16 @@ except ImportError:
 
 from src.logger import setup_logger, reconfigure_for_tf
 from src.processor import process_pipeline, TF_CONFIG, PROCESSED_PATH, save_feature_scaler, load_feature_scaler
-from src.engine_hmm import fit_hmm, save_model as save_hmm, load_model as load_hmm, get_model_path as hmm_model_path
+from src.engine_hmm import fit_hmm, save_model as save_hmm, load_model as load_hmm, get_model_path as hmm_model_path, STATE_NAMES
 from src.engine_xgb import (
     prepare_features, train_xgb, get_predictions,
     export_onnx, save_xgb, load_xgb, ONNX_PATH, FEATURE_COLS,
-    train_xgb_ensemble, get_predictions_ensemble,
+    train_xgb_ensemble,
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
     get_ensemble_path, TF_TRAIN_RATIO, compute_regime_stats,
     train_regime_models, get_regime_predictions,
     save_regime_models, load_regime_models, TB_CONFIG,
+    regime_first_probabilities,
 )
 from src.optimizer import (
     run_optimization, get_best_params, _score_result as _calc_score,
@@ -40,6 +41,7 @@ from src.optimizer import (
     resolve_n_states as _optimizer_resolve_n_states,
 )
 from src.backtester import vectorized_backtest, format_payout
+from src.regime_diagnostics import write_regime_diagnostics
 from src.visualizer import generate_full_report
 from src.risk_manager import AdaptiveRiskManager
 
@@ -66,6 +68,32 @@ def resolve_n_states(tf: str, params: dict) -> int:
             f"Supported states: TREND(0), MEAN_REVERSION(1), VOLATILITY_SHOCK(2)."
         )
     return 3
+
+
+def _extract_cpcv_metrics(cpcv_json: dict) -> dict:
+    """Extract key CPCV metrics from unified schema or legacy flat payload."""
+    agg = cpcv_json.get("cpcv_aggregate_stats") if isinstance(cpcv_json, dict) else None
+    if isinstance(agg, dict):
+        return {
+            "score": float(agg.get("cpcv_score", cpcv_json.get("final_score_and_penalties", {}).get("final_score", 0.0))),
+            "n_valid_paths": int(agg.get("n_valid_paths", 0)),
+            "median_sharpe": float(agg.get("median_sharpe", 0.0)),
+            "median_trades": int(agg.get("median_trades", 0)),
+            "median_win_rate": float(agg.get("median_win_rate", 0.0)),
+            "median_drawdown": float(agg.get("median_drawdown", 0.0)),
+            "median_return": float(agg.get("median_return", 0.0)),
+            "std_sharpe": float(agg.get("std_sharpe", 0.0)),
+        }
+    return {
+        "score": float(cpcv_json.get("cpcv_score", 0.0)),
+        "n_valid_paths": int(cpcv_json.get("n_valid_paths", 0)),
+        "median_sharpe": float(cpcv_json.get("median_sharpe", 0.0)),
+        "median_trades": int(cpcv_json.get("median_trades", 0)),
+        "median_win_rate": float(cpcv_json.get("median_win_rate", 0.0)),
+        "median_drawdown": float(cpcv_json.get("median_drawdown", 0.0)),
+        "median_return": float(cpcv_json.get("median_return", 0.0)),
+        "std_sharpe": float(cpcv_json.get("std_sharpe", 0.0)),
+    }
 
 
 _M5_EXPIRY_HOURS   = 120   # 5 days
@@ -136,6 +164,13 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
     )
     model_hmm, states, state_map = fit_hmm(
         df, n_states=resolve_n_states(tf, params), tf=tf   # fix: tf= was missing before
+    )
+    write_regime_diagnostics(
+        tf=tf,
+        states=states,
+        returns=df["log_return"].values[: len(states)],
+        state_labels=STATE_NAMES,
+        output_dir="reports",
     )
     X, y, df_aligned, feature_scaler = prepare_features(df, states, tf=tf)
     save_feature_scaler(feature_scaler, tf=tf, broker=broker)
@@ -748,10 +783,13 @@ def cmd_report(args):
         if _hmm_path is None:
             raise FileNotFoundError
         model_hmm = load_hmm(_hmm_path)
-        from src.engine_hmm import predict_states, STATE_NAMES_3, STATE_NAMES_2, STATE_NAMES_4
+        from src.engine_hmm import predict_states
+        if int(getattr(model_hmm, "n_components", 0)) != 3:
+            raise ValueError(
+                f"Non-canonical HMM artifact for {tf}/{broker}: n_components={getattr(model_hmm, 'n_components', None)}"
+            )
         states = predict_states(model_hmm, df)
-        n = model_hmm.n_components
-        state_names = {2: STATE_NAMES_2, 3: STATE_NAMES_3, 4: STATE_NAMES_4}.get(n, STATE_NAMES_3)
+        state_names = STATE_NAMES
     except Exception:
         model_hmm, states, state_names = fit_hmm(df, n_states=resolve_n_states(tf, params))
 
@@ -763,16 +801,28 @@ def cmd_report(args):
 
     X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
 
+    states_aligned = states[df.index.isin(df_aligned.index)]
+
+    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
+
     _xgb_path = get_ensemble_path(tf, broker)
     if not _xgb_path.exists():
         _xgb_path = ENSEMBLE_PKL_PATH
-    try:
-        models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
-        # If the saved ensemble was trained with different features (e.g. before DXY
-        # was added), retrain in-memory so the report stays consistent with the data.
-        if metrics.get("feature_cols") != list(X.columns):
-            raise ValueError("Feature mismatch — retraining for report.")
-    except (FileNotFoundError, ValueError):
+
+    models_xgb = None
+    thresholds_xgb = None
+    metrics = {}
+    if _xgb_path.exists():
+        try:
+            models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
+            if metrics.get("feature_cols") and metrics.get("feature_cols") != list(X.columns):
+                logger.warning("Feature mismatch in saved ensemble for %s/%s; ignoring ensemble artifact.", tf, broker)
+                models_xgb, thresholds_xgb, metrics = None, None, {}
+        except Exception as _e:
+            logger.warning("Could not load ensemble artifact for %s/%s: %s", tf, broker, _e)
+            models_xgb, thresholds_xgb, metrics = None, None, {}
+
+    if trend_model is None and shock_model is None and (models_xgb is None or thresholds_xgb is None):
         models_xgb, thresholds_xgb, metrics = train_xgb_ensemble(
             X, y,
             max_depth=params.get("max_depth", 4),
@@ -785,11 +835,21 @@ def cmd_report(args):
             reg_alpha=params.get("reg_alpha", 0.1),
         )
 
-    _, probabilities = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
-    states_aligned = states[df.index.isin(df_aligned.index)]
+    probabilities, prob_source = regime_first_probabilities(
+        X=X,
+        states=states_aligned,
+        tf=tf,
+        broker=broker,
+        trend_model=trend_model,
+        shock_model=shock_model,
+        ensemble_models=models_xgb,
+        ensemble_thresholds=thresholds_xgb,
+        fallback_prob=0.50,
+    )
+    logger.info("Probability source for %s/%s: %s", tf, broker, prob_source)
 
     # Ensure regime_stats are present (may be absent in pre-Z-Score saved models)
-    if not metrics.get("regime_stats"):
+    if models_xgb is not None and thresholds_xgb is not None and not metrics.get("regime_stats"):
         _rs_split = metrics.get("split_idx") or int(len(X) * 0.8)
         _X_is     = X.iloc[:_rs_split]
         _hs_is    = states_aligned[:len(_X_is)]
@@ -822,16 +882,23 @@ def cmd_report(args):
     if _cpcv_json.exists():
         try:
             _cpcv = json.loads(_cpcv_json.read_text())
-            result["cpcv_score"]          = _cpcv.get("cpcv_score", 0.0)
-            result["cpcv_n_valid_paths"]  = _cpcv.get("n_valid_paths", 0)
-            result["oos_sharpe_ratio"]    = _cpcv.get("median_sharpe", 0.0)
-            result["oos_n_trades"]        = _cpcv.get("median_trades", 0)
-            result["oos_win_rate"]        = _cpcv.get("median_win_rate", 0.0)
-            result["oos_max_drawdown"]    = _cpcv.get("median_drawdown", 0.0)
-            result["oos_floating_max_drawdown"] = _cpcv.get("median_drawdown", 0.0)
-            result["oos_total_return"]    = _cpcv.get("median_return", 0.0)
-            result["cpcv_path_scores"]    = _cpcv.get("path_scores", [])
-            result["cpcv_std_sharpe"]     = _cpcv.get("std_sharpe", 0.0)
+            _metrics = _extract_cpcv_metrics(_cpcv)
+            _agg = _cpcv.get("cpcv_aggregate_stats") if isinstance(_cpcv, dict) else None
+            _paths = _cpcv.get("per_path_fold_stats") if isinstance(_cpcv, dict) else None
+
+            result["cpcv_score"] = _metrics["score"]
+            result["cpcv_n_valid_paths"] = _metrics["n_valid_paths"]
+            result["oos_sharpe_ratio"] = _metrics["median_sharpe"]
+            result["oos_n_trades"] = _metrics["median_trades"]
+            result["oos_win_rate"] = _metrics["median_win_rate"]
+            result["oos_max_drawdown"] = _metrics["median_drawdown"]
+            result["oos_floating_max_drawdown"] = _metrics["median_drawdown"]
+            result["oos_total_return"] = _metrics["median_return"]
+            result["cpcv_std_sharpe"] = _metrics["std_sharpe"]
+            if isinstance(_agg, dict):
+                result["cpcv_path_scores"] = (_paths or {}).get("path_scores", [])
+            else:
+                result["cpcv_path_scores"] = _cpcv.get("path_scores", [])
             logger.info(
                 "Loaded CPCV OOS stats from %s — median_sharpe=%.3f  median_trades=%d",
                 _cpcv_json, result["oos_sharpe_ratio"], result["oos_n_trades"],
@@ -996,6 +1063,10 @@ def cmd_sensitivity(args):
         if _hmm_path is None:
             raise FileNotFoundError
         model_hmm = load_hmm(_hmm_path)
+        if int(getattr(model_hmm, "n_components", 0)) != 3:
+            raise ValueError(
+                f"Non-canonical HMM artifact for {tf}/{broker}: n_components={getattr(model_hmm, 'n_components', None)}"
+            )
         from src.engine_hmm import predict_states
         states = predict_states(model_hmm, df)
     except Exception:
@@ -1009,21 +1080,43 @@ def cmd_sensitivity(args):
 
     X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
 
+    states_aligned = states[df.index.isin(df_aligned.index)]
+    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
+
     _xgb_path = get_ensemble_path(tf, broker)
     if not _xgb_path.exists():
         _xgb_path = ENSEMBLE_PKL_PATH
-    try:
-        models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
-        if metrics.get("feature_cols") != list(X.columns):
-            raise ValueError("Feature mismatch")
-    except (FileNotFoundError, ValueError):
-        logger.warning("No saved ensemble found for %s/%s — can't run sensitivity.", tf, broker)
+    models_xgb = None
+    thresholds_xgb = None
+    metrics = {}
+    if _xgb_path.exists():
+        try:
+            models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
+            if metrics.get("feature_cols") and metrics.get("feature_cols") != list(X.columns):
+                logger.warning("Feature mismatch in saved ensemble for %s/%s; ignoring ensemble artifact.", tf, broker)
+                models_xgb, thresholds_xgb, metrics = None, None, {}
+        except Exception as _e:
+            logger.warning("Could not load ensemble artifact for %s/%s: %s", tf, broker, _e)
+            models_xgb, thresholds_xgb, metrics = None, None, {}
+
+    if trend_model is None and shock_model is None and (models_xgb is None or thresholds_xgb is None):
+        logger.warning("No saved regime models or ensemble found for %s/%s — can't run sensitivity.", tf, broker)
         return
 
-    _, probabilities = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
-    states_aligned = states[df.index.isin(df_aligned.index)]
+    probabilities, prob_source = regime_first_probabilities(
+        X=X,
+        states=states_aligned,
+        tf=tf,
+        broker=broker,
+        trend_model=trend_model,
+        shock_model=shock_model,
+        ensemble_models=models_xgb,
+        ensemble_thresholds=thresholds_xgb,
+        fallback_prob=0.50,
+    )
+    logger.info("Probability source for %s/%s: %s", tf, broker, prob_source)
 
-    if not metrics.get("regime_stats"):
+    if models_xgb is not None and thresholds_xgb is not None and not metrics.get("regime_stats"):
         _rs_split = metrics.get("split_idx") or int(len(X) * 0.8)
         metrics["regime_stats"] = compute_regime_stats(
             models_xgb, thresholds_xgb,
@@ -1042,7 +1135,7 @@ def cmd_sensitivity(args):
         probabilities=probabilities,
         states_aligned=states_aligned,
         split_idx=split_idx,
-        regime_stats=metrics["regime_stats"],
+        regime_stats=metrics.get("regime_stats", {}),
     )
 
 
@@ -1089,6 +1182,10 @@ def cmd_montecarlo(args):
     _hmm_path = hmm_model_path(tf, broker)
     try:
         model_hmm = load_hmm(_hmm_path)
+        if int(getattr(model_hmm, "n_components", 0)) != 3:
+            raise ValueError(
+                f"Non-canonical HMM artifact for {tf}/{broker}: n_components={getattr(model_hmm, 'n_components', None)}"
+            )
         from src.engine_hmm import predict_states
         states = predict_states(model_hmm, df)
     except Exception:
@@ -1100,15 +1197,26 @@ def cmd_montecarlo(args):
         _feat_scaler = None
 
     X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
+    states_aligned = states[df.index.isin(df_aligned.index)]
+    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
 
     _xgb_path = get_ensemble_path(tf, broker)
     if not _xgb_path.exists():
         _xgb_path = ENSEMBLE_PKL_PATH
-    try:
-        models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
-        if metrics.get("feature_cols") != list(X.columns):
-            raise ValueError("Feature mismatch")
-    except (FileNotFoundError, ValueError):
+    models_xgb = None
+    thresholds_xgb = None
+    metrics = {}
+    if _xgb_path.exists():
+        try:
+            models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
+            if metrics.get("feature_cols") and metrics.get("feature_cols") != list(X.columns):
+                logger.warning("Feature mismatch in saved ensemble for %s/%s; ignoring ensemble artifact.", tf, broker)
+                models_xgb, thresholds_xgb, metrics = None, None, {}
+        except Exception as _e:
+            logger.warning("Could not load ensemble artifact for %s/%s: %s", tf, broker, _e)
+            models_xgb, thresholds_xgb, metrics = None, None, {}
+
+    if trend_model is None and shock_model is None and (models_xgb is None or thresholds_xgb is None):
         models_xgb, thresholds_xgb, metrics = train_xgb_ensemble(
             X, y,
             max_depth=params.get("max_depth", 4),
@@ -1121,8 +1229,19 @@ def cmd_montecarlo(args):
             reg_alpha=params.get("reg_alpha", 0.1),
         )
 
-    _, probabilities = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
-    states_aligned   = states[df.index.isin(df_aligned.index)]
+    probabilities, prob_source = regime_first_probabilities(
+        X=X,
+        states=states_aligned,
+        tf=tf,
+        broker=broker,
+        trend_model=trend_model,
+        shock_model=shock_model,
+        ensemble_models=models_xgb,
+        ensemble_thresholds=thresholds_xgb,
+        fallback_prob=0.50,
+    )
+    logger.info("Probability source for %s/%s: %s", tf, broker, prob_source)
+
     split_idx        = metrics.get("split_idx")
     if split_idx is not None and not (0 < split_idx < len(X)):
         split_idx = int(len(X) * 0.8)

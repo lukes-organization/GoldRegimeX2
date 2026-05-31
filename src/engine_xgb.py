@@ -848,6 +848,112 @@ def get_regime_predictions(X, states, trend_model, shock_model, fallback_prob=0.
     return probs
 
 
+def predict_by_regime(regime_label: str, row_features, models: dict) -> float | None:
+    """Route a single-row probability request to the matching regime model.
+
+    Returns None when no model is available for the requested regime.
+    """
+    if regime_label == "TREND" and models.get("TREND") is not None:
+        return float(models["TREND"].predict_proba(row_features)[0, 1])
+    if regime_label == "VOLATILITY_SHOCK" and models.get("VOLATILITY_SHOCK") is not None:
+        return float(models["VOLATILITY_SHOCK"].predict_proba(row_features)[0, 1])
+    return None
+
+
+def regime_first_probability(
+    features_df,
+    hmm_state: int,
+    tf: str,
+    broker: str = "headway_cent",
+    trend_model=None,
+    shock_model=None,
+    ensemble_models: dict | None = None,
+    ensemble_thresholds: tuple[float, float] | None = None,
+    fallback_prob: float = 0.50,
+) -> tuple[float, str]:
+    """Return single-row probability using regime models first, then ensemble fallback.
+
+    Routing policy:
+    - TREND / VOLATILITY_SHOCK: use matching regime model when available.
+    - MEAN_REVERSION: return neutral fallback_prob.
+    - If a tradeable regime model is unavailable, fall back to ensemble.
+    """
+    from src.engine_hmm import STATE_NAMES_3
+
+    regime_label = STATE_NAMES_3.get(int(hmm_state), "MEAN_REVERSION")
+
+    if trend_model is None and shock_model is None:
+        trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
+    regime_models = {
+        "TREND": trend_model,
+        "VOLATILITY_SHOCK": shock_model,
+    }
+
+    prob = predict_by_regime(regime_label, features_df, regime_models)
+    if prob is not None:
+        return float(prob), "regime_model"
+
+    if regime_label == "MEAN_REVERSION":
+        return float(fallback_prob), "mr_neutral"
+
+    if ensemble_models is None or ensemble_thresholds is None:
+        xgb_path = get_ensemble_path(tf, broker)
+        if not xgb_path.exists():
+            xgb_path = ENSEMBLE_PKL_PATH
+        if not xgb_path.exists():
+            raise FileNotFoundError(
+                f"No ensemble model found for fallback at {get_ensemble_path(tf, broker)} or {ENSEMBLE_PKL_PATH}"
+            )
+        ensemble_models, ensemble_thresholds, _ = load_xgb_ensemble(xgb_path)
+
+    _, probs = get_predictions_ensemble(ensemble_models, ensemble_thresholds, features_df)
+    return float(probs[0]), "ensemble_fallback"
+
+
+def regime_first_probabilities(
+    X,
+    states,
+    tf: str,
+    broker: str = "headway_cent",
+    trend_model=None,
+    shock_model=None,
+    ensemble_models: dict | None = None,
+    ensemble_thresholds: tuple[float, float] | None = None,
+    fallback_prob: float = 0.50,
+) -> tuple[np.ndarray, str]:
+    """Return batch probabilities with regime models preferred over ensemble.
+
+    If at least one regime model exists, probabilities are generated via
+    get_regime_predictions (MR and missing model paths stay neutral at fallback_prob).
+    If no regime models exist, falls back to ensemble probabilities.
+    """
+    if trend_model is None and shock_model is None:
+        trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
+
+    if trend_model is not None or shock_model is not None:
+        probs = get_regime_predictions(
+            X=X,
+            states=states,
+            trend_model=trend_model,
+            shock_model=shock_model,
+            fallback_prob=fallback_prob,
+        )
+        return probs, "regime_models"
+
+    if ensemble_models is None or ensemble_thresholds is None:
+        xgb_path = get_ensemble_path(tf, broker)
+        if not xgb_path.exists():
+            xgb_path = ENSEMBLE_PKL_PATH
+        if not xgb_path.exists():
+            raise FileNotFoundError(
+                f"No regime models or ensemble fallback found for {tf}/{broker}."
+            )
+        ensemble_models, ensemble_thresholds, _ = load_xgb_ensemble(xgb_path)
+
+    _, probs = get_predictions_ensemble(ensemble_models, ensemble_thresholds, X)
+    return probs, "ensemble_fallback"
+
+
 def save_regime_models(regime_result, tf, broker='headway_cent'):
     # Persist trend_model and shock_model to models/ directory.
     for key in ('trend_model', 'shock_model'):

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from src.logger import setup_logger
 from src.risk_manager import BROKER_CONFIGS
-from src.engine_hmm import CANONICAL_REGIME_ID, REGIME_TREND, REGIME_MR, REGIME_SHOCK
+from src.engine_hmm import CANONICAL_REGIME_ID, REGIME_TREND, REGIME_MR, REGIME_SHOCK, STATE_NAMES
 from src.trade_lifecycle import config_for_tf
 
 logger = setup_logger(__name__)
@@ -398,6 +398,37 @@ def _mr_attribution(
     }
 
 
+def _regime_occupancy(states: np.ndarray) -> dict:
+    states_arr = np.asarray(states)
+    n = int(len(states_arr))
+    if n == 0:
+        return {STATE_NAMES[i]: 0.0 for i in sorted(STATE_NAMES)}
+
+    out: dict[str, float] = {}
+    for sid, label in sorted(STATE_NAMES.items()):
+        out[label] = float(np.mean(states_arr == sid)) * 100.0
+    return out
+
+
+def _trade_distribution(signals: np.ndarray, states: np.ndarray) -> dict:
+    sig = np.asarray(signals)
+    st = np.asarray(states)
+    n = int(min(len(sig), len(st)))
+    out = {STATE_NAMES[i]: 0 for i in sorted(STATE_NAMES)}
+    if n == 0:
+        return out
+
+    sig = sig[:n]
+    st = st[:n]
+    prev_s = np.concatenate([[0], sig[:-1]])
+    is_entry = (sig != 0) & (sig != prev_s)
+    for idx in np.where(is_entry)[0]:
+        sid = int(st[idx])
+        label = STATE_NAMES.get(sid, f"state_{sid}")
+        out[label] = int(out.get(label, 0) + 1)
+    return out
+
+
 def _compute_bb_positions(close: np.ndarray, window: int = 20) -> np.ndarray:
     """Normalised position within rolling high-low band (0=at low, 1=at high)."""
     out = np.full(len(close), 0.5)
@@ -422,7 +453,7 @@ def _run_bar_loop(
     raw_atr_arr=None,
     z_cutoff_bull: float | None = None,
     z_cutoff_bear: float | None = None,
-    h1_entry_prob: float | None = None,
+    entry_probability_threshold: float | None = None,
 ) -> tuple:
     from src.signal_engine import SignalEngine
 
@@ -461,7 +492,8 @@ def _run_bar_loop(
         "tf": tf, "hmm_transmat": hmm_transmat,
         "z_cutoff_bull": z_cutoff_bull,
         "z_cutoff_bear": z_cutoff_bear,
-        "h1_entry_prob": h1_entry_prob,
+        "entry_probability_threshold": entry_probability_threshold,
+        "h1_entry_prob": entry_probability_threshold,
     }
 
     # ── Raw ATR fallback (if not pre-computed by caller) ─────────────────────
@@ -609,12 +641,6 @@ def _run_bar_loop(
             # ── 6. End-of-bar exit checks ─────────────────────────────────────
             hit_time_stop = bars_in_trade >= MAX_HOLD_BARS
 
-            _hmm_now = int(states[i])
-            regime_exit = (
-                (signal_type == "trend"          and _hmm_now >= CHOP_STATE) or
-                (signal_type == "mean_reversion" and _hmm_now <  CHOP_STATE)
-            )
-
             # Policy exit decision via evaluate_bar (Phase 2).
             # pos_ctx carries end-of-bar P&L so profit_erosion check is accurate.
             _pos_ctx = {
@@ -622,7 +648,7 @@ def _run_bar_loop(
                 "max_fav_pnl": max_fav_pnl, "bars_in_trade": bars_in_trade,
             }
             _row_ctx_exit = {
-                "hmm_state": _hmm_now, "prob": current_prob,
+                "hmm_state": int(states[i]), "prob": current_prob,
                 "synth_vix_zscore": float(vix_zscore_arr[i]),
                 "atr_band_position": float(atr_band_arr[i]),
             }
@@ -642,7 +668,7 @@ def _run_bar_loop(
                 and (i + 1 >= n or not bool(test_mask[i + 1]))
             )
 
-            exit_now = hit_sl or hit_tp1 or hit_time_stop or regime_exit or engine_exit or _scalp_hit or _force_exit
+            exit_now = hit_sl or hit_tp1 or hit_time_stop or engine_exit or _scalp_hit or _force_exit
 
             if exit_now:
                 costs_arr[i]        += spread_cost * size_mult
@@ -660,7 +686,6 @@ def _run_bar_loop(
                             "exit_reason": "SL"     if hit_sl        else
                                            "TP"     if hit_tp1        else
                                            "TIME"   if hit_time_stop  else
-                                           "REGIME" if regime_exit    else
                                            "SCALP"  if _scalp_hit     else
                                            _exit_reason if engine_exit else "FORCE",
                         })
@@ -673,7 +698,7 @@ def _run_bar_loop(
                 engine.on_trade_closed()
                 cum_return, max_fav_pnl, bars_in_trade = 0.0, 0.0, 0
                 floating_pnl_usd = 0.0
-                if regime_exit:
+                if _exit_reason == "regime_reversal":
                     _lc_regime_forced_closes += 1
             else:
                 strategy_returns[i] = bar_gross
@@ -715,13 +740,13 @@ def _run_bar_loop(
                     signals[i]    = direction
                     sizes_arr[i]  = size_mult
                     trade_entry_i = i
-                    signal_type   = "mean_reversion" if "mr" in _bar_decision.reason else "trend"
+                    signal_type   = "shock" if _bar_decision.regime == REGIME_SHOCK else "trend"
 
                     # ── Raw ATR-based SL/TP at entry ─────────────────────────
                     entry_price = float(closes[i])
                     entry_atr   = max(float(raw_atr_arr[i]), 1e-6)
 
-                    _regime_key = "chop" if int(states[i]) >= CHOP_STATE else "trend"
+                    _regime_key = "chop" if _bar_decision.regime == REGIME_SHOCK else "trend"
                     _sl_tp      = _tp_sl_cfg.get(_regime_key, _tp_sl_cfg["trend"])
                     sl_dist     = _sl_tp["sl_mult"]  * entry_atr
                     tp1_dist    = _sl_tp["tp1_mult"] * entry_atr
@@ -792,7 +817,9 @@ def vectorized_backtest(
     # Extract optional Z overrides from evaluator_config for sensitivity sweeps.
     z_bull = evaluator_config.get("Z_CUTOFF_BULL") if evaluator_config else None
     z_bear = evaluator_config.get("Z_CUTOFF_BEAR") if evaluator_config else None
-    h1_ep  = evaluator_config.get("h1_entry_prob") if evaluator_config else None
+    ep_thr = None
+    if evaluator_config:
+        ep_thr = evaluator_config.get("entry_probability_threshold", evaluator_config.get("h1_entry_prob"))
     atr_norm    = df["atr_normalized"].values
     n           = len(df)
 
@@ -840,7 +867,7 @@ def vectorized_backtest(
         split_idx=split_idx, return_trades=return_trades,
         test_mask=test_mask, raw_atr_arr=raw_atr_arr,
         z_cutoff_bull=z_bull, z_cutoff_bear=z_bear,
-        h1_entry_prob=h1_ep,
+        entry_probability_threshold=ep_thr,
     )
 
     _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
@@ -863,6 +890,8 @@ def vectorized_backtest(
     result.update(_lc_events)
     # Full-period MR attribution
     result.update(_mr_attribution(signals, hmm_states, strategy_returns))
+    result["regime_occupancy"] = _regime_occupancy(hmm_states)
+    result["trade_distribution"] = _trade_distribution(signals, hmm_states)
 
     if split_idx is not None and 0 < split_idx < len(strategy_returns) and test_mask is None:
         is_m  = _compute_metrics(strategy_returns[:split_idx], signals[:split_idx], tf)

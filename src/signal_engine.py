@@ -5,7 +5,7 @@ exits on regime reversal, persistence collapse, profit erosion, or max hold.
 Replaces Z-Score and RCEV evaluation logic.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -26,15 +26,15 @@ SHOCK_STATE = CANONICAL_REGIME_ID[REGIME_SHOCK]    # 2
 # This is the single canonical source of state-to-trade permission.
 
 # Minimum consecutive bars in a regime before entry is allowed.
-MIN_CONFIRMATION_BARS = {"H1": 2, "M15": 2, "M5": 2}
+MIN_CONFIRMATION_BARS = {"H1": 4, "M15": 3, "M5": 2}
 
 # Minimum consecutive bars in a NEW (different) regime before regime-reversal
 # exit fires.
 MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 2}
 
 # XGBoost probability threshold for trend and SHOCK entries.
-# H1: probability check required. M15/M5: bypass (XGB probs cluster near 50-55%).
-ENTRY_PROB    = {"H1": 0.575}
+# M5 keeps a dynamic rolling percentile gate in evaluate_bar().
+ENTRY_PROB = {"H1": 0.58, "M15": 0.53}
 
 # Z-Score thresholds for TREND and SHOCK entries.
 MIN_TREND_ZSCORE = {"H1": 0.5, "M15": 1.0, "M5": 1.5}
@@ -71,14 +71,13 @@ MR_SIZE_MULTIPLIER = 0.75
 def should_apply_prob_gate(tf: str) -> bool:
     """Return True when the XGBoost probability gate should be enforced.
 
-    H1: probability check required (XGB signal is meaningful at hourly scale).
-    M15/M5: bypass — XGB probabilities cluster near 50-55% on noisy short TFs;
-            strict gates produce a dead zone that suppresses valid signals.
+    H1/M15: fixed threshold gate required.
+    M5: dynamic rolling percentile gate handled separately.
 
     This single function is the canonical source used by both backtester and
     live trader, eliminating ad hoc per-module guards.
     """
-    return tf.upper() == "H1"
+    return tf.upper() in ENTRY_PROB
 
 
 @dataclass
@@ -88,6 +87,7 @@ class SignalDecision:
     Both backtest and live paths consume this object, ensuring identical
     policy logic regardless of execution environment.
     """
+    action: str
     enter: bool
     exit: bool
     direction: int                  # +1 = long, -1 = short, 0 = flat
@@ -97,6 +97,77 @@ class SignalDecision:
     position_size_multiplier: float
     sl_atr_multiple: float
     tp_atr_multiple: float
+    metadata: dict = field(default_factory=dict)
+
+    @classmethod
+    def no_trade(
+        cls,
+        confidence: float,
+        regime: str,
+        reason: str,
+        metadata: dict | None = None,
+    ) -> "SignalDecision":
+        return cls(
+            action="NO_TRADE",
+            enter=False,
+            exit=False,
+            direction=0,
+            confidence=float(confidence),
+            regime=regime,
+            reason=reason,
+            metadata=metadata or {},
+            position_size_multiplier=1.0,
+            sl_atr_multiple=0.0,
+            tp_atr_multiple=0.0,
+        )
+
+    @classmethod
+    def exit_trade(
+        cls,
+        confidence: float,
+        regime: str,
+        reason: str,
+        metadata: dict | None = None,
+    ) -> "SignalDecision":
+        return cls(
+            action="EXIT",
+            enter=False,
+            exit=True,
+            direction=0,
+            confidence=float(confidence),
+            regime=regime,
+            reason=reason,
+            metadata=metadata or {},
+            position_size_multiplier=1.0,
+            sl_atr_multiple=0.0,
+            tp_atr_multiple=0.0,
+        )
+
+    @classmethod
+    def enter_trade(
+        cls,
+        direction: int,
+        confidence: float,
+        regime: str,
+        reason: str,
+        size_multiplier: float,
+        sl_atr_multiple: float,
+        tp_atr_multiple: float,
+        metadata: dict | None = None,
+    ) -> "SignalDecision":
+        return cls(
+            action="ENTER_LONG" if direction > 0 else "ENTER_SHORT",
+            enter=True,
+            exit=False,
+            direction=int(direction),
+            confidence=float(confidence),
+            regime=regime,
+            reason=reason,
+            metadata=metadata or {},
+            position_size_multiplier=float(size_multiplier),
+            sl_atr_multiple=float(sl_atr_multiple),
+            tp_atr_multiple=float(tp_atr_multiple),
+        )
 
 
 class SignalEngine:
@@ -154,6 +225,15 @@ class SignalEngine:
         regime_label = self._REGIME_LABELS.get(state, f"state_{state}")
 
         regime_info = self.update_regime(state, hmm_transmat)
+        base_meta = {
+            "tf": self.tf,
+            "state": state,
+            "bars_in_regime": int(regime_info.get("bars_in_regime", 0)),
+            "stability": float(regime_info.get("stability", 0.0)),
+            "probability": prob,
+            "synth_vix_zscore": vix_z,
+            "atr_band_position": atr_bnd,
+        }
 
         # ── Exit check first (if in a position) ───────────────────────────────
         if current_position:
@@ -164,22 +244,53 @@ class SignalEngine:
                 regime_info, cur_pnl, max_fav_pnl, bars_in_trade
             )
             if exit_now:
-                return SignalDecision(
-                    enter=False, exit=True, direction=0, confidence=prob,
-                    regime=regime_label, reason=reason,
-                    position_size_multiplier=1.0,
-                    sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                exit_meta = dict(base_meta)
+                exit_meta.update({
+                    "cur_pnl": cur_pnl,
+                    "max_fav_pnl": max_fav_pnl,
+                    "bars_in_trade": bars_in_trade,
+                })
+                return SignalDecision.exit_trade(
+                    confidence=prob,
+                    regime=regime_label,
+                    reason=reason,
+                    metadata=exit_meta,
                 )
 
         # ── Entry check (if flat) ──────────────────────────────────────────────
         if not current_position:
-            # Strict STATE_POLICY: MEAN_REVERSION is always no-trade.
-            if not STATE_POLICY.get(regime_label, False):
-                return SignalDecision(
-                    enter=False, exit=False, direction=0, confidence=prob,
-                    regime=regime_label, reason="state_disabled",
-                    position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+            # Hard block: MEAN_REVERSION always returns no-trade before other filters.
+            if regime_label == REGIME_MR:
+                return SignalDecision.no_trade(
+                    confidence=prob,
+                    regime=regime_label,
+                    reason="mean_reversion_state",
+                    metadata=base_meta,
                 )
+
+            # Strict STATE_POLICY fallback for unknown labels.
+            if not STATE_POLICY.get(regime_label, False):
+                return SignalDecision.no_trade(
+                    confidence=prob,
+                    regime=regime_label,
+                    reason="state_disabled",
+                    metadata=base_meta,
+                )
+
+            if should_apply_prob_gate(self.tf):
+                _min_prob = float(ENTRY_PROB.get(self.tf, 0.0))
+                _confidence = max(prob, 1.0 - prob)
+                if _confidence < _min_prob:
+                    gate_meta = dict(base_meta)
+                    gate_meta["required_confidence"] = _min_prob
+                    gate_meta["directional_confidence"] = _confidence
+                    return SignalDecision.no_trade(
+                        confidence=prob,
+                        regime=regime_label,
+                        reason="probability_below_threshold",
+                        metadata=gate_meta,
+                    )
+
             # Rolling probability window for M5 dynamic threshold.
             self._probs_window.append(prob)
             if len(self._probs_window) > 200:
@@ -191,16 +302,22 @@ class SignalEngine:
                     np.array(self._probs_window), percentile=90.0
                 )
                 if prob < _dyn_th:
-                    return SignalDecision(
-                        enter=False, exit=False, direction=0, confidence=prob,
-                        regime=regime_label, reason="m5_prob_below_dynamic_threshold",
-                        position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                    dyn_meta = dict(base_meta)
+                    dyn_meta["dynamic_threshold"] = _dyn_th
+                    return SignalDecision.no_trade(
+                        confidence=prob,
+                        regime=regime_label,
+                        reason="m5_prob_below_dynamic_threshold",
+                        metadata=dyn_meta,
                     )
 
             entry = self.should_enter(regime_info, prob, vix_z, atr_bnd,
                                       z_cutoff_bull=tf_config.get("z_cutoff_bull"),
                                       z_cutoff_bear=tf_config.get("z_cutoff_bear"),
-                                      h1_entry_prob=tf_config.get("h1_entry_prob"))
+                                      entry_probability_threshold=tf_config.get(
+                                          "entry_probability_threshold",
+                                          tf_config.get("h1_entry_prob"),
+                                      ))
 
             # Phase 3 — M15: continuation quality gate.
             # Neutral fallbacks (1.0) pass the gate when features are absent
@@ -217,10 +334,11 @@ class SignalEngine:
                     "realized_vol_ratio":  float(row.get("realized_vol_ratio", 1.0)),
                 }
                 if not self._m15_entry_ok(_m15_row, tf_config):
-                    return SignalDecision(
-                        enter=False, exit=False, direction=0, confidence=prob,
-                        regime=regime_label, reason="m15_gate_rejected",
-                        position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                    return SignalDecision.no_trade(
+                        confidence=prob,
+                        regime=regime_label,
+                        reason="m15_gate_rejected",
+                        metadata=base_meta,
                     )
 
             # Phase 4 — meta-label gate (no-op unless use_meta_label=True in tf_config).
@@ -233,30 +351,39 @@ class SignalEngine:
                     _meta_X = _pd.DataFrame([row])
                     _meta_prob = float(_meta_model.predict_proba(_meta_X)[0, 1])
                     if _meta_prob < float(tf_config.get("meta_min_prob", 0.55)):
-                        return SignalDecision(
-                            enter=False, exit=False, direction=0, confidence=prob,
-                            regime=regime_label, reason="meta_label_reject",
-                            position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                        meta_reject = dict(base_meta)
+                        meta_reject["meta_probability"] = _meta_prob
+                        return SignalDecision.no_trade(
+                            confidence=prob,
+                            regime=regime_label,
+                            reason="meta_label_reject",
+                            metadata=meta_reject,
                         )
 
             if entry:
                 sig       = entry["signal"]
                 direction = 1 if sig == "BUY" else -1
-                return SignalDecision(
-                    enter=True, exit=False,
+                enter_meta = dict(base_meta)
+                enter_meta.update({
+                    "entry_regime": entry.get("regime"),
+                    "size_multiplier": float(entry.get("size_multiplier", 1.0)),
+                })
+                return SignalDecision.enter_trade(
                     direction=direction,
                     confidence=prob,
                     regime=regime_label,
                     reason=f"entry_{entry.get('regime', 'unknown').lower()}_{sig.lower()}",
-                    position_size_multiplier=entry.get("size_multiplier", 1.0),
+                    size_multiplier=entry.get("size_multiplier", 1.0),
                     sl_atr_multiple=tf_config.get("sl_atr_multiple", 2.0),
                     tp_atr_multiple=tf_config.get("tp_atr_multiple", 1.5),
+                    metadata=enter_meta,
                 )
 
-        return SignalDecision(
-            enter=False, exit=False, direction=0, confidence=prob,
-            regime=regime_label, reason="no_signal",
-            position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+        return SignalDecision.no_trade(
+            confidence=prob,
+            regime=regime_label,
+            reason="no_signal",
+            metadata=base_meta,
         )
 
     # ── Core API ──────────────────────────────────────────────────────────────
@@ -303,7 +430,7 @@ class SignalEngine:
         atr_band_position: float,
         z_cutoff_bull: float | None = None,
         z_cutoff_bear: float | None = None,
-        h1_entry_prob: float | None = None,
+        entry_probability_threshold: float | None = None,
     ) -> dict | None:
         """Evaluate entry conditions for the current bar.
 
@@ -332,18 +459,17 @@ class SignalEngine:
         eff_buy  = xgb_prob
         eff_sell = 1.0 - xgb_prob
 
-        # H1 probability gate: use tunable per-run threshold when provided,
-        # otherwise fall back to ENTRY_PROB constant.
-        # M15/M5: bypass (XGB probs cluster near 50-55%).
-        if self.tf == "H1":
-            buy_thr, sell_thr = self._effective_h1_prob_thresholds(
-                {"h1_entry_prob": h1_entry_prob} if h1_entry_prob is not None else None
+        if should_apply_prob_gate(self.tf):
+            thr = (
+                float(entry_probability_threshold)
+                if entry_probability_threshold is not None
+                else float(ENTRY_PROB.get(self.tf, 0.0))
             )
-            prob_req_buy  = eff_buy  >= buy_thr
-            prob_req_sell = eff_sell >= sell_thr
+            prob_req_buy = eff_buy >= thr
+            prob_req_sell = eff_sell >= thr
         else:
-            prob_req_buy  = eff_buy  >= ENTRY_PROB.get(self.tf, 0.0)
-            prob_req_sell = eff_sell >= ENTRY_PROB.get(self.tf, 0.0)
+            prob_req_buy = True
+            prob_req_sell = True
 
         # Effective Z thresholds — caller override takes precedence
         trend_z_bull = (float(z_cutoff_bull) if z_cutoff_bull is not None

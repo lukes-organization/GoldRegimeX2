@@ -37,13 +37,21 @@ from src.processor import (
     load_feature_scaler,
     CONTINUOUS_FEATURE_COLS,
 )
-from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH, STATE_NAMES_2, STATE_NAMES_3, STATE_NAMES_4
+from src.engine_hmm import (
+    load_model as load_hmm,
+    predict_states,
+    get_model_path as hmm_model_path,
+    MODEL_PATH as HMM_GENERIC_PATH,
+    STATE_NAMES,
+    REGIME_SHOCK,
+)
 from src.engine_xgb import (
-    load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
+    load_xgb_ensemble, assign_vol_bucket, FEATURE_COLS,
     get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
+    load_regime_models, regime_first_probability,
 )
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
-from src.signal_engine import SignalEngine, should_apply_prob_gate
+from src.signal_engine import SignalEngine
 from src.trade_lifecycle import config_for_tf, floating_pnl_usd
 
 logger = setup_logger(__name__)
@@ -1078,15 +1086,41 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         model_hmm = load_hmm(hmm_path)
     except FileNotFoundError:
         raise FileNotFoundError("HMM model not found. Run --mode train first.")
+    if int(getattr(model_hmm, "n_components", 0)) != 3:
+        raise RuntimeError(
+            f"Live runtime requires a 3-state HMM model; found n_components={getattr(model_hmm, 'n_components', None)}. "
+            "Re-train with canonical 3 states before live trading."
+        )
+
+    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
 
     xgb_path = get_ensemble_path(tf, broker)
     if not xgb_path.exists():
         xgb_path = XGB_GENERIC_PATH
-    try:
-        models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble(xgb_path)
-        feature_cols = xgb_meta.get("feature_cols", list(FEATURE_COLS))
-    except FileNotFoundError:
-        raise FileNotFoundError("XGB ensemble model not found. Run --mode train first.")
+
+    models_xgb = None
+    thresholds_xgb = None
+    xgb_meta = {}
+    if xgb_path.exists():
+        try:
+            models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble(xgb_path)
+        except FileNotFoundError:
+            models_xgb, thresholds_xgb, xgb_meta = None, None, {}
+
+    feature_cols = xgb_meta.get("feature_cols")
+    if not feature_cols:
+        _regime_cols = None
+        for _m in (trend_model, shock_model):
+            _names = getattr(_m, "feature_names_in_", None) if _m is not None else None
+            if _names is not None and len(_names) > 0:
+                _regime_cols = [str(c) for c in _names]
+                break
+        feature_cols = _regime_cols or list(FEATURE_COLS)
+
+    if trend_model is None and shock_model is None and (models_xgb is None or thresholds_xgb is None):
+        raise FileNotFoundError(
+            "No regime models or XGB ensemble model found. Run --mode train first."
+        )
 
     # Resolve Kalman params from Optuna study or TF defaults
     try:
@@ -1109,11 +1143,19 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     cooldown_bars = 0   # bars to wait after a trade close before evaluating new signals
     # Tracks the tickets and entry context of the most recently placed signal
     # so the break-even SL logic can fire when TP1 closes position 1.
-    signal_tracker = {"tickets": [], "entry_price": 0.0,
-                      "direction": None, "tp1_hit": False,
-                      "tp1_level": None, "guard_hit": False,
-                      "signal_type": None,
-                      "atr_price": 0.0}   # cached price-denom ATR for between-bar trail
+    signal_tracker = {
+        "tickets": [],
+        "entry_price": 0.0,
+        "direction": None,
+        "tp1_hit": False,
+        "tp1_level": None,
+        "guard_hit": False,
+        "signal_type": None,
+        "atr_price": 0.0,
+        "bars_in_trade": 0,
+        "max_fav_pnl_usd": 0.0,
+        "entry_regime": None,
+    }   # cached ATR + lifecycle tracking for unified evaluate_bar exits
     # Per-ticket ATR trail state: {ticket: {"activated": bool, "partial_done": bool, "current_sl": float}}
     atr_state_tracker: dict = {}
     # Deprecated peak-pnl tracker kept for cleanup compat (atr_state_tracker supersedes it)
@@ -1383,8 +1425,17 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                         _upd.update_all_timeframes()
                 except Exception as _upd_exc:
                     logger.debug("Weekly data updater: %s", _upd_exc)
-            _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
-            prob        = float(_probs[0])
+            prob, prob_source = regime_first_probability(
+                features_df=features_df,
+                hmm_state=hmm_state,
+                tf=tf,
+                broker=broker,
+                trend_model=trend_model,
+                shock_model=shock_model,
+                ensemble_models=models_xgb,
+                ensemble_thresholds=thresholds_xgb,
+            )
+            logger.info("Probability source: %s | prob=%.3f", prob_source, prob)
             gmm_cluster = int(features_df["gmm_vol_cluster"].iloc[0]) if "gmm_vol_cluster" in features_df.columns else -1
 
             # ── Spread efficiency filter ──────────────────────────────────────
@@ -1402,8 +1453,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
 
             # ── 5. Log bar info on every new bar (always visible) ─────────
             bar_str   = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            _snames   = {2: STATE_NAMES_2, 3: STATE_NAMES_3, 4: STATE_NAMES_4}
-            state_lbl = _snames.get(model_hmm.n_components, STATE_NAMES_4).get(hmm_state, str(hmm_state))
+            state_lbl = STATE_NAMES.get(int(hmm_state), str(hmm_state))
             logger.info(
                 "Bar %s | state=%s | prob=%.3f | Efficiency=%.1fx",
                 bar_str, hmm_state, prob, _er,
@@ -1415,13 +1465,20 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 f"Efficiency: <b>{_er:.1f}x</b>"
             )
 
-            # ── 6. Position management (always runs — P&L, break-even, chop-exit)
+            from src.processor import compute_synth_vix, compute_dynamic_atr_bands
+            _svix_raw  = compute_synth_vix(live_df)
+            _svix_val  = float(_svix_raw.iloc[-1]) if not np.isnan(_svix_raw.iloc[-1]) else 0.0
+            _atr_bands = compute_dynamic_atr_bands(live_df)
+            _atr_band_val = float(_atr_bands.iloc[-1]) if not np.isnan(_atr_bands.iloc[-1]) else 0.5
+
+            # ── 6. Position management (always runs — P&L, break-even, policy-exit)
             if signal_tracker["tickets"]:
-                open_set = {
-                    p.ticket
-                    for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
+                _all_pos = [
+                    p for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
                     if p.magic == magic
-                }
+                ]
+                _pos_by_ticket = {int(p.ticket): p for p in _all_pos}
+                open_set = set(_pos_by_ticket.keys())
                 active = [t for t in signal_tracker["tickets"] if t in open_set]
                 closed = [t for t in signal_tracker["tickets"] if t not in open_set]
                 # Log P&L for any positions that closed since last bar
@@ -1435,21 +1492,49 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     signal_tracker["tp1_hit"] = True
                     for ticket in active:
                         _move_sl_to_breakeven(ticket, signal_tracker["entry_price"], mt5)
-                # Regime shifted to any Chop state while a TREND runner is active → close immediately.
-                # Use >= CHOP_STATE to cover both Chop_Low (2) and Chop_High (3) in 4-state models.
-                if signal_tracker.get("signal_type") == "trend" and hmm_state >= CHOP_STATE and active:
-                    for ticket in active:
-                        _close_position(ticket, mt5, magic=magic)
-                    logger.info("Trend runner(s) closed: regime shifted to Chop.")
-                    active = []
-                elif signal_tracker.get("signal_type") == "mean_reversion" and hmm_state < CHOP_STATE and active:
-                    for ticket in active:
-                        _close_position(ticket, mt5, comment="GRX_close_mr_breakout", magic=magic)
-                    logger.info("MR position(s) closed: Chop ended, regime broke out to state %d.", hmm_state)
-                    active = []
+
+                if active:
+                    signal_tracker["bars_in_trade"] = int(signal_tracker.get("bars_in_trade", 0)) + 1
+                    _cur_pnl_raw = float(
+                        sum(_pos_by_ticket[t].profit for t in active if t in _pos_by_ticket)
+                    )
+                    _cur_pnl_usd = float(floating_pnl_usd(_cur_pnl_raw, broker))
+                    _max_fav = float(signal_tracker.get("max_fav_pnl_usd", 0.0))
+                    signal_tracker["max_fav_pnl_usd"] = max(_max_fav, _cur_pnl_usd)
+
+                    _pos_ctx = {
+                        "direction": 1 if signal_tracker.get("direction") == "BUY" else -1,
+                        "cur_pnl": _cur_pnl_usd,
+                        "max_fav_pnl": float(signal_tracker.get("max_fav_pnl_usd", 0.0)),
+                        "bars_in_trade": int(signal_tracker.get("bars_in_trade", 0)),
+                    }
+                    _row_ctx_exit = {
+                        "hmm_state": int(hmm_state),
+                        "prob": float(prob),
+                        "synth_vix_zscore": _svix_val,
+                        "atr_band_position": _atr_band_val,
+                    }
+                    _exit_decision = signal_engine.evaluate_bar(
+                        _row_ctx_exit,
+                        _pos_ctx,
+                        {"tf": tf, "hmm_transmat": model_hmm.transmat_},
+                    )
+                    if _exit_decision.exit:
+                        for ticket in active:
+                            _close_position(
+                                ticket,
+                                mt5,
+                                comment=f"GRX_policy_exit_{_exit_decision.reason}",
+                                magic=magic,
+                            )
+                        logger.info("Policy exit triggered: %s", _exit_decision.reason)
+                        active = []
+
                 signal_tracker["tickets"] = active
                 if not active:
                     signal_engine.on_trade_closed()
+                    signal_tracker["bars_in_trade"] = 0
+                    signal_tracker["max_fav_pnl_usd"] = 0.0
                     cooldown_bars = 3
                     logger.info("Post-trade cooldown activated: 3 bars.")
             if equity_gate.locked:
@@ -1496,28 +1581,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
 
             # ── 9. Signal routing — regime-confirmation engine ────────────
 
-            # PROBABILITY GATE: H1 only — M15/M5 bypass via should_apply_prob_gate().
-            # XGB probabilities cluster near 50-55% on short TFs; a strict gate
-            # there produces a dead zone that blocks valid signals.
-            _thresh_long  = TF_PROB_THRESHOLD.get(tf.upper(), 0.55)
-            _thresh_short = TF_SHORT_THRESHOLD.get(tf.upper(), 0.45)
-
-            if should_apply_prob_gate(tf) and _thresh_short < prob < _thresh_long:
-                logger.info(
-                    "Signal rejected [%s]: prob=%.3f in noise zone (%.2f - %.2f).",
-                    tf, prob, _thresh_short, _thresh_long,
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
             _bb_pos = _calculate_bb_position(np.array(close_prices_cache))
-
-            # ── Signal engine inputs: Z-score and ATR band position ───────────
-            from src.processor import compute_synth_vix, compute_dynamic_atr_bands
-            _svix_raw  = compute_synth_vix(live_df)
-            _svix_val  = float(_svix_raw.iloc[-1]) if not np.isnan(_svix_raw.iloc[-1]) else 0.0
-            _atr_bands = compute_dynamic_atr_bands(live_df)
-            _atr_band_val = float(_atr_bands.iloc[-1]) if not np.isnan(_atr_bands.iloc[-1]) else 0.5
 
             # ── Single policy call via evaluate_bar (Phase 2) ─────────────────
             # evaluate_bar calls update_regime internally and enforces M15/M5
@@ -1545,49 +1609,23 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # Map SignalDecision back to signal string for downstream execution code.
-            _is_mr    = "mr" in _entry_decision.reason.lower()
             _dir_int  = _entry_decision.direction
-            if _dir_int == 1:
-                _sig_str = "MR_BUY"  if _is_mr else "BUY"
-            else:
-                _sig_str = "MR_SELL" if _is_mr else "SELL"
             _size_mult = _entry_decision.position_size_multiplier
 
-            if _sig_str == "BUY":
+            if _dir_int == 1:
                 direction   = "BUY"
                 order_type  = mt5.ORDER_TYPE_BUY
-                signal_type = "trend"
-                logger.info("[SIGNAL] BUY (trend) | prob=%.3f | bars=%d | P(stay)=%.2f",
+                signal_type = "shock" if _entry_decision.regime == REGIME_SHOCK else "trend"
+                logger.info("[SIGNAL] BUY (%s) | prob=%.3f | bars=%d | P(stay)=%.2f",
+                            signal_type,
                             prob, signal_engine.bars_in_regime, _get_transition_prob(model_hmm, hmm_state))
-            elif _sig_str == "SELL":
+            elif _dir_int == -1:
                 direction   = "SELL"
                 order_type  = mt5.ORDER_TYPE_SELL
-                signal_type = "trend"
-                logger.info("[SIGNAL] SELL (trend) | prob=%.3f | bars=%d | P(stay)=%.2f",
+                signal_type = "shock" if _entry_decision.regime == REGIME_SHOCK else "trend"
+                logger.info("[SIGNAL] SELL (%s) | prob=%.3f | bars=%d | P(stay)=%.2f",
+                            signal_type,
                             prob, signal_engine.bars_in_regime, _get_transition_prob(model_hmm, hmm_state))
-            elif _sig_str == "MR_BUY":
-                direction   = "BUY"
-                order_type  = mt5.ORDER_TYPE_BUY
-                signal_type = "mean_reversion"
-                logger.info("[SIGNAL] MR_BUY | prob=%.3f | BB=%.2f | bars=%d",
-                            prob, _bb_pos, signal_engine.bars_in_regime)
-                if gmm_cluster == 2:
-                    logger.warning(
-                        "[MR WARNING] High-vol environment (GMM cluster=2) — "
-                        "MR has lower edge in breakout conditions."
-                    )
-            elif _sig_str == "MR_SELL":
-                direction   = "SELL"
-                order_type  = mt5.ORDER_TYPE_SELL
-                signal_type = "mean_reversion"
-                logger.info("[SIGNAL] MR_SELL | prob=%.3f | BB=%.2f | bars=%d",
-                            prob, _bb_pos, signal_engine.bars_in_regime)
-                if gmm_cluster == 2:
-                    logger.warning(
-                        "[MR WARNING] High-vol environment (GMM cluster=2) — "
-                        "MR has lower edge in breakout conditions."
-                    )
             else:
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -1597,9 +1635,6 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             limits        = arm.get_trade_limits(hmm_state)
             pos_per_trade = min(limits["pos_per_trade"], len(tp_mults))
             sl_distance   = max(atr_price * TF_ATR_MULTIPLIER.get(tf.upper(), 2.0), 0.01)
-            if signal_type == "mean_reversion":
-                sl_distance *= 0.70   # MR trades use tighter SL — mean-reversion has defined exit
-                logger.info("[MR RISK ADJ] SL tightened to 70%% of base: %.4f", sl_distance)
 
             # $15 accounts use hardcoded lot splits — bypass AdaptiveRiskManager.
             # Cent:     0.02 (pos1) + 0.03 (pos2) = 0.05 micro-lots total.
@@ -1660,10 +1695,18 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 continue
 
             # ── 13. Send order(s) with state-aware staged TPs ─────────────
-            signal_tracker = {"tickets": [], "entry_price": entry_price,
-                              "direction": direction, "tp1_hit": False,
-                              "tp1_level": tp_levels[0], "guard_hit": False,
-                              "signal_type": signal_type}
+            signal_tracker = {
+                "tickets": [],
+                "entry_price": entry_price,
+                "direction": direction,
+                "tp1_hit": False,
+                "tp1_level": tp_levels[0],
+                "guard_hit": False,
+                "signal_type": signal_type,
+                "bars_in_trade": 0,
+                "max_fav_pnl_usd": 0.0,
+                "entry_regime": _entry_decision.regime,
+            }
             peak_pnl_tracker = {}
             logger.info(
                 "SIGNAL %s | state=%d | prob=%.3f | size=%.2f | lots=%s | sl=%.2f | tp=%s | dev=%d",
@@ -1674,7 +1717,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             for p in range(pos_per_trade):
                 tp_price    = tp_levels[p]
                 current_lot = forced_lots[p] if p < len(forced_lots) else forced_lots[-1]
-                _trade_tag  = "MR" if signal_type == "mean_reversion" else "TREND"
+                _trade_tag  = "SHOCK" if signal_type == "shock" else "TREND"
                 comment     = f"GRX_{tf}_{_trade_tag}_{direction}_s{hmm_state}_tp{p+1}"
                 result = send_market_order(
                     symbol=DEFAULT_SYMBOL,
@@ -1699,7 +1742,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             if signal_tracker["tickets"]:
                 signal_engine.on_trade_entered(hmm_state)
                 _emoji  = "🟢" if direction == "BUY" else "🔴"
-                _tag    = "📐 MEAN REVERSION" if signal_type == "mean_reversion" else "📈 TREND"
+                _tag    = "⚡ VOLATILITY SHOCK" if signal_type == "shock" else "📈 TREND"
                 _tp_str = " / ".join(f"{t:.2f}" for t in tp_levels)
                 _tix    = "  ".join(f"#{t}" for t in signal_tracker["tickets"])
                 send_telegram_msg(

@@ -28,13 +28,20 @@ import pandas as pd
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from src.processor import kalman_smooth
-from src.engine_hmm import fit_hmm, predict_states
+from src.engine_hmm import fit_hmm, predict_states, STATE_NAMES
 from src.engine_xgb import (
     prepare_features, train_xgb_ensemble, get_predictions_ensemble,
     compute_regime_stats, get_feature_cols,
     train_regime_models, get_regime_predictions,
 )
 from src.backtester import vectorized_backtest
+from src.cpcv_reporting import build_cpcv_report, write_cpcv_report, write_legacy_cpcv_report
+from src.optuna_param_guard import audit_search_space, search_space_as_text
+from src.regime_diagnostics import (
+    summarize_regimes,
+    get_occupancy_percentage,
+    write_regime_diagnostics,
+)
 from src.risk_manager import SMALL_ACCOUNT_THRESHOLD
 from src.logger import setup_logger, append_trial_score
 
@@ -162,6 +169,13 @@ CPCV_K_TEST         = 2
 CPCV_TRIALS         = {"H1": 80, "M15": 120, "M5": 200}
 CPCV_PURGE_BARS     = {"H1": 24, "M15": 96,  "M5": 288}
 MIN_TRADES_PER_PATH = {"H1": 15, "M15": 60,  "M5": 100}
+
+# Validation and deployment thresholds are fixed governance constants.
+VALIDATION_CONFIG = {
+    "H1": {"min_median_sharpe": 0.25, "min_median_pf": 1.10, "max_trades_per_100": 8},
+    "M15": {"min_median_sharpe": 0.20, "min_median_pf": 1.05, "max_trades_per_100": 20},
+    "M5": {"min_median_sharpe": 0.10, "min_median_pf": 1.00, "max_trades_per_100": 35},
+}
 
 
 # ── Utility helpers ────────────────────────────────────────────────────────────
@@ -951,11 +965,8 @@ def make_objective_stage1(
             obs_cov   = trial.suggest_float("obs_cov",   0.5,  5.0,  log=True)
             trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
 
-        # M5/M15 fixed at 3 states — same reasoning as full CPCV objective
-        if tf_up in ("M5", "M15"):
-            n_states = 3
-        else:  # H1
-            n_states = trial.suggest_int("n_states", 3, 4)
+        # Canonical contract: all TFs use exactly 3 states.
+        n_states = 3
 
         # ── XGBoost params (same ranges as full CPCV objective) ───────────────
         if tf_up == "M5":
@@ -1113,6 +1124,7 @@ def format_trial_summary(row: dict) -> str:
         "tf", "trial", "objective_score", "cpcv_mean_score", "cpcv_std_score",
         "valid_paths", "total_paths", "sharpe_median", "pf_median", "calmar_median",
         "expectancy_median", "floating_dd_median", "trades_median", "mr_leak_count",
+        "regime_occupancy", "trade_distribution",
         "activation_events", "partial_close_events", "trail_updates",
         "regime_shift_forced_closes", "avg_activation_pnl_usd",
         "pruned", "elapsed_sec",
@@ -1122,56 +1134,38 @@ def format_trial_summary(row: dict) -> str:
 
 # ── H1 profitability safeguards ─────────────────────────────────────────────
 
-def _apply_h1_hard_floors(metrics: dict, params: dict) -> "tuple[float, list[str]]":
-    """Apply hard-floor penalty for H1 CPCV quality metrics.
+def _apply_validation_floors(metrics: dict, tf: str) -> "tuple[float, list[str]]":
+    """Apply fixed validation quality floors by timeframe."""
+    tf_up = tf.upper()
+    cfg = VALIDATION_CONFIG.get(tf_up, VALIDATION_CONFIG["H1"])
 
-    Returns (penalty, reasons) where reasons is a list of grep-friendly tags.
-    Floors are trial params so Optuna learns which param combos can meet them.
-    """
     penalty: float = 0.0
     reasons: list = []
 
-    min_sharpe = float(params.get("h1_min_median_sharpe", 0.10))
-    min_exp    = float(params.get("h1_min_median_expectancy", 0.0))
-    min_pf     = float(params.get("h1_min_median_pf", 1.02))
-    min_valid  = int(  params.get("h1_min_valid_paths", 0))
+    min_sharpe = float(cfg.get("min_median_sharpe", 0.0))
+    min_pf = float(cfg.get("min_median_pf", 1.0))
 
     med_sharpe  = float(metrics.get("median_sharpe",   0.0))
-    med_exp     = float(metrics.get("median_expectancy", 0.0))
     med_pf      = float(metrics.get("median_pf",        1.0))
-    valid_paths = int(  metrics.get("n_valid_paths",    0))
 
     if med_sharpe < min_sharpe:
         penalty += 10.0 + (min_sharpe - med_sharpe) * 10.0
         reasons.append(f"floor_sharpe:{med_sharpe:.3f}<{min_sharpe:.3f}")
 
-    if med_exp <= min_exp:
-        penalty += 8.0 + (min_exp - med_exp) * 25.0
-        reasons.append(f"floor_expectancy:{med_exp:.5f}<={min_exp:.5f}")
-
     if med_pf < min_pf:
         penalty += 6.0 + (min_pf - med_pf) * 12.0
         reasons.append(f"floor_pf:{med_pf:.3f}<{min_pf:.3f}")
 
-    if min_valid > 0 and valid_paths < min_valid:
-        penalty += 8.0 + (min_valid - valid_paths) * 1.5
-        reasons.append(f"floor_valid_paths:{valid_paths}<{min_valid}")
-
     return penalty, reasons
 
 
-def _turnover_penalty(metrics: dict, params: dict, tf: str) -> "tuple[float, list[str]]":
-    """Penalise excessive churn; H1-only (M15/M5 use spread-penalty in execute_cpcv).
-
-    Returns (penalty, reasons).
-    """
-    if tf.upper() != "H1":
-        return 0.0, []
+def _turnover_penalty(metrics: dict, tf: str) -> "tuple[float, list[str]]":
+    """Penalise excessive churn using fixed max-trade governance by timeframe."""
+    tf_up = tf.upper()
+    cfg = VALIDATION_CONFIG.get(tf_up, VALIDATION_CONFIG["H1"])
 
     trades_per_100 = float(metrics.get("trades_per_100_bars", 0.0))
-    reversal_ratio = float(metrics.get("reversal_ratio",      0.0))  # future metric
-    max_t100 = float(params.get("h1_max_trades_per_100", 4.0))
-    max_rev  = float(params.get("h1_max_reversal_ratio", 0.35))
+    max_t100 = float(cfg.get("max_trades_per_100", 20.0))
 
     penalty: float = 0.0
     reasons: list = []
@@ -1180,22 +1174,13 @@ def _turnover_penalty(metrics: dict, params: dict, tf: str) -> "tuple[float, lis
         penalty += (trades_per_100 - max_t100) * 1.5
         reasons.append(f"turnover:{trades_per_100:.2f}>{max_t100:.2f}")
 
-    if reversal_ratio > max_rev:
-        penalty += (reversal_ratio - max_rev) * 2.0
-        reasons.append(f"reversals:{reversal_ratio:.2f}>{max_rev:.2f}")
-
     return penalty, reasons
 
 
 # ── TF-specific objective weights ────────────────────────────────────────────
 
-def _tf_pipeline_score(cpcv_result: dict, tf: str) -> float:
-    """Apply TF-specific objective weights to CPCV aggregate metrics.
-
-    H1  : 0.50*expectancy + 0.30*calmar + 0.20*stability
-    M15 : 0.40*profit_factor + 0.30*sharpe + 0.30*calmar
-    M5  : 0.40*stability + 0.30*profit_factor + 0.30*drawdown_score
-    """
+def _tf_objective_breakdown(cpcv_result: dict, tf: str) -> dict:
+    """Return weighted objective component breakdown for timeframe-specific scoring."""
     tf_up             = tf.upper()
     median_sharpe     = float(cpcv_result.get("median_sharpe",     0.0))
     median_pf         = float(cpcv_result.get("median_pf",         1.0))
@@ -1204,16 +1189,40 @@ def _tf_pipeline_score(cpcv_result: dict, tf: str) -> float:
     stability         = float(cpcv_result.get("median_win_rate",   0.0))
     median_dd         = float(cpcv_result.get("median_drawdown",   0.0))
 
-    drawdown_score = max(0.0, 1.0 - median_dd / max(CPCV_MAX_FLOAT_DD, 1e-6))
+    drawdown_control = max(0.0, 1.0 - median_dd / max(CPCV_MAX_FLOAT_DD, 1e-6))
 
     if tf_up == "H1":
-        score = 0.50 * median_expectancy + 0.30 * median_calmar + 0.20 * stability
+        weights = {"expectancy": 0.35, "calmar": 0.35, "profit_factor": 0.30}
+        components = {
+            "expectancy": median_expectancy,
+            "calmar": median_calmar,
+            "profit_factor": median_pf,
+        }
     elif tf_up == "M15":
-        score = 0.40 * median_pf + 0.30 * median_sharpe + 0.30 * median_calmar
+        weights = {"profit_factor": 0.40, "sharpe": 0.30, "calmar": 0.30}
+        components = {
+            "profit_factor": median_pf,
+            "sharpe": median_sharpe,
+            "calmar": median_calmar,
+        }
     else:  # M5
-        score = 0.40 * stability + 0.30 * median_pf + 0.30 * drawdown_score
+        weights = {"stability": 0.40, "profit_factor": 0.30, "drawdown_control": 0.30}
+        components = {
+            "stability": stability,
+            "profit_factor": median_pf,
+            "drawdown_control": drawdown_control,
+        }
 
-    return float(score)
+    base_score = float(sum(weights[k] * components[k] for k in weights))
+    return {
+        "weights": weights,
+        "components": components,
+        "base_score": base_score,
+    }
+
+
+def _tf_pipeline_score(cpcv_result: dict, tf: str) -> float:
+    return float(_tf_objective_breakdown(cpcv_result, tf).get("base_score", 0.0))
 
 
 # ── Unified single-stage pipeline optimizer ───────────────────────────────────
@@ -1252,16 +1261,34 @@ class PipelineOptimizer:
         )
         self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
+    def active_param_names(self) -> list[str]:
+        """Return the exact Optuna-tuned parameter names for this timeframe."""
+        base = [
+            "obs_cov",
+            "trans_cov",
+            "persistence_threshold",
+            "max_depth",
+            "learning_rate",
+            "n_estimators",
+            "subsample",
+            "colsample_bytree",
+            "min_child_weight",
+            "gamma",
+            "reg_alpha",
+            "reg_lambda",
+            "scale_pos_weight",
+        ]
+        return sorted(base)
+
     # ── Parameter space ───────────────────────────────────────────────────────
 
     def suggest_params(self, trial: "optuna.Trial") -> dict:
         """Suggest hyperparameters for one trial.
 
-        New unified parameter space:
-        - HMM:  n_states, obs_cov, trans_cov, persistence_threshold,
-                transition_penalty, median_filter_window
-        - GMM:  gmm_n_components, gmm_covariance_type  (future wiring)
-        - XGB:  per-TF ranges per spec
+        Unified parameter space:
+        - HMM: n_states, obs_cov, trans_cov, persistence_threshold
+        - XGB: per-TF ranges
+        Validation floors, CPCV gates, and reporting thresholds are fixed.
         """
         tf_up = self.tf
 
@@ -1315,16 +1342,10 @@ class PipelineOptimizer:
         reg_lambda       = trial.suggest_float("reg_lambda",       0.01, 2.0,  log=True)
         scale_pos_weight = trial.suggest_float("scale_pos_weight", 0.5,  2.0,  log=True)
 
-        # H1-only entry gate and profitability floor params
-        # These are sampled so Optuna learns which XGB/HMM combos can meet stricter bars.
-        _h1_gates: dict = {}
-        if tf_up == "H1":
-            _h1_gates = {
-                "h1_entry_prob":         trial.suggest_float("h1_entry_prob",         0.57, 0.66),
-                "h1_min_median_sharpe":  trial.suggest_float("h1_min_median_sharpe",  0.05, 0.25),
-                "h1_min_median_pf":      trial.suggest_float("h1_min_median_pf",      1.00, 1.10),
-                "h1_max_trades_per_100": trial.suggest_float("h1_max_trades_per_100", 2.5,  6.0),
-            }
+        _signal_cfg = {
+            "entry_probability_threshold": {"H1": 0.60, "M15": 0.55}.get(tf_up, None),
+            "confirmation_bars": {"H1": 4, "M15": 3, "M5": 2}.get(tf_up, 2),
+        }
 
         return {
             "kalman": {
@@ -1347,7 +1368,7 @@ class PipelineOptimizer:
                 "reg_lambda":       reg_lambda,
                 "scale_pos_weight": scale_pos_weight,
             },
-            "h1_gates": _h1_gates,
+            "signal": _signal_cfg,
         }
 
     # ── Single trial execution ────────────────────────────────────────────────
@@ -1367,9 +1388,96 @@ class PipelineOptimizer:
 
         xgb_kwargs = params["xgb"]
         hmm_params = params["hmm"]
-        h1_gates   = params.get("h1_gates", {})
+        signal_cfg = params.get("signal", {})
         n_states   = int(hmm_params["n_states"])
         tf_embargo = CPCV_PURGE_BARS.get(self.tf, 24)
+
+        # Phase 1: lightweight occupancy diagnostics + early gate before CPCV loops.
+        _gate_model, gate_states, _ = fit_hmm(
+            df_trial,
+            n_states=_enforce_three_states({"n_states": n_states}, "run_single_trial_gate"),
+            tf=self.tf,
+        )
+        _gate_returns = df_trial["log_return"].values[: len(gate_states)]
+        _diag = summarize_regimes(gate_states, _gate_returns, STATE_NAMES)
+        write_regime_diagnostics(
+            tf=self.tf,
+            states=gate_states,
+            returns=_gate_returns,
+            state_labels=STATE_NAMES,
+            output_dir="reports",
+        )
+        trend_pct = get_occupancy_percentage(_diag, "TREND")
+        shock_pct = get_occupancy_percentage(_diag, "VOLATILITY_SHOCK")
+        if trend_pct < 0.15 or shock_pct < 0.05:
+            fail_reason = []
+            if trend_pct < 0.15:
+                fail_reason.append(f"trend_pct<{0.15:.2f}")
+            if shock_pct < 0.05:
+                fail_reason.append(f"shock_pct<{0.05:.2f}")
+            fail_tag = ",".join(fail_reason)
+            summary = {
+                "tf": self.tf,
+                "trial": trial.number,
+                "objective_score": -90.0,
+                "cpcv_mean_score": -90.0,
+                "cpcv_std_score": 0.0,
+                "valid_paths": 0,
+                "total_paths": _N_PATHS,
+                "sharpe_median": 0.0,
+                "pf_median": 1.0,
+                "calmar_median": 0.0,
+                "expectancy_median": 0.0,
+                "floating_dd_median": 0.0,
+                "trades_median": 0,
+                "mr_leak_count": 0,
+                "activation_events": 0,
+                "partial_close_events": 0,
+                "trail_updates": 0,
+                "regime_shift_forced_closes": 0,
+                "avg_activation_pnl_usd": 0.0,
+                "p_floor": 0.0,
+                "p_turn": 0.0,
+                "floor_reasons": f"occupancy_gate:{fail_tag}",
+                "pruned": True,
+                "elapsed_sec": round(time.time() - t_start, 1),
+            }
+            return {
+                "objective_score": -90.0,
+                "cpcv": {
+                    "cpcv_score": -90.0,
+                    "n_valid_paths": 0,
+                    "std_sharpe": 0.0,
+                    "median_sharpe": 0.0,
+                    "median_trades": 0,
+                    "median_drawdown": 0.0,
+                    "median_pf": 1.0,
+                    "median_expectancy": 0.0,
+                    "median_calmar": 0.0,
+                    "total_mr_leaks": 0,
+                    "regime_occupancy": {
+                        "TREND": float(_diag.get("TREND", {}).get("percentage", 0.0)),
+                        "MEAN_REVERSION": float(_diag.get("MEAN_REVERSION", {}).get("percentage", 0.0)),
+                        "VOLATILITY_SHOCK": float(_diag.get("VOLATILITY_SHOCK", {}).get("percentage", 0.0)),
+                    },
+                    "trade_distribution": {
+                        "TREND": 0,
+                        "MEAN_REVERSION": 0,
+                        "VOLATILITY_SHOCK": 0,
+                    },
+                    "path_scores": [],
+                    "path_sharpes": [],
+                    "path_trades": [],
+                    "path_winrates": [],
+                    "path_drawdowns": [],
+                    "path_returns": [],
+                    "path_pfs": [],
+                    "path_expectancies": [],
+                },
+                "summary": summary,
+                "objective_breakdown": {"weights": {}, "components": {}, "base_score": 0.0},
+                "penalties": {"occupancy_gate": 90.0},
+            }
 
         cpcv = execute_cpcv(
             df_full      = df_trial,
@@ -1379,7 +1487,7 @@ class PipelineOptimizer:
             broker       = self.broker,
             xgb_kwargs   = xgb_kwargs,
             hmm_params   = hmm_params,
-            h1_gates     = h1_gates,
+            signal_cfg   = signal_cfg,
             n_splits     = CPCV_N_BLOCKS,
             n_test_splits= CPCV_K_TEST,
             embargo_bars = tf_embargo,
@@ -1387,7 +1495,8 @@ class PipelineOptimizer:
         )
 
         # TF-specific objective base score
-        base_score      = _tf_pipeline_score(cpcv, self.tf)
+        objective_breakdown = _tf_objective_breakdown(cpcv, self.tf)
+        base_score      = float(objective_breakdown.get("base_score", 0.0))
         objective_score = base_score
 
         # Penalties
@@ -1397,41 +1506,54 @@ class PipelineOptimizer:
         mr_leaks          = int(  cpcv.get("total_mr_leaks",  0))
         median_trades     = int(  cpcv.get("median_trades",   0))
 
-        variance_penalty     = 0.10 * std_sharpe
-        instability_penalty  = 0.50 * max(0, _N_PATHS - n_valid)
-        dd_penalty           = 20.0 if median_dd > CPCV_MAX_FLOAT_DD else 0.0
-        mr_penalty           = float(mr_leaks) * 5.0
+        variance_penalty = 0.10 * std_sharpe
+        instability_penalty = 0.50 * max(0, _N_PATHS - n_valid)
+        dd_penalty = 20.0 if median_dd > CPCV_MAX_FLOAT_DD else 0.0
+        mr_penalty = float(mr_leaks) * 5.0
 
-        # Excessive turnover penalty (especially harmful at M5 due to spread)
-        spread_penalty = 0.0
-        if self.tf == "M5" and median_trades > 500:
-            spread_penalty = 1.0 * ((median_trades - 500) / 500.0)
+        _test_bars = max(len(self.df) * CPCV_K_TEST // CPCV_N_BLOCKS, 1)
+        _cpcv_ext = dict(cpcv)
+        _cpcv_ext["trades_per_100_bars"] = (median_trades / _test_bars) * 100.0
 
-        objective_score -= (
-            variance_penalty + instability_penalty
-            + dd_penalty + mr_penalty + spread_penalty
-        )
+        p_floor, floor_reasons = _apply_validation_floors(cpcv, self.tf)
+        p_turn, turn_reasons = _turnover_penalty(_cpcv_ext, self.tf)
 
-        # H1 profitability floors and turnover penalty
-        p_floor, floor_reasons = 0.0, []
-        p_turn,  turn_reasons  = 0.0, []
-        if self.tf == "H1":
-            # trades_per_100_bars: median_trades / (estimated OOS bars per path)
-            _test_bars = max(len(self.df) * CPCV_K_TEST // CPCV_N_BLOCKS, 1)
-            _cpcv_ext  = dict(cpcv)
-            _cpcv_ext["trades_per_100_bars"] = (median_trades / _test_bars) * 100.0
-            p_floor, floor_reasons = _apply_h1_hard_floors(cpcv, h1_gates)
-            p_turn,  turn_reasons  = _turnover_penalty(_cpcv_ext, h1_gates, self.tf)
-            objective_score -= (p_floor + p_turn)
+        occ = cpcv.get("regime_occupancy", {})
+        occ_trend = float(occ.get("TREND", 0.0)) / 100.0
+        occ_shock = float(occ.get("VOLATILITY_SHOCK", 0.0)) / 100.0
+        occ_penalty = 0.0
+        occ_reasons: list[str] = []
+        if occ_trend < 0.15:
+            occ_penalty += (0.15 - occ_trend) * 20.0
+            occ_reasons.append("regime_occ_trend_low")
+        if occ_shock < 0.05:
+            occ_penalty += (0.05 - occ_shock) * 25.0
+            occ_reasons.append("regime_occ_shock_low")
 
-        all_reasons = floor_reasons + turn_reasons
+        m15_trade_penalty = 0.0
+        if self.tf == "M15" and median_trades > 400:
+            m15_trade_penalty = float(median_trades - 400) * 0.03
+
+        penalties = {
+            "variance": variance_penalty,
+            "instability": instability_penalty,
+            "drawdown": dd_penalty,
+            "mr_leak": mr_penalty,
+            "validation_floor": p_floor,
+            "overtrading": p_turn,
+            "regime_occupancy_instability": occ_penalty,
+            "m15_trade_excess": m15_trade_penalty,
+        }
+        objective_score -= float(sum(penalties.values()))
+
+        all_reasons = floor_reasons + turn_reasons + occ_reasons
         logger.info(
             "trial=%d tf=%s base=%.4f p_var=%.4f p_inst=%.4f p_dd=%.4f "
-            "p_mr=%.4f p_floor=%.4f p_turn=%.4f final=%.4f reasons=%s",
+            "p_mr=%.4f p_floor=%.4f p_turn=%.4f p_occ=%.4f p_m15=%.4f final=%.4f reasons=%s",
             trial.number, self.tf,
             base_score,
             variance_penalty, instability_penalty, dd_penalty, mr_penalty,
-            p_floor, p_turn,
+            p_floor, p_turn, occ_penalty, m15_trade_penalty,
             objective_score,
             "|".join(all_reasons) or "none",
         )
@@ -1458,6 +1580,8 @@ class PipelineOptimizer:
             "trail_updates":              int(cpcv.get("total_trail_updates",         0)),
             "regime_shift_forced_closes": int(cpcv.get("total_regime_forced_closes", 0)),
             "avg_activation_pnl_usd":     round(float(cpcv.get("avg_activation_pnl_usd", 0.0)), 4),
+            "regime_occupancy":    dict(cpcv.get("regime_occupancy", {})),
+            "trade_distribution":  dict(cpcv.get("trade_distribution", {})),
             "p_floor":            round(p_floor, 4),
             "p_turn":             round(p_turn,  4),
             "floor_reasons":      "|".join(floor_reasons) or "none",
@@ -1465,7 +1589,13 @@ class PipelineOptimizer:
             "elapsed_sec":        elapsed,
         }
 
-        return {"objective_score": objective_score, "cpcv": cpcv, "summary": summary}
+        return {
+            "objective_score": objective_score,
+            "cpcv": cpcv,
+            "summary": summary,
+            "objective_breakdown": objective_breakdown,
+            "penalties": penalties,
+        }
 
     # ── Optuna objective ──────────────────────────────────────────────────────
 
@@ -1477,6 +1607,8 @@ class PipelineOptimizer:
             score   = result["objective_score"]
             summary = result["summary"]
             cpcv    = result["cpcv"]
+            objective_breakdown = result.get("objective_breakdown", {})
+            penalties = result.get("penalties", {})
 
             # Store attrs for Optuna history / callbacks
             trial.set_user_attr("n_valid_paths",   summary["valid_paths"])
@@ -1485,6 +1617,30 @@ class PipelineOptimizer:
             trial.set_user_attr("median_sharpe",   summary["sharpe_median"])
             trial.set_user_attr("median_drawdown", summary["floating_dd_median"])
             trial.set_user_attr("mr_leak_count",   summary["mr_leak_count"])
+            trial.set_user_attr("median_win_rate",   float(cpcv.get("median_win_rate", 0.0)))
+            trial.set_user_attr("median_return",     float(cpcv.get("median_return", 0.0)))
+            trial.set_user_attr("median_pf",         float(cpcv.get("median_pf", 1.0)))
+            trial.set_user_attr("median_expectancy", float(cpcv.get("median_expectancy", 0.0)))
+            trial.set_user_attr("median_calmar",     float(cpcv.get("median_calmar", 0.0)))
+
+            trial.set_user_attr("path_scores",       list(cpcv.get("path_scores", [])))
+            trial.set_user_attr("path_sharpes",      list(cpcv.get("path_sharpes", [])))
+            trial.set_user_attr("path_trades",       list(cpcv.get("path_trades", [])))
+            trial.set_user_attr("path_winrates",     list(cpcv.get("path_winrates", [])))
+            trial.set_user_attr("path_drawdowns",    list(cpcv.get("path_drawdowns", [])))
+            trial.set_user_attr("path_returns",      list(cpcv.get("path_returns", [])))
+            trial.set_user_attr("path_pfs",          list(cpcv.get("path_pfs", [])))
+            trial.set_user_attr("path_expectancies", list(cpcv.get("path_expectancies", [])))
+
+            trial.set_user_attr("total_activation_events",    int(cpcv.get("total_activation_events", 0)))
+            trial.set_user_attr("total_partial_close_events", int(cpcv.get("total_partial_close_events", 0)))
+            trial.set_user_attr("total_regime_forced_closes", int(cpcv.get("total_regime_forced_closes", 0)))
+            trial.set_user_attr("total_trail_updates",        int(cpcv.get("total_trail_updates", 0)))
+            trial.set_user_attr("avg_activation_pnl_usd",     float(cpcv.get("avg_activation_pnl_usd", 0.0)))
+            trial.set_user_attr("regime_occupancy", cpcv.get("regime_occupancy", {}))
+            trial.set_user_attr("trade_distribution", cpcv.get("trade_distribution", {}))
+            trial.set_user_attr("objective_breakdown", objective_breakdown)
+            trial.set_user_attr("penalties", penalties)
 
             log_line = format_trial_summary(summary)
             logger.info(log_line)
@@ -1508,6 +1664,7 @@ class PipelineOptimizer:
                 "sharpe_median": None, "pf_median": None, "calmar_median": None,
                 "expectancy_median": None, "floating_dd_median": None,
                 "trades_median": 0, "mr_leak_count": 0,
+                "regime_occupancy": {}, "trade_distribution": {},
                 "activation_events": 0, "partial_close_events": 0,
                 "trail_updates": 0, "regime_shift_forced_closes": 0,
                 "avg_activation_pnl_usd": 0.0,
@@ -1522,6 +1679,39 @@ class PipelineOptimizer:
 
         finally:
             gc.collect()
+
+
+def _cpcv_from_attrs(attrs: dict, final_score: float) -> dict:
+    """Rebuild a CPCV payload from persisted Optuna trial attrs."""
+    return {
+        "cpcv_score": float(final_score),
+        "n_valid_paths": int(attrs.get("n_valid_paths", 0)),
+        "median_sharpe": float(attrs.get("median_sharpe", 0.0)),
+        "std_sharpe": float(attrs.get("std_sharpe", 0.0)),
+        "median_trades": int(attrs.get("median_trades", 0)),
+        "median_win_rate": float(attrs.get("median_win_rate", 0.0)),
+        "median_drawdown": float(attrs.get("median_drawdown", 0.0)),
+        "median_return": float(attrs.get("median_return", 0.0)),
+        "median_pf": float(attrs.get("median_pf", 1.0)),
+        "median_expectancy": float(attrs.get("median_expectancy", 0.0)),
+        "median_calmar": float(attrs.get("median_calmar", 0.0)),
+        "path_scores": list(attrs.get("path_scores", [])),
+        "path_sharpes": list(attrs.get("path_sharpes", [])),
+        "path_trades": list(attrs.get("path_trades", [])),
+        "path_winrates": list(attrs.get("path_winrates", [])),
+        "path_drawdowns": list(attrs.get("path_drawdowns", [])),
+        "path_returns": list(attrs.get("path_returns", [])),
+        "path_pfs": list(attrs.get("path_pfs", [])),
+        "path_expectancies": list(attrs.get("path_expectancies", [])),
+        "regime_occupancy": dict(attrs.get("regime_occupancy", {})),
+        "trade_distribution": dict(attrs.get("trade_distribution", {})),
+        "total_mr_leaks": int(attrs.get("mr_leak_count", 0)),
+        "total_activation_events": int(attrs.get("total_activation_events", 0)),
+        "total_partial_close_events": int(attrs.get("total_partial_close_events", 0)),
+        "total_regime_forced_closes": int(attrs.get("total_regime_forced_closes", 0)),
+        "total_trail_updates": int(attrs.get("total_trail_updates", 0)),
+        "avg_activation_pnl_usd": float(attrs.get("avg_activation_pnl_usd", 0.0)),
+    }
 
 def run_optimization_stage1(
     df:           pd.DataFrame,
@@ -1623,6 +1813,19 @@ def run_optimization(
     feature_cols = list(get_feature_cols(df))
     _check_study_hash(study, tf=tf, broker=broker, feature_cols=feature_cols)
 
+    _existing_params: set[str] = set()
+    for _t in study.trials:
+        if _t.params:
+            _existing_params.update(str(k) for k in _t.params.keys())
+    if _existing_params:
+        try:
+            audit_search_space(_existing_params)
+        except RuntimeError as _audit_err:
+            raise RuntimeError(
+                f"Existing study contains forbidden/unknown params: {_audit_err}. "
+                "Reset the study (--reset_study) before continuing."
+            )
+
     if warm_start_stage1:
         logger.warning(
             "warm_start_stage1 is deprecated and ignored in unified mode. "
@@ -1657,6 +1860,13 @@ def run_optimization(
         tf=tf, broker=broker, account_size=account_size,
         df=df, wfo_mode=wfo_mode,
     )
+
+    _active_params = _pipeline_opt.active_param_names()
+    print("Active Optuna search space:")
+    print(search_space_as_text(_active_params))
+    audit_search_space(_active_params)
+    logger.info("Optuna search space audited: %s", _active_params)
+
     study.optimize(
         _pipeline_opt.objective,
         n_trials=remaining,
@@ -1694,35 +1904,47 @@ def run_optimization(
         + "\n".join(f"  <code>{k}</code>: {v}" for k, v in study.best_params.items())
     )
 
-    # Persist best-trial CPCV stats so --mode report can display them directly.
-    # These are the ground-truth OOS metrics recorded during optimisation.
     try:
-        import json as _json
-        from pathlib import Path as _Path
-        _tf_up  = tf.upper()
-        _bt     = study.best_trial
-        _attrs  = _bt.user_attrs  # {'median_sharpe', 'median_trades', 'n_valid_paths', 'std_sharpe'}
-        _cpcv_data = {
-            "cpcv_score":      float(best),
-            "n_valid_paths":   int(_attrs.get("n_valid_paths", 0)),
-            "median_sharpe":   float(_attrs.get("median_sharpe", 0.0)),
-            "std_sharpe":      float(_attrs.get("std_sharpe", 0.0)),
-            "median_trades":   int(_attrs.get("median_trades", 0)),
-            # These aren't stored per-trial; leave as 0.0 to be filled by --mode wfa
-            "median_win_rate": 0.0,
-            "median_drawdown": 0.0,
-            "median_return":   0.0,
-            "path_scores":     [],
-        }
-        os.makedirs("reports", exist_ok=True)
-        _cpcv_path = _Path(f"reports/cpcv_{_tf_up.lower()}_{broker}.json")
-        _cpcv_path.write_text(_json.dumps(_cpcv_data, indent=2))
-        logger.info(
-            "Best-trial CPCV stats saved → %s  (median_sharpe=%.3f  median_trades=%d)",
-            _cpcv_path, _cpcv_data["median_sharpe"], _cpcv_data["median_trades"],
+        _bt = study.best_trial
+        _attrs = _bt.user_attrs
+        _cpcv_data = _cpcv_from_attrs(_attrs, final_score=float(best))
+        _objective_breakdown = dict(_attrs.get("objective_breakdown", {}))
+        _penalties = dict(_attrs.get("penalties", {}))
+
+        _report = build_cpcv_report(
+            tf=tf,
+            broker=broker,
+            optimization_summary={
+                "study_name": name,
+                "best_trial": int(_bt.number),
+                "completed_trials": int(total_done),
+                "search_space": list(_active_params),
+            },
+            cpcv_result=_cpcv_data,
+            objective_breakdown=_objective_breakdown,
+            final_score=float(best),
+            penalties=_penalties,
         )
+        _path_main = write_cpcv_report(_report, tf=tf, output_dir="reports")
+        _path_legacy = write_legacy_cpcv_report(_report, tf=tf, broker=broker, output_dir="reports")
+        logger.info("Unified CPCV report saved → %s", _path_main)
+        logger.info("Legacy CPCV report mirror saved → %s", _path_legacy)
+
+        _occ = _cpcv_data.get("regime_occupancy", {})
+        _trd = _cpcv_data.get("trade_distribution", {})
+        print(f"\n{tf.upper()}")
+        print(f"TREND: {float(_occ.get('TREND', 0.0)):.1f}%")
+        print(f"MEAN_REVERSION: {float(_occ.get('MEAN_REVERSION', 0.0)):.1f}%")
+        print(f"VOLATILITY_SHOCK: {float(_occ.get('VOLATILITY_SHOCK', 0.0)):.1f}%")
+        print("\nTrades:")
+        print(f"Trend = {int(_trd.get('TREND', 0))}")
+        print(f"Shock = {int(_trd.get('VOLATILITY_SHOCK', 0))}")
+        _mr_tr = int(_trd.get("MEAN_REVERSION", 0))
+        print(f"MR = {_mr_tr}")
+        if _mr_tr > 0:
+            print("DEFECT: MR trades are non-zero.")
     except Exception as _save_err:
-        logger.warning("Could not save CPCV stats after optimisation: %s", _save_err)
+        logger.warning("Could not save unified CPCV report after optimisation: %s", _save_err)
 
     return study
 
@@ -1739,9 +1961,6 @@ def save_best_trial_cpcv(
     Used to backfill the CPCV JSON from an existing completed study without
     re-running optimisation.  Returns True on success, False if study is empty.
     """
-    import json as _json
-    from pathlib import Path as _Path
-
     tier    = _get_tier(balance)
     name    = _study_name(broker=broker, tier=tier, tf=tf)
     storage = _study_db(broker)
@@ -1758,20 +1977,23 @@ def save_best_trial_cpcv(
 
     _bt    = _study.best_trial
     _attrs = _bt.user_attrs
-    _data  = {
-        "cpcv_score":      float(_study.best_value),
-        "n_valid_paths":   int(_attrs.get("n_valid_paths", 0)),
-        "median_sharpe":   float(_attrs.get("median_sharpe", 0.0)),
-        "std_sharpe":      float(_attrs.get("std_sharpe", 0.0)),
-        "median_trades":   int(_attrs.get("median_trades", 0)),
-        "median_win_rate": 0.0,
-        "median_drawdown": 0.0,
-        "median_return":   0.0,
-        "path_scores":     [],
-    }
-    os.makedirs("reports", exist_ok=True)
-    _path = _Path(f"reports/cpcv_{tf.lower()}_{broker}.json")
-    _path.write_text(_json.dumps(_data, indent=2))
+    _data = _cpcv_from_attrs(_attrs, final_score=float(_study.best_value))
+    _report = build_cpcv_report(
+        tf=tf,
+        broker=broker,
+        optimization_summary={
+            "study_name": _study.study_name,
+            "best_trial": int(_bt.number),
+            "completed_trials": len([t for t in _study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
+            "search_space": sorted(list(_bt.params.keys())),
+        },
+        cpcv_result=_data,
+        objective_breakdown=dict(_attrs.get("objective_breakdown", {})),
+        final_score=float(_study.best_value),
+        penalties=dict(_attrs.get("penalties", {})),
+    )
+    _path = write_cpcv_report(_report, tf=tf, output_dir="reports")
+    write_legacy_cpcv_report(_report, tf=tf, broker=broker, output_dir="reports")
     logger.info(
         "CPCV stats saved from best trial → %s  (score=%.3f  median_sharpe=%.3f  trades=%d)",
         _path, _data["cpcv_score"], _data["median_sharpe"], _data["median_trades"],
@@ -1973,21 +2195,24 @@ def run_wfa(
     result["wfe_ratio"]       = 0.0           # not applicable in CPCV
     result["window_scores"]   = result.get("path_scores", [])
 
-    # Persist CPCV summary so --mode report can load it as primary OOS metrics
-    import json as _json
-    from pathlib import Path as _Path
-    _cpcv_path = _Path(f"reports/cpcv_{tf.lower()}_{broker}.json")
-    _cpcv_path.parent.mkdir(parents=True, exist_ok=True)
-    _saveable = {k: v for k, v in result.items() if k != "params"}
-    # Convert any numpy types to native Python for JSON serialisation
-    def _to_native(obj):
-        if isinstance(obj, (np.integer,)):   return int(obj)
-        if isinstance(obj, (np.floating,)):  return float(obj)
-        if isinstance(obj, np.ndarray):      return obj.tolist()
-        if isinstance(obj, list):            return [_to_native(x) for x in obj]
-        return obj
-    _cpcv_path.write_text(_json.dumps({k: _to_native(v) for k, v in _saveable.items()}, indent=2))
-    logger.info("CPCV report saved → %s", _cpcv_path)
+    _report = build_cpcv_report(
+        tf=tf,
+        broker=broker,
+        optimization_summary={
+            "study_name": f"wfa_{tf.lower()}_{broker}",
+            "best_trial": None,
+            "completed_trials": None,
+            "search_space": [],
+        },
+        cpcv_result=result,
+        objective_breakdown={"weights": {}, "components": {}, "base_score": float(result.get("cpcv_score", 0.0))},
+        final_score=float(result.get("cpcv_score", 0.0)),
+        penalties={},
+    )
+    _path_main = write_cpcv_report(_report, tf=tf, output_dir="reports")
+    _path_legacy = write_legacy_cpcv_report(_report, tf=tf, broker=broker, output_dir="reports")
+    logger.info("CPCV report saved → %s", _path_main)
+    logger.info("CPCV legacy mirror saved → %s", _path_legacy)
 
     return result
 
@@ -2045,7 +2270,7 @@ def execute_cpcv(
     embargo_bars: int = 24,
     trial_number: int | None = None,
     hmm_params: dict | None = None,
-    h1_gates: dict | None = None,
+    signal_cfg: dict | None = None,
 ) -> dict:
     """Execute Combinatorial Purged CV with strict per-path HMM and Scaler fitting.
 
@@ -2073,6 +2298,12 @@ def execute_cpcv(
     path_pfs:          list = []
     path_expectancies: list = []
     path_mr_leaks:     list = []
+    path_occ_trend:    list = []
+    path_occ_mr:       list = []
+    path_occ_shock:    list = []
+    path_trd_trend:    list = []
+    path_trd_mr:       list = []
+    path_trd_shock:    list = []
     # lifecycle parity telemetry accumulators
     path_activation_events:        list = []
     path_partial_close_events:     list = []
@@ -2082,9 +2313,15 @@ def execute_cpcv(
     n_valid_paths = 0
     min_trades = HARD_TRADE_FLOORS.get(tf.upper(), 10)
 
-    # H1 entry prob override: apply per-path via evaluator_config
-    _h1_ep = float((h1_gates or {}).get("h1_entry_prob", 0.0))
-    _h1_eval_cfg = {"h1_entry_prob": _h1_ep} if (tf.upper() == "H1" and _h1_ep > 0) else None
+    # Entry probability threshold override for policy path.
+    _entry_prob = (signal_cfg or {}).get("entry_probability_threshold")
+    _eval_cfg = None
+    if _entry_prob is not None:
+        _eval_cfg = {
+            "entry_probability_threshold": float(_entry_prob),
+            # Backward-compat alias consumed by existing backtester wiring.
+            "h1_entry_prob": float(_entry_prob),
+        }
 
     for path_idx, (train_mask, test_mask) in enumerate(splitter.split()):
         try:
@@ -2172,7 +2409,7 @@ def execute_cpcv(
                 test_df, test_probs, test_states,
                 split_idx=None, account_size=balance, broker=broker, tf=tf,
                 hmm_transmat=model_path.transmat_,
-                evaluator_config=_h1_eval_cfg,
+                evaluator_config=_eval_cfg,
             )
 
             n_trades = int(path_result.get("n_trades", 0))
@@ -2216,6 +2453,15 @@ def execute_cpcv(
             path_expectancies.append(float(path_result.get("expected_payoff", 0.0)))
             path_mr_leaks.append(int(path_result.get("mr_leak_count",
                                                        path_result.get("mr_trades", 0))))
+            _occ = path_result.get("regime_occupancy", {})
+            path_occ_trend.append(float(_occ.get("TREND", 0.0)))
+            path_occ_mr.append(float(_occ.get("MEAN_REVERSION", 0.0)))
+            path_occ_shock.append(float(_occ.get("VOLATILITY_SHOCK", 0.0)))
+
+            _dist = path_result.get("trade_distribution", {})
+            path_trd_trend.append(int(_dist.get("TREND", 0)))
+            path_trd_mr.append(int(_dist.get("MEAN_REVERSION", 0)))
+            path_trd_shock.append(int(_dist.get("VOLATILITY_SHOCK", 0)))
             # lifecycle counters
             path_activation_events.append(int(path_result.get("activation_events", 0)))
             path_partial_close_events.append(int(path_result.get("partial_close_events", 0)))
@@ -2270,6 +2516,17 @@ def execute_cpcv(
         for r, d in zip(path_returns, path_drawdowns)
     ]
 
+    regime_occupancy = {
+        "TREND": float(np.median(path_occ_trend)) if path_occ_trend else 0.0,
+        "MEAN_REVERSION": float(np.median(path_occ_mr)) if path_occ_mr else 0.0,
+        "VOLATILITY_SHOCK": float(np.median(path_occ_shock)) if path_occ_shock else 0.0,
+    }
+    trade_distribution = {
+        "TREND": int(np.median(path_trd_trend)) if path_trd_trend else 0,
+        "MEAN_REVERSION": int(np.median(path_trd_mr)) if path_trd_mr else 0,
+        "VOLATILITY_SHOCK": int(np.median(path_trd_shock)) if path_trd_shock else 0,
+    }
+
     return {
         "cpcv_score":        final_score,
         "n_valid_paths":     n_valid_paths,
@@ -2285,6 +2542,8 @@ def execute_cpcv(
             np.median(_path_calmars) if _path_calmars else 0.0, -5.0, 5.0
         )),
         "total_mr_leaks":    int(sum(path_mr_leaks)),
+        "regime_occupancy":  regime_occupancy,
+        "trade_distribution": trade_distribution,
         # lifecycle parity telemetry
         "total_activation_events":       int(sum(path_activation_events)),
         "total_partial_close_events":    int(sum(path_partial_close_events)),
