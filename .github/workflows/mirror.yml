@@ -1,0 +1,32 @@
+name: Mirror to GoldRegimeX2
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+  delete:
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-to-org
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push mirror to lukes-organization/GoldRegimeX2
+        env:
+          TOKEN: $ secrets.ORG_REPO_TOKEN 
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add org "https://x-access-token:${TOKEN}@github.com/lukes-organization/GoldRegimeX2.git"
+          git push --mirror org
