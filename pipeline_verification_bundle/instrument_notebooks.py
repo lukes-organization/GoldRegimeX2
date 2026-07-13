@@ -9,7 +9,7 @@ What it does
 
 Inserts / updates tagged hook cells in each target notebook so the pipeline
 observability module (shared/pipeline_observability.py) hooks into the
-existing notebook code without changing any model, strategy, HMM, XGBoost,
+existing notebook codes without changing any model, strategy, HMM, XGBoost,
 or CPCV logic.
 
 Inserted cells (identified by tag `pipeline_observability_v1`):
