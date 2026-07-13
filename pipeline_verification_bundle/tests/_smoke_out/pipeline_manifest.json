@@ -1,0 +1,9 @@
+{
+  "feature_hash": "F1",
+  "session_filter_hash": "S1",
+  "strategy_hash": "STR1",
+  "candidate_hash": "C1",
+  "model_hash": "MOD1",
+  "pipeline_version": "v1.0.0",
+  "written_at": "2026-07-13T10:58:25.293183+00:00"
+}

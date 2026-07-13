@@ -1,0 +1,173 @@
+{
+  "experiment_id": "1cbea8d6aaff",
+  "timestamp": "2026-07-13T10:58:25.441626+00:00",
+  "timeframes": {
+    "M15": {
+      "generated": 600,
+      "session_pass": 257,
+      "tbm_pass": 231,
+      "hmm_pass": 206,
+      "threshold_pass": 6,
+      "executed": 6
+    },
+    "M5": {
+      "generated": 1200,
+      "session_pass": 1074,
+      "tbm_pass": 962,
+      "hmm_pass": 853,
+      "threshold_pass": 26,
+      "executed": 24
+    }
+  },
+  "run_id": "1cbea8d6aaff",
+  "generated_at_utc": "2026-07-13T10:58:25.441684+00:00",
+  "integrity_flags": {
+    "Candidate Integrity": "PASS",
+    "Model Integrity": "PASS",
+    "Train/OOS Separation": "PASS",
+    "Model UUID Consistency": "PASS"
+  },
+  "survival_matrix": [
+    {
+      "Stage": "Generated",
+      "M15 Remaining": 600,
+      "M15 %": 100.0,
+      "M5 Remaining": 1200,
+      "M5 %": 100.0
+    },
+    {
+      "Stage": "FeatureEngineering",
+      "M15 Remaining": 600,
+      "M15 %": 100.0,
+      "M5 Remaining": 1200,
+      "M5 %": 100.0
+    },
+    {
+      "Stage": "Session",
+      "M15 Remaining": 257,
+      "M15 %": 42.83,
+      "M5 Remaining": 1074,
+      "M5 %": 89.5
+    },
+    {
+      "Stage": "TBM",
+      "M15 Remaining": 231,
+      "M15 %": 38.5,
+      "M5 Remaining": 962,
+      "M5 %": 80.17
+    },
+    {
+      "Stage": "HMM",
+      "M15 Remaining": 206,
+      "M15 %": 34.33,
+      "M5 Remaining": 853,
+      "M5 %": 71.08
+    },
+    {
+      "Stage": "Probability",
+      "M15 Remaining": 206,
+      "M15 %": 34.33,
+      "M5 Remaining": 853,
+      "M5 %": 71.08
+    },
+    {
+      "Stage": "Threshold",
+      "M15 Remaining": 6,
+      "M15 %": 1.0,
+      "M5 Remaining": 26,
+      "M5 %": 2.17
+    },
+    {
+      "Stage": "Risk",
+      "M15 Remaining": 6,
+      "M15 %": 1.0,
+      "M5 Remaining": 24,
+      "M5 %": 2.0
+    },
+    {
+      "Stage": "Executed",
+      "M15 Remaining": 6,
+      "M15 %": 1.0,
+      "M5 Remaining": 24,
+      "M5 %": 2.0
+    }
+  ],
+  "survival_gap_warnings": [
+    "[Session] survival gap = 46.7 pp across M15=42.8%, M5=89.5%",
+    "[TBM] survival gap = 41.7 pp across M15=38.5%, M5=80.2%",
+    "[HMM] survival gap = 36.7 pp across M15=34.3%, M5=71.1%",
+    "[Probability] survival gap = 36.7 pp across M15=34.3%, M5=71.1%"
+  ],
+  "per_timeframe": {
+    "M15": {
+      "generated": 600,
+      "executed": 6,
+      "survival_pct": 1.0,
+      "threshold": null,
+      "model_hash": null,
+      "bottleneck_stage": "Session",
+      "bottleneck_drop_pct": 57.17,
+      "hmm_snapshot": null,
+      "probability_summary": {
+        "raw": {
+          "n": 500.0,
+          "min": 0.02514690846841727,
+          "p25": 0.17311172778077327,
+          "median": 0.2799607504169517,
+          "p75": 0.39925888809805277,
+          "p95": 0.6104091227435774,
+          "p99": 0.7168692890676296,
+          "max": 0.8228336513674296,
+          "mean": 0.30010796685731206,
+          "std": 0.1640404641253624
+        },
+        "thresholded": {
+          "n": 200.0,
+          "min": 0.07906829471921914,
+          "p25": 0.3764423933084445,
+          "median": 0.5187824346905823,
+          "p75": 0.6318650997524151,
+          "p95": 0.7883077113763676,
+          "p99": 0.9310491592869657,
+          "max": 0.9634782429317674,
+          "mean": 0.5079607870276719,
+          "std": 0.18384953300990328
+        }
+      },
+      "feature_drift": [
+        {
+          "feature": "rsi",
+          "psi": 0.05,
+          "ks": 0.03,
+          "mean_shift": 0.01,
+          "std_shift": 0.02,
+          "flag": "SAFE"
+        },
+        {
+          "feature": "macd",
+          "psi": 0.28,
+          "ks": 0.11,
+          "mean_shift": 0.05,
+          "std_shift": 0.1,
+          "flag": "CRITICAL"
+        }
+      ],
+      "reconciliation": {}
+    },
+    "M5": {
+      "generated": 1200,
+      "executed": 24,
+      "survival_pct": 2.0,
+      "threshold": null,
+      "model_hash": null,
+      "bottleneck_stage": "Threshold",
+      "bottleneck_drop_pct": 68.91,
+      "hmm_snapshot": null,
+      "probability_summary": {},
+      "feature_drift": [],
+      "reconciliation": {}
+    }
+  },
+  "total_candidates": 1800,
+  "dashboard": "============================== PIPELINE HEALTH ==============================\n\nM15 Generated: 600\nM15 Executed:  6\nM15 Survival:  1.00%\n\nM5 Generated: 1200\nM5 Executed:  24\nM5 Survival:  2.00%\n\nLargest M15 Bottleneck: Session (-57.2%)\nLargest M5 Bottleneck: Threshold (-68.9%)\n\nCandidate Integrity: PASS\nModel Integrity: PASS\nTrain/OOS Separation: PASS\nModel UUID Consistency: PASS\n\nPipeline Status: PASS\n============================================================================="
+}

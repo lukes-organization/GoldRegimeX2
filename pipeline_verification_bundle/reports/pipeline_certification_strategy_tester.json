@@ -1,0 +1,16 @@
+{
+  "overall": "PASS",
+  "results": {
+    "Session Consistency": {
+      "name": "Session Consistency",
+      "status": "PASS",
+      "details": {
+        "tests": "                                    test         timestamp     filter  \\\n0            London open (Mon 07:00 UTC)  2025-01-06 07:00     London   \n1           London close (Mon 15:59 UTC)  2025-01-06 15:59     London   \n2      Post-London close (Mon 16:00 UTC)  2025-01-06 16:00     London   \n3       New York overlap (Mon 14:00 UTC)  2025-01-06 14:00  London_NY   \n4                   Asia (Mon 03:00 UTC)  2025-01-06 03:00  London_NY   \n5           Friday close (Fri 20:59 UTC)  2025-01-10 20:59         NY   \n6            Sunday open (Sun 22:00 UTC)  2025-01-05 22:00  London_NY   \n7                Weekend (Sat 12:00 UTC)  2025-01-04 12:00     London   \n8  DST transition (2025-03-30 12:00 UTC)  2025-03-30 12:00     London   \n\n   expected  actual detected_session  weekend result  \n0      True    True           LONDON    False   PASS  \n1      True    True          OVERLAP    False   PASS  \n2     False   False         NEW_YORK    False   PASS  \n3      True    True          OVERLAP    False   PASS  \n4     False   False             ASIA    False   PASS  \n5      True    True         NEW_YORK    False   PASS  \n6     False   False             ASIA     True   PASS  \n7      True    True           LONDON     True   PASS  \n8      True    True           LONDON     True   PASS  ",
+        "warnings": [
+          "Session filter has no explicit weekend guard: Weekend (Sat 12:00 UTC) returned True. Dormant in practice because OHLCV panels contain no weekend bars."
+        ]
+      },
+      "message": ""
+    }
+  }
+}

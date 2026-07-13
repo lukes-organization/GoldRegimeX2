@@ -1,0 +1,3 @@
+from_stage,to_stage,stage_removed,lost_count
+TREND_PULLBACK,BACKTEST,BACKTEST,0
+BACKTEST,EXECUTED,EXECUTED,1700

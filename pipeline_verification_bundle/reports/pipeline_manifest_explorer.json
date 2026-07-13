@@ -1,0 +1,14 @@
+{
+  "pipeline_version": "gxr-verify@1.0.0",
+  "strategy_version": "trend_pullback@v1",
+  "feature_set_hash": "c287462915067d2b",
+  "session_filter_hash": "2e32a85f9217264a",
+  "candidate_count": 26021,
+  "candidate_ids_hash": "8fea9fe6b5cb9a1b",
+  "train_hash": "{\"M15\": \"f7cd61210e9ed0437dc0ff67fb624f40674c8d5aa3d4c8e07f584eed76567123\", \"M5\": \"da2e265acdf14363ce7124eae92def94ab8f6efa1c6f922e8161c24ce7dc0203\"}",
+  "oos_hash": "{\"M15\": \"b548a471b9a65b5eccd0ba72fdb3c97ce276a3b0b4af6c94950250c739214c23\", \"M5\": \"a04fc24ed6fe64f9e68c0de966ed1464b8c11c779372f97fc94d55029f871dbe\"}",
+  "per_timeframe_counts": {
+    "M15": 6725,
+    "M5": 19296
+  }
+}

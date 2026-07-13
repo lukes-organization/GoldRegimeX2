@@ -1,0 +1,14 @@
+{
+  "pipeline_version": "gxr-verify@1.0.0",
+  "strategy_version": "trend_pullback@v1",
+  "feature_set_hash": "8d23ba410e018cd3",
+  "session_filter_hash": "2e32a85f9217264a",
+  "candidate_count": 7642560,
+  "candidate_ids_hash": "0efc8e74c1ca130f",
+  "train_hash": "",
+  "oos_hash": "",
+  "per_timeframe_counts": {
+    "M5": 6109359,
+    "M15": 1533201
+  }
+}

@@ -1,0 +1,12 @@
+category,status
+Train/OOS Separation,PASS
+Feature Leakage,FAIL
+Evaluation Integrity,SKIPPED
+Prediction Alignment,SKIPPED
+Session Consistency,PASS
+Candidate Integrity,FAIL
+Model Reuse,SKIPPED
+Threshold Verification,PASS
+Probability Calibration,PASS
+Root Cause Analysis,PASS
+Dataset Integrity,PASS

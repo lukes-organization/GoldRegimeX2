@@ -1,0 +1,1101 @@
+Top 100 rejected M15 candidates (of 594 lost)
+------------------------------------------------------------
+Candidate 100000
+  Strategy: trend_pull
+  Time: 2026-06-01 00:00 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.1928 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.19 < 0.6)
+
+Candidate 100001
+  Strategy: trend_pull
+  Time: 2026-06-01 00:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.4255 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.43 < 0.6)
+
+Candidate 100002
+  Strategy: trend_pull
+  Time: 2026-06-01 00:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.1059 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.11 < 0.6)
+
+Candidate 100003
+  Strategy: trend_pull
+  Time: 2026-06-01 00:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100004
+  Strategy: trend_pull
+  Time: 2026-06-01 01:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100005
+  Strategy: trend_pull
+  Time: 2026-06-01 01:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100006
+  Strategy: trend_pull
+  Time: 2026-06-01 01:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100007
+  Strategy: trend_pull
+  Time: 2026-06-01 01:45 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.0688 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.07 < 0.6)
+
+Candidate 100008
+  Strategy: trend_pull
+  Time: 2026-06-01 02:00 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: FAIL
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by HMM (unfavourable regime)
+
+Candidate 100009
+  Strategy: trend_pull
+  Time: 2026-06-01 02:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.4215 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.42 < 0.6)
+
+Candidate 100010
+  Strategy: trend_pull
+  Time: 2026-06-01 02:30 UTC
+  Session: PASS
+  TBM: FAIL
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by TBM (TBM timeout)
+
+Candidate 100011
+  Strategy: trend_pull
+  Time: 2026-06-01 02:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100012
+  Strategy: trend_pull
+  Time: 2026-06-01 03:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100013
+  Strategy: trend_pull
+  Time: 2026-06-01 03:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: FAIL
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by HMM (unfavourable regime)
+
+Candidate 100014
+  Strategy: trend_pull
+  Time: 2026-06-01 03:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100015
+  Strategy: trend_pull
+  Time: 2026-06-01 03:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100016
+  Strategy: trend_pull
+  Time: 2026-06-01 04:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100017
+  Strategy: trend_pull
+  Time: 2026-06-01 04:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.4564 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.46 < 0.6)
+
+Candidate 100018
+  Strategy: trend_pull
+  Time: 2026-06-01 04:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100019
+  Strategy: trend_pull
+  Time: 2026-06-01 04:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100020
+  Strategy: trend_pull
+  Time: 2026-06-01 05:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100021
+  Strategy: trend_pull
+  Time: 2026-06-01 05:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100022
+  Strategy: trend_pull
+  Time: 2026-06-01 05:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100023
+  Strategy: trend_pull
+  Time: 2026-06-01 05:45 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.0410 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.04 < 0.6)
+
+Candidate 100024
+  Strategy: trend_pull
+  Time: 2026-06-01 06:00 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.2641 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.26 < 0.6)
+
+Candidate 100025
+  Strategy: trend_pull
+  Time: 2026-06-01 06:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100026
+  Strategy: trend_pull
+  Time: 2026-06-01 06:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.1568 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.16 < 0.6)
+
+Candidate 100027
+  Strategy: trend_pull
+  Time: 2026-06-01 06:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100028
+  Strategy: trend_pull
+  Time: 2026-06-01 07:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100029
+  Strategy: trend_pull
+  Time: 2026-06-01 07:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100030
+  Strategy: trend_pull
+  Time: 2026-06-01 07:30 UTC
+  Session: PASS
+  TBM: FAIL
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by TBM (TBM timeout)
+
+Candidate 100031
+  Strategy: trend_pull
+  Time: 2026-06-01 07:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100032
+  Strategy: trend_pull
+  Time: 2026-06-01 08:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100033
+  Strategy: trend_pull
+  Time: 2026-06-01 08:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100034
+  Strategy: trend_pull
+  Time: 2026-06-01 08:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.3792 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.38 < 0.6)
+
+Candidate 100035
+  Strategy: trend_pull
+  Time: 2026-06-01 08:45 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.4979 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.50 < 0.6)
+
+Candidate 100036
+  Strategy: trend_pull
+  Time: 2026-06-01 09:00 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.1337 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.13 < 0.6)
+
+Candidate 100037
+  Strategy: trend_pull
+  Time: 2026-06-01 09:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.2443 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.24 < 0.6)
+
+Candidate 100038
+  Strategy: trend_pull
+  Time: 2026-06-01 09:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.1887 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.19 < 0.6)
+
+Candidate 100039
+  Strategy: trend_pull
+  Time: 2026-06-01 09:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100040
+  Strategy: trend_pull
+  Time: 2026-06-01 10:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100041
+  Strategy: trend_pull
+  Time: 2026-06-01 10:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.3176 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.32 < 0.6)
+
+Candidate 100042
+  Strategy: trend_pull
+  Time: 2026-06-01 10:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100043
+  Strategy: trend_pull
+  Time: 2026-06-01 10:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100044
+  Strategy: trend_pull
+  Time: 2026-06-01 11:00 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.2146 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.21 < 0.6)
+
+Candidate 100045
+  Strategy: trend_pull
+  Time: 2026-06-01 11:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100046
+  Strategy: trend_pull
+  Time: 2026-06-01 11:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100047
+  Strategy: trend_pull
+  Time: 2026-06-01 11:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100048
+  Strategy: trend_pull
+  Time: 2026-06-01 12:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100049
+  Strategy: trend_pull
+  Time: 2026-06-01 12:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.4996 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.50 < 0.6)
+
+Candidate 100050
+  Strategy: trend_pull
+  Time: 2026-06-01 12:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.2354 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.24 < 0.6)
+
+Candidate 100051
+  Strategy: trend_pull
+  Time: 2026-06-01 12:45 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.1923 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.19 < 0.6)
+
+Candidate 100052
+  Strategy: trend_pull
+  Time: 2026-06-01 13:00 UTC
+  Session: PASS
+  TBM: FAIL
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by TBM (TBM timeout)
+
+Candidate 100053
+  Strategy: trend_pull
+  Time: 2026-06-01 13:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100054
+  Strategy: trend_pull
+  Time: 2026-06-01 13:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100055
+  Strategy: trend_pull
+  Time: 2026-06-01 13:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100056
+  Strategy: trend_pull
+  Time: 2026-06-01 14:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100057
+  Strategy: trend_pull
+  Time: 2026-06-01 14:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100058
+  Strategy: trend_pull
+  Time: 2026-06-01 14:30 UTC
+  Session: PASS
+  TBM: FAIL
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by TBM (TBM timeout)
+
+Candidate 100059
+  Strategy: trend_pull
+  Time: 2026-06-01 14:45 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.1851 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.19 < 0.6)
+
+Candidate 100060
+  Strategy: trend_pull
+  Time: 2026-06-01 15:00 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.3087 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.31 < 0.6)
+
+Candidate 100061
+  Strategy: trend_pull
+  Time: 2026-06-01 15:15 UTC
+  Session: PASS
+  TBM: FAIL
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by TBM (TBM timeout)
+
+Candidate 100062
+  Strategy: trend_pull
+  Time: 2026-06-01 15:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100063
+  Strategy: trend_pull
+  Time: 2026-06-01 15:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100064
+  Strategy: trend_pull
+  Time: 2026-06-01 16:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100065
+  Strategy: trend_pull
+  Time: 2026-06-01 16:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.0319 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.03 < 0.6)
+
+Candidate 100066
+  Strategy: trend_pull
+  Time: 2026-06-01 16:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.1070 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.11 < 0.6)
+
+Candidate 100067
+  Strategy: trend_pull
+  Time: 2026-06-01 16:45 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.1178 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.12 < 0.6)
+
+Candidate 100068
+  Strategy: trend_pull
+  Time: 2026-06-01 17:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100069
+  Strategy: trend_pull
+  Time: 2026-06-01 17:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.4158 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.42 < 0.6)
+
+Candidate 100070
+  Strategy: trend_pull
+  Time: 2026-06-01 17:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100071
+  Strategy: trend_pull
+  Time: 2026-06-01 17:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100072
+  Strategy: trend_pull
+  Time: 2026-06-01 18:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100073
+  Strategy: trend_pull
+  Time: 2026-06-01 18:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 1
+  HMM Decision: PASS
+  Probability: 0.0785 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.08 < 0.6)
+
+Candidate 100074
+  Strategy: trend_pull
+  Time: 2026-06-01 18:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100075
+  Strategy: trend_pull
+  Time: 2026-06-01 18:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100076
+  Strategy: trend_pull
+  Time: 2026-06-01 19:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100077
+  Strategy: trend_pull
+  Time: 2026-06-01 19:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: FAIL
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by HMM (unfavourable regime)
+
+Candidate 100078
+  Strategy: trend_pull
+  Time: 2026-06-01 19:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.2235 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.22 < 0.6)
+
+Candidate 100079
+  Strategy: trend_pull
+  Time: 2026-06-01 19:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100080
+  Strategy: trend_pull
+  Time: 2026-06-01 20:00 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.3888 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.39 < 0.6)
+
+Candidate 100081
+  Strategy: trend_pull
+  Time: 2026-06-01 20:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.2966 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.30 < 0.6)
+
+Candidate 100082
+  Strategy: trend_pull
+  Time: 2026-06-01 20:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.4441 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.44 < 0.6)
+
+Candidate 100083
+  Strategy: trend_pull
+  Time: 2026-06-01 20:45 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.3998 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.40 < 0.6)
+
+Candidate 100084
+  Strategy: trend_pull
+  Time: 2026-06-01 21:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100085
+  Strategy: trend_pull
+  Time: 2026-06-01 21:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.4966 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.50 < 0.6)
+
+Candidate 100086
+  Strategy: trend_pull
+  Time: 2026-06-01 21:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100087
+  Strategy: trend_pull
+  Time: 2026-06-01 21:45 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.2177 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.22 < 0.6)
+
+Candidate 100088
+  Strategy: trend_pull
+  Time: 2026-06-01 22:00 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 2
+  HMM Decision: PASS
+  Probability: 0.1002 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.10 < 0.6)
+
+Candidate 100089
+  Strategy: trend_pull
+  Time: 2026-06-01 22:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: FAIL
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by HMM (unfavourable regime)
+
+Candidate 100090
+  Strategy: trend_pull
+  Time: 2026-06-01 22:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.4048 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.40 < 0.6)
+
+Candidate 100091
+  Strategy: trend_pull
+  Time: 2026-06-01 22:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100092
+  Strategy: trend_pull
+  Time: 2026-06-01 23:00 UTC
+  Session: PASS
+  TBM: FAIL
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by TBM (TBM timeout)
+
+Candidate 100093
+  Strategy: trend_pull
+  Time: 2026-06-01 23:15 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100094
+  Strategy: trend_pull
+  Time: 2026-06-01 23:30 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100095
+  Strategy: trend_pull
+  Time: 2026-06-01 23:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100096
+  Strategy: trend_pull
+  Time: 2026-06-02 00:00 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)
+
+Candidate 100097
+  Strategy: trend_pull
+  Time: 2026-06-02 00:15 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: FAIL
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by HMM (unfavourable regime)
+
+Candidate 100098
+  Strategy: trend_pull
+  Time: 2026-06-02 00:30 UTC
+  Session: PASS
+  TBM: PASS
+  HMM State: 0
+  HMM Decision: PASS
+  Probability: 0.3815 (threshold 0.6000)
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Threshold (prob 0.38 < 0.6)
+
+Candidate 100099
+  Strategy: trend_pull
+  Time: 2026-06-02 00:45 UTC
+  Session: FAIL
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by Session (outside session)

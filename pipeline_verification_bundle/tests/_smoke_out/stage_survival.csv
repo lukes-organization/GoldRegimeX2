@@ -1,0 +1,10 @@
+Stage,M15 Remaining,M15 %,M5 Remaining,M5 %
+Generated,600,100.0,1200,100.0
+FeatureEngineering,600,100.0,1200,100.0
+Session,257,42.83,1074,89.5
+TBM,231,38.5,962,80.17
+HMM,206,34.33,853,71.08
+Probability,206,34.33,853,71.08
+Threshold,6,1.0,26,2.17
+Risk,6,1.0,24,2.0
+Executed,6,1.0,24,2.0

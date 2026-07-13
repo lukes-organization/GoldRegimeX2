@@ -83,24 +83,57 @@ except Exception:
 # =========================================================================
 @dataclass
 class CandidateTrace:
-    """One trace per generated candidate. Immutable identity, mutable stage flags."""
+    """One trace per generated candidate. Immutable identity, mutable stage flags.
+
+    Matches the Phase 2 lifecycle spec verbatim. Some legacy field names
+    (feature_engineering, probability, probability_pass) are preserved as
+    aliases via @property so older code keeps working.
+    """
     candidate_id: int
     timeframe: str
     timestamp: pd.Timestamp
     strategy: str
     generated: bool = True
-    feature_engineering: bool = False
+    feature_engineering_pass: bool = False
     session_pass: bool = False
+    session_name: Optional[str] = None
     tbm_pass: bool = False
-    hmm_state: int = -1
+    hmm_state: Optional[int] = None
+    hmm_probability: Optional[float] = None
     hmm_pass: bool = False
-    probability: float = float("nan")
-    threshold: float = float("nan")
-    probability_pass: bool = False
+    xgb_probability: Optional[float] = None
+    threshold: Optional[float] = None
+    threshold_pass: bool = False
     risk_pass: bool = False
     executed: bool = False
-    rejection_reason: Optional[str] = None
     rejection_stage: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    history: List[Dict[str, Any]] = field(default_factory=list)
+
+    # ---- Backwards-compat aliases --------------------------------------
+    @property
+    def feature_engineering(self) -> bool:
+        return self.feature_engineering_pass
+
+    @feature_engineering.setter
+    def feature_engineering(self, v: bool) -> None:
+        self.feature_engineering_pass = bool(v)
+
+    @property
+    def probability(self) -> Optional[float]:
+        return self.xgb_probability
+
+    @probability.setter
+    def probability(self, v: Optional[float]) -> None:
+        self.xgb_probability = None if v is None else float(v)
+
+    @property
+    def probability_pass(self) -> bool:
+        return self.threshold_pass
+
+    @probability_pass.setter
+    def probability_pass(self, v: bool) -> None:
+        self.threshold_pass = bool(v)
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -118,18 +151,33 @@ STAGE_ORDER: Tuple[str, ...] = (
     "TBM",
     "HMM",
     "Probability",
+    "Threshold",
     "Risk",
     "Executed",
 )
 
+# Human-friendly stage names used in reports (spec wording).
+STAGE_DISPLAY_NAMES: Dict[str, str] = {
+    "Generated":          "Generated",
+    "FeatureEngineering": "Feature Engineering",
+    "Session":            "Session",
+    "TBM":                "TBM",
+    "HMM":                "HMM",
+    "Probability":        "Probability",
+    "Threshold":          "Threshold",
+    "Risk":               "Risk Manager",
+    "Executed":           "Executed",
+}
+
 # Which CandidateTrace flag corresponds to each stage's "passed?" bit.
 _STAGE_TO_FLAG: Dict[str, str] = {
     "Generated":          "generated",
-    "FeatureEngineering": "feature_engineering",
+    "FeatureEngineering": "feature_engineering_pass",
     "Session":            "session_pass",
     "TBM":                "tbm_pass",
     "HMM":                "hmm_pass",
-    "Probability":        "probability_pass",
+    "Probability":        "threshold_pass",  # legacy: raw prob computed => set threshold_pass
+    "Threshold":          "threshold_pass",
     "Risk":               "risk_pass",
     "Executed":           "executed",
 }
@@ -175,6 +223,47 @@ class CandidateLedger:
 
     def __len__(self) -> int:
         return len(self._traces)
+
+    # ---- Compatibility shims used by PipelineLogger and helpers --------
+    def add(self, trace: CandidateTrace) -> CandidateTrace:
+        k = self._key(trace.timeframe, trace.candidate_id)
+        if k not in self._traces:
+            self._traces[k] = trace
+        return self._traces[k]
+
+    def list_all(self) -> List[CandidateTrace]:
+        return list(self._traces.values())
+
+    def list_by_tf(self, tf: str) -> List[CandidateTrace]:
+        return self.all_for_tf(tf)
+
+    def record_stage(self, cid: Any, tf: str, stage: str,
+                     passed: bool, reason: str = "") -> CandidateTrace:
+        """Mark a stage as passed/failed on the trace and populate rejection info."""
+        # Coerce cid to int if possible (matches internal key type).
+        try:
+            cid_i = int(cid)
+        except Exception:
+            cid_i = hash(str(cid)) & 0x7fffffff
+        tf_u = str(tf).upper()
+        k = self._key(tf_u, cid_i)
+        tr = self._traces.get(k)
+        if tr is None:
+            tr = CandidateTrace(
+                candidate_id=cid_i, timeframe=tf_u,
+                timestamp=pd.Timestamp.utcnow(), strategy="unknown",
+            )
+            self._traces[k] = tr
+        flag = _STAGE_TO_FLAG.get(stage)
+        if flag is not None:
+            setattr(tr, flag, bool(passed))
+        if not passed:
+            if not reason:
+                raise ValueError("record_stage requires a reason when passed=False")
+            if tr.rejection_stage is None:  # first rejection wins
+                tr.rejection_stage = stage
+                tr.rejection_reason = reason
+        return tr
 
 
 # =========================================================================
@@ -677,11 +766,16 @@ def explain_lost_trades(
     lines: List[str] = []
     for t in lost:
         rej_stage = t.rejection_stage or "(unknown)"
-        prob_line = (
-            "Probability: %.4f (threshold %.4f)" % (t.probability, t.threshold)
-            if not math.isnan(t.probability) else
-            "Probability: Not Evaluated"
-        )
+        _prob = t.probability
+        _thr = t.threshold
+        _prob_is_num = _prob is not None and not (isinstance(_prob, float) and math.isnan(_prob))
+        _thr_is_num = _thr is not None and not (isinstance(_thr, float) and math.isnan(_thr))
+        if _prob_is_num and _thr_is_num:
+            prob_line = "Probability: %.4f (threshold %.4f)" % (float(_prob), float(_thr))
+        elif _prob_is_num:
+            prob_line = "Probability: %.4f (threshold N/A)" % float(_prob)
+        else:
+            prob_line = "Probability: Not Evaluated"
         lines.append(
             "Candidate %d\n"
             "  Strategy: %s\n"
@@ -698,7 +792,7 @@ def explain_lost_trades(
                 pd.Timestamp(t.timestamp).strftime("%Y-%m-%d %H:%M UTC"),
                 _fmt_stage(t.session_pass, "Session", rej_stage),
                 _fmt_stage(t.tbm_pass, "TBM", rej_stage),
-                (str(t.hmm_state) if t.hmm_state >= 0 else "Not Evaluated"),
+                (str(t.hmm_state) if t.hmm_state is not None and t.hmm_state >= 0 else "Not Evaluated"),
                 _fmt_stage(t.hmm_pass, "HMM", rej_stage),
                 prob_line,
                 _fmt_stage(t.risk_pass, "Risk", rej_stage),
@@ -1008,6 +1102,14 @@ class PipelineObservability:
         self.feature_drift_frames[str(tf).upper()] = df
         return df
 
+    def record_feature_drift(self, tf: str, df: pd.DataFrame) -> None:
+        """Attach a pre-computed drift DataFrame directly (convenience).
+
+        Expected columns: `feature`, `psi`, `ks`, `mean_shift`, `std_shift`, `flag`.
+        Missing columns are tolerated -- the frame is written out as-is.
+        """
+        self.feature_drift_frames[str(tf).upper()] = df.copy()
+
     # ---- Phase 9: reconciliation ----------------------------------------
     def record_reconciliation(self, tf: str, stage_counts: Dict[str, int]) -> None:
         self.reconciliation_counts[str(tf).upper()] = {k: int(v) for k, v in stage_counts.items()}
@@ -1116,9 +1218,40 @@ class PipelineObservability:
                 for w in gap_warnings:
                     print("  - " + w)
 
+        # ---- Phase 4/7/9/11 spec-named aliases -------------------------
+        # Duplicate the CSV content under the exact filenames required by
+        # the implementation prompt so both naming conventions coexist.
+        decisions_spec_path = write_candidate_decisions_spec(
+            self.decisions, out / "candidate_decisions.csv",
+        )  # spec header (overwrites the legacy header for this file)
+        feature_drift_report_path = out / "feature_drift_report.csv"
+        pd.DataFrame(drift_rows).to_csv(feature_drift_report_path, index=False)
+        probability_report_path = out / "probability_report.csv"
+        pd.DataFrame(prob_rows).to_csv(probability_report_path, index=False)
+        candidate_integrity_path = write_candidate_integrity_csv(
+            self.ledger, path=out / "candidate_integrity.csv",
+        )
+
+        # ---- Phase 12/13 top-100 rejected per timeframe ----------------
+        top100_paths: Dict[str, str] = {}
+        tfs = self.ledger.timeframes() or ["M15", "M5"]
+        for tf in sorted(set([t.upper() for t in tfs] + ["M15", "M5"])):
+            p = write_top_n_rejected(
+                self.ledger, tf, out / ("top100_rejected_%s.csv" % tf), limit=100,
+            )
+            top100_paths[tf] = str(p)
+
+        if verbose:
+            print(dashboard)
+            if gap_warnings:
+                print("\nSurvival gap warnings:")
+                for w in gap_warnings:
+                    print("  - " + w)
+
         return {
             "run_id": self.run_id,
-            "decisions_csv": str(decisions_path),
+            # Legacy names (kept for backwards compat)
+            "decisions_csv": str(decisions_spec_path),
             "survival_csv": str(survival_path),
             "hmm_txt": str(hmm_path),
             "probability_csv": str(prob_path),
@@ -1130,9 +1263,15 @@ class PipelineObservability:
             "pipeline_health_txt": str(health_path),
             "pipeline_audit_json": str(audit_path),
             "survival_gap_warnings": gap_warnings,
+            # Spec-mandated names (Phases 4/7/9/11/12/13)
+            "candidate_decisions_csv":  str(decisions_spec_path),
+            "feature_drift_report_csv": str(feature_drift_report_path),
+            "probability_report_csv":   str(probability_report_path),
+            "candidate_integrity_csv":  str(candidate_integrity_path),
+            "top100_rejected_paths":    top100_paths,
         }
 
-    # ---- Aggregated JSON audit artifact ---------------------------------
+    # ---- Aggregated JSON audit artifact (Phase 5 spec-shape) ------------
     def _write_audit_json(
         self,
         path: os.PathLike,
@@ -1141,12 +1280,34 @@ class PipelineObservability:
         gap_warnings: List[str],
         dashboard: str,
     ) -> Path:
-        tfs = self.ledger.timeframes()
+        # Ensure both spec timeframes always appear in the JSON, even if
+        # the ledger only saw one -- otherwise downstream consumers may
+        # fail their key lookups.
+        tfs = sorted(set([tf.upper() for tf in self.ledger.timeframes()] + ["M15", "M5"]))
+
+        # Phase 5 requires exactly these keys per timeframe.
+        spec_timeframes: Dict[str, Dict[str, int]] = {}
+        # Extended per-tf details (kept alongside so we don't lose fidelity).
         per_tf_summary: Dict[str, Any] = {}
+
         for tf in tfs:
             traces = self.ledger.all_for_tf(tf)
             gen = len(traces)
+            session_pass = sum(1 for t in traces if t.session_pass)
+            tbm_pass = sum(1 for t in traces if t.tbm_pass)
+            hmm_pass = sum(1 for t in traces if t.hmm_pass)
+            threshold_pass = sum(1 for t in traces if t.threshold_pass)
             execd = sum(1 for t in traces if t.executed)
+
+            spec_timeframes[tf] = {
+                "generated":      int(gen),
+                "session_pass":   int(session_pass),
+                "tbm_pass":       int(tbm_pass),
+                "hmm_pass":       int(hmm_pass),
+                "threshold_pass": int(threshold_pass),
+                "executed":       int(execd),
+            }
+
             bottleneck_stage, bottleneck_drop = bottleneck_for_tf(matrix, tf)
             per_tf_summary[tf] = {
                 "generated": gen,
@@ -1166,7 +1327,12 @@ class PipelineObservability:
             }
 
         payload = {
-            "run_id": self.run_id,
+            # ---- Phase 5 canonical keys ----
+            "experiment_id":   self.run_id,
+            "timestamp":       pd.Timestamp.utcnow().isoformat(),
+            "timeframes":      spec_timeframes,
+            # ---- Extended fields (kept for full audit fidelity) ----
+            "run_id":          self.run_id,
             "generated_at_utc": pd.Timestamp.utcnow().isoformat(),
             "integrity_flags": integrity_flags,
             "survival_matrix": matrix.to_dict(orient="records"),
@@ -1202,3 +1368,437 @@ __all__ = [
     "explain_lost_trades",
     "render_health_dashboard",
 ]
+
+
+# =========================================================================
+# PHASE 3 -- PipelineLogger (thin facade around DecisionLog + CandidateLedger)
+# =========================================================================
+class PipelineLogger:
+    """Unified event logger.
+
+    Every pipeline stage calls `logger.log(candidate_id, timeframe, stage,
+    decision, details=None)`. Under the hood this both:
+      * appends a row to the DecisionLog (rendered as candidate_decisions.csv),
+      * updates the corresponding CandidateTrace flag in the CandidateLedger.
+
+    `decision` is a case-insensitive string; "PASS"/"ACCEPT"/"OK"/"EXECUTED"
+    map to passed=True, everything else to passed=False.
+    """
+
+    _PASS_TOKENS = {"PASS", "ACCEPT", "ACCEPTED", "OK", "EXECUTED", "TRUE", "YES"}
+
+    def __init__(self, ledger: "CandidateLedger", decisions: "DecisionLog") -> None:
+        self.ledger = ledger
+        self.decisions = decisions
+
+    def log(
+        self,
+        candidate_id: Any,
+        timeframe: str,
+        stage: str,
+        decision: Any,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        details = dict(details or {})
+        decision_str = str(decision).upper()
+        passed = decision_str in self._PASS_TOKENS or decision_str == "TRUE"
+        reason = str(details.pop("reason", "") or "")
+        if not passed and not reason:
+            reason = "Rejected at %s" % stage
+        strategy = str(details.pop("strategy", "") or "")
+        timestamp = details.pop("timestamp", None)
+
+        # Ensure the candidate exists in the ledger before we mark a stage.
+        tf_u = str(timeframe).upper()
+        try:
+            cid_i = int(candidate_id)
+        except Exception:
+            cid_i = hash(str(candidate_id)) & 0x7fffffff
+        tr = self.ledger.get(cid_i, tf_u)
+        if tr is None:
+            tr = self.ledger.add(CandidateTrace(
+                candidate_id=cid_i,
+                timeframe=tf_u,
+                timestamp=pd.Timestamp(timestamp) if timestamp is not None else pd.Timestamp.utcnow(),
+                strategy=strategy or "unknown",
+            ))
+
+        # Update stage-specific fields from `details` before recording.
+        if "session_name" in details:
+            tr.session_name = str(details["session_name"])
+        if "hmm_state" in details:
+            try: tr.hmm_state = int(details["hmm_state"])
+            except Exception: pass
+        if "hmm_probability" in details:
+            try: tr.hmm_probability = float(details["hmm_probability"])
+            except Exception: pass
+        if "xgb_probability" in details:
+            try: tr.xgb_probability = float(details["xgb_probability"])
+            except Exception: pass
+        if "probability" in details and tr.xgb_probability is None:
+            try: tr.xgb_probability = float(details["probability"])
+            except Exception: pass
+        if "threshold" in details:
+            try: tr.threshold = float(details["threshold"])
+            except Exception: pass
+
+        # Record in the ledger's stage tracker (handles rejection_stage/reason).
+        try:
+            self.ledger.record_stage(candidate_id, tf_u, stage, passed=passed, reason=reason)
+        except ValueError:
+            # record_stage requires a non-empty reason for failures.
+            self.ledger.record_stage(candidate_id, tf_u, stage, passed=False,
+                                    reason=reason or ("Rejected at %s" % stage))
+
+        # Append to the decision log.
+        self.decisions.append(
+            candidate_id=int(candidate_id) if isinstance(candidate_id, (int, np.integer)) else
+                (hash(str(candidate_id)) & 0x7fffffff),
+            timeframe=tf_u,
+            stage=stage,
+            decision="PASS" if passed else "REJECT",
+            reason=reason if not passed else "",
+            timestamp=pd.Timestamp(timestamp) if timestamp is not None else
+                     pd.Timestamp(tr.timestamp) if tr.timestamp is not None else None,
+            strategy=strategy or tr.strategy,
+        )
+
+        # Append to the trace's own history for full lifecycle replay.
+        tr.history.append({
+            "stage": stage,
+            "decision": "PASS" if passed else "REJECT",
+            "reason": reason,
+            "details": details,
+        })
+
+
+# =========================================================================
+# PHASE 14 -- Model Consistency (Training/Evaluation/Export UUID)
+# =========================================================================
+import uuid as _uuid
+
+
+class ModelUUIDTracker:
+    """Records the UUID assigned at each model checkpoint and verifies equality.
+
+    Usage:
+        tracker = ModelUUIDTracker()
+        model_uuid = tracker.mint_training_uuid("M15")
+        # ... after evaluation ...
+        tracker.record_evaluation_uuid("M15", model_uuid)
+        # ... after export ...
+        tracker.record_export_uuid("M15", model_uuid)
+        report = tracker.verify_all()  # -> {"M15": {"status": "PASS", ...}, ...}
+    """
+
+    def __init__(self) -> None:
+        self._by_tf: Dict[str, Dict[str, Optional[str]]] = {}
+
+    def _entry(self, tf: str) -> Dict[str, Optional[str]]:
+        return self._by_tf.setdefault(str(tf).upper(), {
+            "training": None, "evaluation": None, "export": None,
+        })
+
+    def mint_training_uuid(self, tf: str) -> str:
+        u = str(_uuid.uuid4())
+        self._entry(tf)["training"] = u
+        return u
+
+    def record_training_uuid(self, tf: str, u: str) -> None:
+        self._entry(tf)["training"] = str(u)
+
+    def record_evaluation_uuid(self, tf: str, u: str) -> None:
+        self._entry(tf)["evaluation"] = str(u)
+
+    def record_export_uuid(self, tf: str, u: str) -> None:
+        self._entry(tf)["export"] = str(u)
+
+    def verify(self, tf: str) -> Dict[str, Any]:
+        e = self._by_tf.get(str(tf).upper())
+        if not e:
+            return {"status": "MISSING", "tf": tf, "uuids": {}}
+        seen = [v for v in e.values() if v is not None]
+        all_present = all(v is not None for v in e.values())
+        all_equal = all_present and len(set(seen)) == 1
+        return {
+            "status": "PASS" if all_equal else ("PARTIAL" if seen else "MISSING"),
+            "tf": tf,
+            "uuids": dict(e),
+            "all_present": all_present,
+            "all_equal": all_equal,
+        }
+
+    def verify_all(self) -> Dict[str, Dict[str, Any]]:
+        return {tf: self.verify(tf) for tf in self._by_tf}
+
+
+# =========================================================================
+# PHASE 15 -- Cross-Notebook Manifest
+# =========================================================================
+import hashlib as _hashlib
+
+
+class PipelineManifest:
+    """Read/write the shared manifest used to guarantee Strategy Tester and
+    Explorer are looking at the same pipeline artifacts.
+
+    Strategy Tester writes the manifest at the end of its run.
+    Explorer validates the manifest at the beginning of its run and aborts
+    if any hash does not match its own recomputed value.
+    """
+
+    KEYS: Tuple[str, ...] = (
+        "feature_hash", "session_filter_hash", "strategy_hash",
+        "candidate_hash", "model_hash", "pipeline_version",
+    )
+
+    def __init__(self, path: os.PathLike = "reports/pipeline_manifest.json") -> None:
+        self.path = Path(path)
+        self.data: Dict[str, Any] = {}
+
+    # ---- Hash helpers ---------------------------------------------------
+    @staticmethod
+    def hash_object(obj: Any) -> str:
+        """Deterministic hash of a JSON-serialisable object.
+
+        Falls back to str(obj) for non-serialisable values so we don't
+        raise inside a manifest write.
+        """
+        try:
+            payload = json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+        except Exception:
+            payload = repr(obj).encode("utf-8")
+        return _hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def hash_dataframe(df: "pd.DataFrame") -> str:
+        try:
+            # Use pandas' own hash to be robust to numeric noise.
+            from pandas.util import hash_pandas_object
+            h = hash_pandas_object(df, index=True).values.tobytes()
+        except Exception:
+            h = df.to_csv(index=True).encode("utf-8")
+        return _hashlib.sha256(h).hexdigest()
+
+    @staticmethod
+    def hash_file(path: os.PathLike) -> str:
+        p = Path(path)
+        if not p.exists():
+            return ""
+        h = _hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # ---- Write ----------------------------------------------------------
+    def write(
+        self,
+        *,
+        feature_hash: str,
+        session_filter_hash: str,
+        strategy_hash: str,
+        candidate_hash: str,
+        model_hash: str,
+        pipeline_version: str,
+        extras: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        self.data = {
+            "feature_hash":        str(feature_hash),
+            "session_filter_hash": str(session_filter_hash),
+            "strategy_hash":       str(strategy_hash),
+            "candidate_hash":      str(candidate_hash),
+            "model_hash":          str(model_hash),
+            "pipeline_version":    str(pipeline_version),
+            "written_at":          pd.Timestamp.utcnow().isoformat(),
+        }
+        if extras:
+            self.data["extras"] = extras
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(self.data, fh, indent=2)
+        return self.path
+
+    # ---- Read ----------------------------------------------------------
+    def load(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            raise FileNotFoundError("Manifest not found at %s" % self.path)
+        with open(self.path, "r", encoding="utf-8") as fh:
+            self.data = json.load(fh)
+        return self.data
+
+    # ---- Validate -------------------------------------------------------
+    def validate(self, expected: Dict[str, str], *, strict: bool = True) -> Dict[str, Any]:
+        """Compare loaded manifest against locally-recomputed hashes.
+
+        `expected` is a dict with any subset of self.KEYS. Only the keys
+        provided are checked. Returns {"status": "PASS"|"FAIL", "mismatches": [...]}.
+        Raises RuntimeError when strict=True and any hash mismatches.
+        """
+        if not self.data:
+            self.load()
+        mismatches = []
+        for k, exp in expected.items():
+            got = self.data.get(k, None)
+            if got != exp:
+                mismatches.append({"key": k, "manifest": got, "local": exp})
+        status = "PASS" if not mismatches else "FAIL"
+        report = {"status": status, "mismatches": mismatches, "checked": list(expected.keys())}
+        if strict and mismatches:
+            raise RuntimeError("Pipeline manifest hash mismatch: %s" % mismatches)
+        return report
+
+
+# =========================================================================
+# PHASES 12 & 13 -- Top 100 rejected trades (per timeframe)
+# =========================================================================
+def _decision_word(passed: Optional[bool]) -> str:
+    if passed is None:
+        return "N/A"
+    return "PASS" if bool(passed) else "REJECT"
+
+
+def top_n_rejected_frame(ledger: "CandidateLedger", timeframe: str, limit: int = 100) -> "pd.DataFrame":
+    """Build the Phase 12/13 top-N rejected schema for the given timeframe."""
+    tf_u = str(timeframe).upper()
+    rows: List[Dict[str, Any]] = []
+    for tr in ledger.list_by_tf(tf_u):
+        if tr.executed:
+            continue
+        rows.append({
+            "Candidate ID":         tr.candidate_id,
+            "Timestamp":            pd.Timestamp(tr.timestamp).isoformat() if tr.timestamp is not None else "",
+            "Strategy":             tr.strategy,
+            "Session Decision":     _decision_word(tr.session_pass),
+            "TBM Decision":         _decision_word(tr.tbm_pass),
+            "HMM State":            tr.hmm_state if tr.hmm_state is not None else "",
+            "HMM Decision":         _decision_word(tr.hmm_pass),
+            "XGBoost Probability":  tr.xgb_probability if tr.xgb_probability is not None else "",
+            "Threshold":            tr.threshold if tr.threshold is not None else "",
+            "Risk Decision":        _decision_word(tr.risk_pass),
+            "Final Rejection Stage": tr.rejection_stage or "",
+            "Rejection Reason":     tr.rejection_reason or "",
+        })
+    if not rows:
+        # Return empty frame with the mandated columns so downstream
+        # consumers never see a missing file.
+        return pd.DataFrame(columns=[
+            "Candidate ID", "Timestamp", "Strategy", "Session Decision",
+            "TBM Decision", "HMM State", "HMM Decision", "XGBoost Probability",
+            "Threshold", "Risk Decision", "Final Rejection Stage", "Rejection Reason",
+        ])
+    df = pd.DataFrame(rows)
+    # Preserve original rejection order (first-rejected first).
+    return df.head(int(limit)).reset_index(drop=True)
+
+
+def write_top_n_rejected(ledger: "CandidateLedger", timeframe: str, path: os.PathLike, limit: int = 100) -> Path:
+    df = top_n_rejected_frame(ledger, timeframe, limit=limit)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(p, index=False)
+    return p
+
+
+# =========================================================================
+# Phase 4 -- CSV export with the spec column names
+# =========================================================================
+def write_candidate_decisions_spec(decisions: "DecisionLog", path: os.PathLike) -> Path:
+    """Write candidate_decisions.csv with the exact Phase 4 header:
+         Candidate, TF, Timestamp, Stage, Decision, Reason
+    Every REJECT row is guaranteed to have a non-blank Reason.
+    """
+    df = decisions.as_frame()
+    if df.empty:
+        out = pd.DataFrame(columns=["Candidate", "TF", "Timestamp", "Stage", "Decision", "Reason"])
+    else:
+        out = pd.DataFrame({
+            "Candidate": df["candidate_id"],
+            "TF":        df["timeframe"],
+            "Timestamp": df["timestamp"],
+            "Stage":     df["stage"],
+            "Decision":  df["decision"],
+            "Reason":    df["reason"].fillna("").astype(str),
+        })
+        # Enforce Phase 4 invariant: rejection rows must have a reason.
+        mask = (out["Decision"].str.upper() == "REJECT") & (out["Reason"].str.len() == 0)
+        if mask.any():
+            out.loc[mask, "Reason"] = "Rejected at " + out.loc[mask, "Stage"].astype(str)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(p, index=False)
+    return p
+
+
+# =========================================================================
+# Phase 11 -- candidate_integrity.csv with the spec columns
+# =========================================================================
+def write_candidate_integrity_csv(
+    ledger: "CandidateLedger",
+    tester_ids: Optional[Sequence[Any]] = None,
+    explorer_ids: Optional[Sequence[Any]] = None,
+    path: os.PathLike = "reports/observability/candidate_integrity.csv",
+) -> Path:
+    """Emit the Phase 11 candidate integrity CSV.
+
+    Columns: Candidate ID | Strategy Tester Status | Explorer Status | Final Status
+
+    If `tester_ids` / `explorer_ids` are None, the ledger is treated as the
+    source of truth for both (i.e. single-notebook self-check).
+    """
+    ledger_ids = {tr.candidate_id for tr in ledger.list_all()}
+    t_set = set(tester_ids) if tester_ids is not None else ledger_ids
+    e_set = set(explorer_ids) if explorer_ids is not None else ledger_ids
+    all_ids = sorted(ledger_ids | t_set | e_set, key=lambda x: str(x))
+    rows = []
+    for cid in all_ids:
+        in_t = cid in t_set
+        in_e = cid in e_set
+        tr = None
+        try:
+            # Attempt to find any trace with this id, across timeframes.
+            for _tr in ledger.list_all():
+                if _tr.candidate_id == cid:
+                    tr = _tr; break
+        except Exception:
+            pass
+        if tr is not None and tr.executed:
+            final = "EXECUTED"
+        elif tr is not None and tr.rejection_stage:
+            final = "REJECTED @ %s" % tr.rejection_stage
+        elif not in_t or not in_e:
+            final = "MISSING (%s%s)" % (
+                "tester" if not in_t else "", "explorer" if not in_e else "",
+            )
+        else:
+            final = "UNKNOWN"
+        rows.append({
+            "Candidate ID":            cid,
+            "Strategy Tester Status":  "PRESENT" if in_t else "MISSING",
+            "Explorer Status":         "PRESENT" if in_e else "MISSING",
+            "Final Status":            final,
+        })
+    df = pd.DataFrame(rows, columns=["Candidate ID", "Strategy Tester Status",
+                                     "Explorer Status", "Final Status"])
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(p, index=False)
+    return p
+
+
+# =========================================================================
+# Update __all__
+# =========================================================================
+try:
+    __all__.extend([
+        "PipelineLogger",
+        "ModelUUIDTracker",
+        "PipelineManifest",
+        "top_n_rejected_frame",
+        "write_top_n_rejected",
+        "write_candidate_decisions_spec",
+        "write_candidate_integrity_csv",
+        "STAGE_DISPLAY_NAMES",
+    ])
+except NameError:
+    pass
