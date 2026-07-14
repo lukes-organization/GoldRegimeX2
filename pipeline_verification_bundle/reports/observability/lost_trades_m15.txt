@@ -1,3 +1,1101 @@
-Top 0 rejected M15 candidates (of 0 lost)
+Top 100 rejected M15 candidates (of 8107 lost)
 ------------------------------------------------------------
-(none)
+Candidate 6511b23ddc7a3afd
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 81e8572d05edd16e
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 8f39f4df58eef964
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 951277cc400ce5e4
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate be2e0385c00ff0aa
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate c880e125d5ac0ab0
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 22c2d05da295cc2d
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 54031baa762460c5
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 725a3ea3f93d70cd
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 7563637415b340a3
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 83a53357daa16946
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 998ae9efc6731527
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate a5a0f3148bd87322
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate b1f28fe3765043b4
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate e2d51bb69b10521c
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate fd43341b6ef7834c
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 0ff72e80144e4117
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 10dc1e1bf0f27d9b
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 3e9e3759d4063c7b
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 557efa33849efa75
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 70abe34c6c7918de
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 9678efaa57c7085f
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate dacf583e9c688b5d
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 251c720bf2a049db
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 320a8210c34dbbc4
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 57064cadeff5b6a2
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 59a229b82b740499
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate c58da9856ecd84fb
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate fa97bcc26ef0fb13
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate fff9e7269410c2ab
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 1c852505f7392fed
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 56a2f50ca6d57c99
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate b6a74463ce53d44b
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate bb3a557cbe26bc0b
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate d8e8ae0e4a89f091
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate f5c058b8fc818574
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 23c5ff719368b31e
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate cbdcca096842446b
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate fdf8280a7e8573bb
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 3f41426ba309df09
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 5794a93c5b954b46
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate dd86ee0b8367cad9
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate e257d013a28a8876
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 062b2a189fc54e43
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 2177bc09aa2b80e4
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 3d675c5ccc274dce
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 47650f2c904783b3
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 6d9b7ff3a846d121
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 7bb6c16939f5ab3f
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 87109a8aec20d536
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 97f22cdd975daf8c
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 99170df34d8fabed
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate b9f92c55890176e9
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate ce84f79d51b33cf0
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate d662fae83640daff
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate e6a22a29c40fdb35
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate ecedff1ff9197ffa
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate fa727ef33a34b854
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate ffb91bd3d75b2dcf
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate ffe48fc5c500b37f
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 068f1b7b43d53104
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 08a68419de8ab43d
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 2dc7057cd6f49ee4
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 34d9f660a5a9a169
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 3e3f573ecdbddbee
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 4591856f915abd68
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 56600dc90eff0075
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 7bfaf67750623fe1
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate a199ab9f002fa347
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate f8654986ae4b85d7
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 05817d70f96fb5cb
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 0940753955938fc2
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 1936eae4f4e1628a
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 2ff844b18fbbcbff
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 388212cb09e021d7
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 4181b39b203658db
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate c5318b376e206a08
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate cb16a850b782764c
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 2879f960ac235af8
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 33266aebab74e035
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 79e54c65cb948f9b
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate b545f23d046086a1
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate c278613b60237b76
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate c4af795f7f204b00
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate d3893b86d100d5f8
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate d3c7dc67187950cc
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate d3f4329603feafdf
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate e14990649dea8cb1
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate e83334d6d94273c4
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate f05318f583b5bc71
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate f6f5e7eb66ed0ee8
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 017750a3e9228c4d
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 0a150820acef7f4d
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 0f7b6277e568d0ba
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 2d7d740bf2cf3ae4
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 5e71677752e91a6d
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 8578826d9efe31b1
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 88bc9a3f70faf29d
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate 8a4b3c186c0e7b5d
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))
+
+Candidate ae15ee90c9d039a6
+  Strategy: unknown
+  Time: 2026-07-14 09:20 UTC
+  Session: Not Evaluated
+  TBM: Not Evaluated
+  HMM State: Not Evaluated
+  HMM Decision: Not Evaluated
+  Probability: Not Evaluated
+  Risk: Not Evaluated
+  Final Outcome: Rejected by FeatureEngineering (Filtered at FeatureEngineering (from profiler))

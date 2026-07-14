@@ -1,9 +1,9 @@
 {
-  "experiment_id": "c48e5a398b29",
-  "timestamp": "2026-07-14T07:23:44.593453+00:00",
+  "experiment_id": "78c382e40d72",
+  "timestamp": "2026-07-14T09:20:45.923525+00:00",
   "timeframes": {
     "M15": {
-      "generated": 0,
+      "generated": 8107,
       "session_pass": 0,
       "tbm_pass": 0,
       "hmm_pass": 0,
@@ -11,7 +11,7 @@
       "executed": 0
     },
     "M5": {
-      "generated": 0,
+      "generated": 26773,
       "session_pass": 0,
       "tbm_pass": 0,
       "hmm_pass": 0,
@@ -19,67 +19,54 @@
       "executed": 0
     }
   },
-  "run_id": "c48e5a398b29",
-  "generated_at_utc": "2026-07-14T07:23:44.593453+00:00",
+  "run_id": "78c382e40d72",
+  "generated_at_utc": "2026-07-14T09:20:45.923525+00:00",
   "integrity_flags": {},
   "survival_matrix": [
     {
-      "Stage": "Generated"
+      "Stage": "Generated",
+      "M15 Remaining": 8107,
+      "M15 %": 100.0,
+      "M5 Remaining": 26773,
+      "M5 %": 100.0
     },
     {
-      "Stage": "FeatureEngineering"
-    },
-    {
-      "Stage": "Session"
-    },
-    {
-      "Stage": "TBM"
-    },
-    {
-      "Stage": "HMM"
-    },
-    {
-      "Stage": "Probability"
-    },
-    {
-      "Stage": "Threshold"
-    },
-    {
-      "Stage": "Risk"
-    },
-    {
-      "Stage": "Executed"
+      "Stage": "FeatureEngineering",
+      "M15 Remaining": 0,
+      "M15 %": 0.0,
+      "M5 Remaining": 0,
+      "M5 %": 0.0
     }
   ],
   "survival_gap_warnings": [],
   "per_timeframe": {
     "M15": {
-      "generated": 0,
+      "generated": 8107,
       "executed": 0,
       "survival_pct": 0.0,
       "threshold": null,
       "model_hash": null,
-      "bottleneck_stage": null,
-      "bottleneck_drop_pct": 0.0,
+      "bottleneck_stage": "FeatureEngineering",
+      "bottleneck_drop_pct": 100.0,
       "hmm_snapshot": null,
       "probability_summary": {},
       "feature_drift": [],
       "reconciliation": {}
     },
     "M5": {
-      "generated": 0,
+      "generated": 26773,
       "executed": 0,
       "survival_pct": 0.0,
       "threshold": null,
       "model_hash": null,
-      "bottleneck_stage": null,
-      "bottleneck_drop_pct": 0.0,
+      "bottleneck_stage": "FeatureEngineering",
+      "bottleneck_drop_pct": 100.0,
       "hmm_snapshot": null,
       "probability_summary": {},
       "feature_drift": [],
       "reconciliation": {}
     }
   },
-  "total_candidates": 0,
-  "dashboard": "============================== PIPELINE HEALTH ==============================\n\n\nPipeline Status: PASS\n============================================================================="
+  "total_candidates": 34880,
+  "dashboard": "============================== PIPELINE HEALTH ==============================\n\nM15 Generated: 8107\nM15 Executed:  0\nM15 Survival:  0.00%\n\nM5 Generated: 26773\nM5 Executed:  0\nM5 Survival:  0.00%\n\nLargest M15 Bottleneck: FeatureEngineering (-100.0%)\nLargest M5 Bottleneck: FeatureEngineering (-100.0%)\n\n\nPipeline Status: FAIL\n============================================================================="
 }
