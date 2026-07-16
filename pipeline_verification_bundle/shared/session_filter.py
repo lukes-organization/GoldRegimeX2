@@ -1,15 +1,20 @@
-# Unified Session Filter (Phase 8).
-#
-# Single reference implementation of session/time-of-day filtering for the
-# GoldRegime_X pipeline. Faithful extraction of the session logic that
-# already exists in both notebooks (add_session_features /
-# session_col_from_value, defined identically in Strategy_Tester.ipynb and
-# GoldRegimeX_Explorer.ipynb) -- hour boundaries below were NOT changed,
-# only centralised.
-#
-# There is intentionally no StrategyTesterSessionFilter,
-# ExplorerSessionFilter, MT5SessionFilter, or BacktesterSessionFilter --
-# only this one class.
+"""shared/session_filter.py -- Single Session Filter (Phase 9).
+
+This is the ONE session-filter implementation for the whole project. The
+Strategy Tester, Explorer, Validator, Backtester and Live Trader must all
+import `SessionFilter` / `ENABLE_SESSION_FILTER` from here. There must be no
+inline notebook session logic, and no separate observability session buckets.
+
+Hour boundaries are the faithful extraction of the notebooks'
+`add_session_features` (London 7-16, NY 13-21, overlap 13-16) -- unchanged,
+only centralised.
+
+Session gating is CONFIGURABLE per timeframe. The audit established that the
+production pipeline does NOT session-gate M15/M5 (processor.py applies the
+session window to H1 only). Diagnostics must reflect the ACTUAL configuration
+rather than pretend a Session filter ran.
+"""
+from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
@@ -25,6 +30,15 @@ NY_START_HOUR = 13
 NY_END_HOUR = 21
 OVERLAP_START_HOUR = 13
 OVERLAP_END_HOUR = 16
+
+# Phase 9: single source of truth for whether a timeframe is session-gated.
+# Matches production reality (H1 only). Diagnostics read this dict; they never
+# assume a Session stage filtered candidates.
+ENABLE_SESSION_FILTER = {
+    "H1": True,
+    "M15": False,
+    "M5": False,
+}
 
 
 @dataclass
@@ -122,75 +136,45 @@ class SessionFilter:
         out["session_mask_london_ny"] = london | ny
         return out
 
-    def check(self, timestamp):
-        ts = pd.Timestamp(timestamp)
-        return SessionCheckResult(
-            timestamp=ts,
-            utc_time=ts.strftime("%Y-%m-%d %H:%M:%S"),
-            detected_session=self.detect_session(ts),
-            is_weekend=self.is_weekend(ts),
-            passes_london=self.is_london(ts),
-            passes_ny=self.is_ny(ts),
-            passes_london_ny=self.is_london_ny(ts),
-        )
+    def is_enabled(self, timeframe: str) -> bool:
+        return bool(ENABLE_SESSION_FILTER.get(str(timeframe).upper(), False))
+
+    def session_mask(self, df, timeframe: str, session_filter="London_NY"):
+        """Boolean Series aligned to df.index.
+
+        If gating is disabled for this timeframe (production reality for
+        M15/M5) EVERY bar passes -- so the SESSION diagnostic stage will show
+        0 losses, which is the truthful outcome, not a fabricated 100%.
+        """
+        idx = df.index
+        if not self.is_enabled(timeframe):
+            return pd.Series(True, index=idx)
+        hour = idx.hour
+        london = (hour >= self.london_start) & (hour < self.london_end)
+        ny = (hour >= self.ny_start) & (hour < self.ny_end)
+        s = None if session_filter is None else str(session_filter).lower()
+        if s is None:
+            mask = np.ones(len(idx), dtype=bool)
+        elif s == "london":
+            mask = london
+        elif s == "ny":
+            mask = ny
+        else:
+            mask = london | ny
+        return pd.Series(mask, index=idx)
 
     def version_hash(self):
         blob = "london=%d-%d|ny=%d-%d|overlap=%d-%d" % (
-            self.london_start,
-            self.london_end,
-            self.ny_start,
-            self.ny_end,
-            self.overlap_start,
-            self.overlap_end,
+            self.london_start, self.london_end, self.ny_start,
+            self.ny_end, self.overlap_start, self.overlap_end,
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
-def run_session_filter_test_suite(session_filter=None, verbose=True):
-    # Phase 9: automated session filter test suite.
-    sf = session_filter or SessionFilter()
+def session_col_from_value(session_filter):
+    """Module-level compatibility helper (single source of truth).
 
-    cases = [
-        {"name": "London open (Mon 07:00 UTC)", "ts": "2025-01-06 07:00", "filter": "London", "expected": True},
-        {"name": "London close (Mon 15:59 UTC)", "ts": "2025-01-06 15:59", "filter": "London", "expected": True},
-        {"name": "Post-London close (Mon 16:00 UTC)", "ts": "2025-01-06 16:00", "filter": "London", "expected": False},
-        {"name": "New York overlap (Mon 14:00 UTC)", "ts": "2025-01-06 14:00", "filter": "London_NY", "expected": True},
-        {"name": "Asia (Mon 03:00 UTC)", "ts": "2025-01-06 03:00", "filter": "London_NY", "expected": False},
-        {"name": "Friday close (Fri 20:59 UTC)", "ts": "2025-01-10 20:59", "filter": "NY", "expected": True},
-        {"name": "Sunday open (Sun 22:00 UTC)", "ts": "2025-01-05 22:00", "filter": "London_NY", "expected": False},
-        {"name": "Weekend (Sat 12:00 UTC)", "ts": "2025-01-04 12:00", "filter": "London", "expected": True, "weekend_warn": True},
-        {"name": "DST transition (2025-03-30 12:00 UTC)", "ts": "2025-03-30 12:00", "filter": "London", "expected": True},
-    ]
-
-    rows = []
-    warnings = []
-    for c in cases:
-        got = sf.passes(c["ts"], c["filter"])
-        weekend = sf.is_weekend(c["ts"])
-        passed = got == c["expected"]
-        row = {
-            "test": c["name"],
-            "timestamp": c["ts"],
-            "filter": c["filter"],
-            "expected": c["expected"],
-            "actual": got,
-            "detected_session": sf.detect_session(c["ts"]),
-            "weekend": weekend,
-            "result": "PASS" if passed else "FAIL",
-        }
-        if c.get("weekend_warn") and weekend and got:
-            warnings.append(
-                "Session filter has no explicit weekend guard: %s returned %s. "
-                "Dormant in practice because OHLCV panels contain no weekend bars." % (c["name"], got)
-            )
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-    if verbose:
-        print("=" * 26 + "  SESSION FILTER TEST REPORT  " + "=" * 26)
-        print(df.to_string(index=False))
-        for w in warnings:
-            print("WARNING: " + w)
-        overall = "PASS" if (df["result"] == "PASS").all() else "FAIL"
-        print("Overall: " + overall)
-    return df, warnings
+    Returns the session_mask_* column name for a given session_filter value.
+    Both notebooks previously defined this inline; they now import it here.
+    """
+    return SessionFilter().session_column_name(session_filter)

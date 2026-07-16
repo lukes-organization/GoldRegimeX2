@@ -55,3 +55,5 @@ pipeline_verification_bundle/reports/candidate_trades_export.csv
 
 git add .gitignore
 git commit -m "Ignore files exceeding GitHub 100MB limit"
+pipeline_verification_bundle/reports/observability/*
+!pipeline_verification_bundle/reports/observability/.gitkeep
