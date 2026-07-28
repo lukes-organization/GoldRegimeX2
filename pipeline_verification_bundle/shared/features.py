@@ -160,6 +160,7 @@ ML_FEATURE_KEEP = [
     "Open", "High", "Low", "Close",
     "log_return", "xag_log_return", "xti_log_return",
     "gold_silver_ratio_z", "gold_oil_ratio_z",
+    "usdchf_log_return", "gold_chf_ratio_z",
     "atr_20", "atr_normalized", "volatility_20",
     "synth_vix_zscore", "hour_sin", "hour_cos",
     "rsi5", "atr14", "atr100", "atr_expansion",
@@ -180,19 +181,31 @@ def build_ml_features(exec_panel: pd.DataFrame, timeframe: str, spread_cap_point
         raise ValueError("Unsupported timeframe: %s" % timeframe)
     exec_df = exec_panel.copy()
 
+    # USDCHF (intraday DXY proxy, ~0.85 DXY correlation) — mirror the XAG/XTI
+    # cross-commodity treatment. Graceful fallback so callers that don't supply a
+    # USDCHF_Close column don't KeyError: fall back to Close (same convention as
+    # the Explorer load_panel), which makes gold_chf_ratio_z a flat 0 signal.
+    if "USDCHF_Close" not in exec_df.columns:
+        exec_df["USDCHF_Close"] = exec_df["Close"]
+
     exec_df["log_return"] = np.log(exec_df["Close"] / exec_df["Close"].shift(1))
     exec_df["xag_log_return"] = np.log(exec_df["XAG_Close"] / exec_df["XAG_Close"].shift(1))
     exec_df["xti_log_return"] = np.log(exec_df["XTI_Close"] / exec_df["XTI_Close"].shift(1))
+    exec_df["usdchf_log_return"] = np.log(exec_df["USDCHF_Close"] / exec_df["USDCHF_Close"].shift(1))
     exec_df["gold_silver_ratio"] = exec_df["Close"] / exec_df["XAG_Close"]
     exec_df["gold_oil_ratio"] = exec_df["Close"] / exec_df["XTI_Close"]
+    exec_df["gold_chf_ratio"] = exec_df["Close"] / exec_df["USDCHF_Close"]
 
     rw = 64
     gs_m = exec_df["gold_silver_ratio"].rolling(rw, min_periods=rw).mean()
     gs_s = exec_df["gold_silver_ratio"].rolling(rw, min_periods=rw).std().replace(0, np.nan)
     go_m = exec_df["gold_oil_ratio"].rolling(rw, min_periods=rw).mean()
     go_s = exec_df["gold_oil_ratio"].rolling(rw, min_periods=rw).std().replace(0, np.nan)
+    gc_m = exec_df["gold_chf_ratio"].rolling(rw, min_periods=rw).mean()
+    gc_s = exec_df["gold_chf_ratio"].rolling(rw, min_periods=rw).std().replace(0, np.nan)
     exec_df["gold_silver_ratio_z"] = ((exec_df["gold_silver_ratio"] - gs_m) / gs_s).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     exec_df["gold_oil_ratio_z"] = ((exec_df["gold_oil_ratio"] - go_m) / go_s).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    exec_df["gold_chf_ratio_z"] = ((exec_df["gold_chf_ratio"] - gc_m) / gc_s).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     tr = true_range(exec_df["High"], exec_df["Low"], exec_df["Close"])
     exec_df["atr_20"] = tr.rolling(20, min_periods=20).mean()
