@@ -1,0 +1,7 @@
+regime,timeframe,trades,net_profit_$,final_balance_$,final_equity_$,return_%,max_drawdown_%,profit_factor
+baseline 0.02 (fixed),M15,106,291.47,306.42,306.42,1942.83,1.98,127.726
+baseline 0.02 (fixed),M5,543,602.72,617.72,617.72,4018.13,94.83,635.442
+escalate ->0.03 @ $50 profit,M15,106,407.42,422.41,422.41,2716.07,2.83,119.093
+escalate ->0.03 @ $50 profit,M5,543,877.77,892.71,892.71,5851.37,94.83,619.148
+escalate ->0.04 @ $50 profit,M15,106,523.39,538.4,538.4,3489.3,3.6,115.028
+escalate ->0.04 @ $50 profit,M5,543,1152.65,1167.69,1167.69,7684.61,94.83,607.658
