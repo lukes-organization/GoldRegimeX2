@@ -20,18 +20,6 @@ except ImportError:
     pass
 
 from src.logger import setup_logger, reconfigure_for_tf
-from src.processor import process_pipeline, TF_CONFIG, PROCESSED_PATH, save_feature_scaler, load_feature_scaler
-from src.engine_hmm import fit_hmm, save_model as save_hmm, load_model as load_hmm, get_model_path as hmm_model_path, STATE_NAMES
-from src.engine_xgb import (
-    prepare_features, train_xgb, get_predictions,
-    export_onnx, save_xgb, load_xgb, ONNX_PATH, FEATURE_COLS,
-    train_xgb_ensemble,
-    save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
-    get_ensemble_path, TF_TRAIN_RATIO, compute_regime_stats,
-    train_regime_models, get_regime_predictions,
-    save_regime_models, load_regime_models, TB_CONFIG,
-    regime_first_probabilities,
-)
 from src.optimizer import (
     run_optimization, get_best_params, _score_result as _calc_score,
     extract_consensus_params, run_wfa as optimizer_run_wfa,
@@ -40,10 +28,8 @@ from src.optimizer import (
     CPCV_N_BLOCKS, CPCV_K_TEST, _N_PATHS,
     resolve_n_states as _optimizer_resolve_n_states,
 )
-from src.backtester import vectorized_backtest, format_payout
-from src.regime_diagnostics import write_regime_diagnostics
-from src.visualizer import generate_full_report
 from src.risk_manager import AdaptiveRiskManager
+from src.strategy_backtest import backtest_tf, load_live_bundle
 
 logger = setup_logger("main")
 
@@ -114,7 +100,7 @@ def _check_m5_readiness(tf: str, broker: str = "headway_cent") -> bool:
 
     The M5 timeframe is sensitive to microstructure changes, so the model
     must have been optimised within the last 5 days.  A meta.json timestamp
-    is written by cmd_optimize after each successful M5 study.
+    is written by cmd_optimize after each successful M5 optimization.
     """
     if tf.upper() != "M5":
         return True
@@ -148,80 +134,6 @@ def _check_m5_readiness(tf: str, broker: str = "headway_cent") -> bool:
     return True
 
 
-def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
-    """Shared train logic for a single timeframe. Returns (result, model_hmm, states, X, metrics).
-
-    Uses regime-specific XGBoost models (TREND + SHOCK, no MR trading).
-    The `tf` kwarg is now correctly forwarded to fit_hmm for TF-aware HMM config.
-    """
-    df = process_pipeline(
-        obs_cov=params.get("obs_cov"),
-        trans_cov=params.get("trans_cov"),
-        save=True,
-        tf=tf,
-        save_models=True,
-        broker=broker,
-    )
-    model_hmm, states, state_map = fit_hmm(
-        df, n_states=resolve_n_states(tf, params), tf=tf   # fix: tf= was missing before
-    )
-    write_regime_diagnostics(
-        tf=tf,
-        states=states,
-        returns=df["log_return"].values[: len(states)],
-        state_labels=STATE_NAMES,
-        output_dir="reports",
-    )
-    X, y, df_aligned, feature_scaler = prepare_features(df, states, tf=tf)
-    save_feature_scaler(feature_scaler, tf=tf, broker=broker)
-
-    xgb_kwargs = dict(
-        max_depth=params.get("max_depth", 4),
-        learning_rate=params.get("learning_rate", 0.05),
-        n_estimators=params.get("n_estimators", 500),
-        subsample=params.get("subsample", 0.8),
-        colsample_bytree=params.get("colsample_bytree", 0.8),
-        min_child_weight=params.get("min_child_weight", 5),
-        gamma=params.get("gamma", 1.0),
-        reg_alpha=params.get("reg_alpha", 0.1),
-        reg_lambda=params.get("reg_lambda", 1.0),
-        scale_pos_weight=params.get("scale_pos_weight", 1.0),
-    )
-
-    states_aligned = states[df.index.isin(df_aligned.index)]
-
-    # ── Regime-specific training ───────────────────────────────────────────
-    regime_result = train_regime_models(X, y, states_aligned, tf=tf, **xgb_kwargs)
-    save_regime_models(regime_result, tf=tf, broker=broker)
-
-    probabilities = get_regime_predictions(
-        X, states_aligned,
-        regime_result["trend_model"], regime_result["shock_model"],
-    )
-
-    metrics = {
-        "trend_n":       regime_result["trend_n"],
-        "shock_n":       regime_result["shock_n"],
-        "trend_metrics": regime_result["trend_metrics"],
-        "shock_metrics": regime_result["shock_metrics"],
-    }
-
-    # Legacy ensemble also saved for backward-compat exports (ONNX, MT5 sync)
-    models_ensemble, thresholds, ens_metrics = train_xgb_ensemble(
-        X, y, train_ratio=1.0, **xgb_kwargs
-    )
-    metrics.update(ens_metrics)
-    metrics["regime_stats"] = compute_regime_stats(models_ensemble, thresholds, X, states_aligned)
-
-    result = vectorized_backtest(
-        df_aligned, probabilities, states_aligned,
-        split_idx=None,   # full-data model — CPCV scores used for validation
-        account_size=balance,
-        broker=broker,
-        tf=tf,
-        hmm_transmat=model_hmm.transmat_,
-    )
-    return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
 
 
 def _check_model_staleness(tf: str, broker: str, args) -> None:
@@ -266,102 +178,26 @@ def _check_model_staleness(tf: str, broker: str, args) -> None:
 
 
 def cmd_wfa(args):
-    """Walk-Forward Analysis using CPCV.
-
-    Uses the best Optuna params from the study DB to evaluate all
-    C(N,K) combinatorial train/test paths (CPCV).  Prints per-path OOS
-    diagnostics and path-score statistics.
-    """
-    import pandas as pd
-    from src.notifier import send_telegram_msg
-
-    balance  = _resolve_balance(args)
-    broker   = args.broker
-    tf       = args.tf.upper()
-    wfo_mode = "fast" if getattr(args, "fast_wfo", False) else "standard"
-    reconfigure_for_tf(tf)
-
-    processed_path = TF_CONFIG[tf]["processed_path"]
-    if not processed_path.exists():
-        print(f"\nERROR: Run --mode process --tf {tf} first.")
-        sys.exit(1)
-
-    df = pd.read_parquet(processed_path)
-    print(f"\n=== Walk-Forward Analysis [{tf} / {broker}] (mode: {wfo_mode}) ===")
-    print(f"  Dataset: {len(df)} bars  ({df.index[0].date()} – {df.index[-1].date()})")
-    print(f"  Running CPCV ({CPCV_N_BLOCKS} blocks, C({CPCV_N_BLOCKS},{CPCV_K_TEST})={_N_PATHS} paths) with best Optuna params...\n")
-
-    wfa = optimizer_run_wfa(
-        df=df, tf=tf, broker=broker,
-        account_size=balance, wfo_mode=wfo_mode,
-    )
-
-    n_paths   = wfa["n_windows"]
-    n_valid   = wfa["n_valid_windows"]
-    scores    = wfa["window_scores"]
-    verdict   = "ROBUST" if n_valid >= n_paths // 2 else "FRAGILE — re-optimise recommended"
-
-    print(f"  Total CPCV paths  : {n_paths}")
-    print(f"  Valid paths       : {n_valid}  (OOS trades above hard floor, DD < 20%)")
-    print(f"  Median OOS score  : {float(__import__('numpy').median(scores)) if scores else 0.0:+.3f}")
-    print(f"  Std OOS Sharpe    : {wfa['std_sharpe']:.3f}")
-    print(f"  Median OOS trades : {wfa['median_trades']}")
-    print(f"  Verdict           : {verdict}")
-    print(f"  CPCV score        : {wfa['wfo_score']:+.3f}")
-
-    if scores:
-        print("\n  Per-path scores:")
-        for i, s in enumerate(scores):
-            bar = "#" * max(0, int((s + 1) * 5))
-            print(f"    Path  {i+1:>2}: {s:+.3f}  {bar}")
-
-    send_telegram_msg(
-        f"<b>Walk-Forward Analysis [{tf}]</b>\n"
-        f"Valid paths: <b>{n_valid}/{n_paths}</b>  |  CPCV score: <b>{wfa['wfo_score']:+.3f}</b>\n"
-        + ("Robust" if n_valid >= n_paths // 2 else "Fragile — re-optimise")
-    )
+    print('[RETIRED] --mode wfa relied on the legacy ML stack (processor/HMM/XGB/backtester), removed in the notebook-engine consolidation. Use --mode optimize (grid-search-plateau); see CONSOLIDATION.md.')
+    raise SystemExit(2)
 
 
 def cmd_process(args):
-    tfs = [t.strip().upper() for t in args.tf.split(",")]
-    for tf in tfs:
-        if tf not in TF_CONFIG:
-            logger.error("Unknown timeframe '%s'. Valid: %s", tf, list(TF_CONFIG))
-            continue
-        reconfigure_for_tf(tf)
-
-        # Auto-sync raw CSV from MT5 before processing (same as cmd_optimize does).
-        # Silently skipped when MT5 is unavailable.
-        try:
-            from src.mt5_sync import ensure_data_updated
-            ensure_data_updated(tf=tf, symbol="XAUUSD")
-        except Exception as _sync_exc:
-            logger.warning("Auto-sync skipped (%s). Continuing with existing data.", _sync_exc)
-
-        try:
-            df = process_pipeline(save=True, tf=tf, save_models=True, broker=args.broker)
-            logger.info(
-                "[%s] Done: %d bars | Range: %s to %s",
-                tf, len(df), df.index.min(), df.index.max(),
-            )
-        except FileNotFoundError as e:
-            logger.error(str(e))
+    print('[RETIRED] --mode process relied on the legacy ML stack (processor/HMM/XGB/backtester), removed in the notebook-engine consolidation. Use --mode optimize (grid-search-plateau); see CONSOLIDATION.md.')
+    raise SystemExit(2)
 
 
 def cmd_optimize(args):
-    import pandas as pd
     balance  = _resolve_balance(args)
     broker   = args.broker
     tfs      = [t.strip().upper() for t in args.tf.split(",")]
     wfo_mode = "fast" if getattr(args, "fast_wfo", False) else "standard"
-    stage    = getattr(args, "stage", None)   # None | "xgb" | "trading"
+    stage    = getattr(args, "stage", None)
 
     for tf in tfs:
         reconfigure_for_tf(tf)
 
-        # ── Auto-sync raw CSV from MT5 before reading parquet ────────────────
-        # If the terminal is running, appends any missing bars to the raw CSV.
-        # Silently skipped when MT5 is unavailable (e.g. running headless).
+        # Auto-sync raw CSV from MT5 first; silently skipped when MT5 is unavailable.
         try:
             from src.mt5_sync import ensure_data_updated
             ensure_data_updated(tf=tf, symbol="XAUUSD")
@@ -373,33 +209,16 @@ def cmd_optimize(args):
             tf, broker, balance, args.trials, wfo_mode, stage or "joint",
         )
 
-        # Pre-load parquet once — make_objective only calls kalman_smooth per trial
-        processed_path = TF_CONFIG[tf]["processed_path"]
-        if not processed_path.exists():
-            print(
-                f"\nERROR: Processed parquet not found for {tf}.\n"
-                f"Run  python main.py --mode process --tf {tf}  first."
-            )
-            sys.exit(1)
-        df = pd.read_parquet(processed_path)
-
         if stage is not None:
             print(
-                f"\n[DEPRECATED] --stage {stage!r} is ignored. "
-                "Running unified single-stage pipeline optimization.\n"
+                f"[DEPRECATED] --stage {stage!r} is ignored. "
+                "Running the unified grid-search-plateau pipeline."
             )
-        # Unified single-stage CPCV pipeline for all TFs
-        if getattr(args, "reset_study", False):
-            from src.optimizer import get_optuna_storage_url, get_optuna_study_name
-            import os, pathlib
-            _db_path = pathlib.Path(get_optuna_storage_url(broker).replace("sqlite:///", ""))
-            if _db_path.exists():
-                logger.info("--reset_study: deleting %s", _db_path)
-                os.remove(_db_path)
-            else:
-                logger.info("--reset_study: no existing db at %s, skipping delete", _db_path)
+
+        # The notebook engine loads its own multi-asset panels and trains
+        # M15 + M5 in a single pass, so no processed parquet is required here.
         study = run_optimization(
-            df=df,
+            df=None,
             tf=tf,
             broker=broker,
             account_size=balance,
@@ -408,22 +227,13 @@ def cmd_optimize(args):
             n_jobs=args.n_jobs,
         )
 
-        print(f"\n=== Best Result [{tf}] ===")
+        print("")
+        print(f"=== Best Result [{tf}] ===")
         print(f"Score:         {study.best_value:.3f}")
         print(f"Broker:        {broker}  |  Balance: ${balance:.0f}  |  WFO mode: {wfo_mode}")
-        print("Best Params:")
+        print("Best Params (grid-search-plateau center):")
         for k, v in study.best_params.items():
             print(f"  {k}: {v}")
-
-        from src.optimizer import get_optuna_storage_url, get_optuna_study_name
-        _db_url    = get_optuna_storage_url(broker)
-        _study_nm  = get_optuna_study_name(tf, broker)
-        print("\nOptuna live dashboard")
-        print(f"  Storage : {_db_url}")
-        print(f"  Study   : {_study_nm}")
-        print("  Run in another terminal:")
-        print(f"    optuna-dashboard {_db_url} --host 127.0.0.1 --port 8080")
-        print("  Then open: http://localhost:8080/")
 
         if tf == "M5":
             meta_path = _m5_meta_path(broker)
@@ -434,199 +244,82 @@ def cmd_optimize(args):
                 "best_score": study.best_value,
             }))
             print(
-                "\nOptimization Complete. HMM States and XGBoost Weights have been updated. "
-                "You are now cleared for M5 Live Trading for the next 5 days."
+                "Optimization Complete. The live model bundle has been exported. "
+                "You are cleared for M5 Live Trading for the next 5 days."
             )
 
 
 def cmd_train(args):
     balance = _resolve_balance(args)
-    broker = args.broker
-    tf = args.tf.upper()
+    broker  = args.broker
+    tf      = args.tf.upper()
     reconfigure_for_tf(tf)
+
+    # With the notebook-engine consolidation, --mode optimize already trains AND
+    # exports the single live model bundle (models + thresholds + base_params).
+    # "train" now loads that exact bundle and reports a full-period backtest, so
+    # the reported edge matches what will actually trade.
+    try:
+        bundle = load_live_bundle()
+    except FileNotFoundError as exc:
+        logger.error(str(exc))
+        print(
+            f"ERROR: No live model bundle found for [{tf}]. "
+            f"Run  python main.py --mode optimize --tf {tf} --broker {broker}  first."
+        )
+        sys.exit(1)
 
     try:
         params = get_best_params(balance=balance, broker=broker, tf=tf)
-        logger.info("Using Optuna best params [%s/%s]: %s", tf, broker, params)
+        logger.info("Grid-search-plateau params [%s/%s]: %s", tf, broker, params)
     except Exception:
-        logger.warning("No Optuna study found for tf=%s broker=%s — using defaults", tf, broker)
-        params = {}
+        logger.warning("Could not read exported params for tf=%s broker=%s.", tf, broker)
 
-    result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities = _train_for_tf(tf, balance, broker, params)
-
-    # Guard: refuse to save a degenerate HMM — identical state means + near-zero persistence
-    # indicate the Kalman/HMM params were bad (usually because Optuna params weren't loaded).
-    _min_persist = min(model_hmm.transmat_[i, i] for i in range(model_hmm.n_components))
-    if _min_persist < 0.70:
-        logger.critical(
-            "TRAINING ABORTED: degenerate HMM (min persistence=%.4f). "
-            "Model NOT saved. Usually caused by missing Optuna study for tf=%s broker=%s. "
-            "Ensure --mode optimize has completed and re-run --mode train.",
-            _min_persist, tf, broker,
-        )
-        print(
-            f"\nERROR: Degenerate HMM detected (min state persistence={_min_persist:.4f} < 0.70).\n"
-            f"The model was NOT saved — saving it would only produce garbage signals.\n"
-            f"\nFix: python main.py --mode optimize --tf {tf} --broker {broker} --trials 300\n"
-            f"Then: python main.py --mode train    --tf {tf} --broker {broker}\n"
-        )
+    try:
+        metrics = backtest_tf(tf, bundle=bundle)
+    except Exception as exc:
+        logger.error("Backtest via the notebook engine failed: %s", exc)
         sys.exit(1)
 
-    save_hmm(model_hmm, hmm_model_path(tf, broker))
-    save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf, broker))
-
     arm = AdaptiveRiskManager(balance, broker=broker)
-    cpcv_score = None
-    try:
-        import optuna as _optuna
-        from src.optimizer import get_optuna_storage_url, get_optuna_study_name
-        _storage   = get_optuna_storage_url(broker)
-        _study_nm  = get_optuna_study_name(tf, broker)
-        _study     = _optuna.load_study(study_name=_study_nm, storage=_storage)
-        cpcv_score = _study.best_value
-    except Exception:
-        pass
 
-    print(f"\n=== Training Results [{tf}] ===")
+    cpcv_score = None
+    _cpcv_json_path = Path(f"reports/cpcv_{tf.lower()}_{broker}.json")
+    if _cpcv_json_path.exists():
+        try:
+            cpcv_score = _extract_cpcv_metrics(json.loads(_cpcv_json_path.read_text()))["score"]
+        except Exception:
+            cpcv_score = None
+
+    print("")
+    print(f"=== Training Results [{tf}] ===")
     print(f"Broker: {broker} | Balance: ${balance:.0f} | Tier: {'small' if arm.is_small_account else 'growth'}")
-    print(f"Full-data model trained on 100% of available bars (CPCV validation via optimize step).")
-    print(f"Full-period Sharpe: {result['sharpe_ratio']:.3f} | MaxDD: {result['max_drawdown']*100:.1f}%"
-          f" | WR: {result['win_rate']*100:.1f}% | Trades: {result['n_trades']}")
+    print("Model bundle exported by --mode optimize (single-source live model).")
+    print(
+        f"Full-period Sharpe: {metrics.get('sharpe', 0.0):.3f}"
+        f" | MaxDD: {metrics.get('max_drawdown', 0.0):.1f}%"
+        f" | WR: {metrics.get('win_rate', 0.0) * 100:.1f}%"
+        f" | Trades: {metrics.get('trade_count', 0)}"
+    )
     if cpcv_score is not None:
         print(f"CPCV Validation Score (best trial): {cpcv_score:.3f}")
-    print(f"\nModels saved. Run --mode export to generate ONNX.")
+    print("")
+    print("Live model bundle is ready. Run --mode sync_validate before going live.")
 
 
 def cmd_extract_consensus(args):
-    """Extract consensus hyperparameters from top-N trials (median per param).
-
-    More robust than the single best trial. Prints the consensus params and
-    saves them nowhere — use with --mode train to apply the consensus params.
-    """
-    tf      = args.tf.upper()
-    broker  = args.broker
-    top_n   = getattr(args, "top_n", 10)
-    min_wfe = getattr(args, "min_wfe", 0.0)
-    reconfigure_for_tf(tf)
-
-    try:
-        consensus = extract_consensus_params(tf=tf, broker=broker, top_n=top_n, min_wfe=min_wfe)
-    except Exception as exc:
-        print(f"\nERROR: {exc}")
-        sys.exit(1)
-
-    meta = consensus.pop("meta", {})
-    print(f"\n=== Consensus Params [{tf} / {broker}] ===")
-    print(f"  Study:      {meta.get('study_name', '?')}")
-    print(f"  Top-N used: {meta.get('top_n_actual', top_n)}")
-    print(f"  Score range: [{meta.get('min_score', 0.0):.3f}, {meta.get('max_score', 0.0):.3f}]")
-    print(f"  Mean WFE:   {meta.get('mean_wfe', 0.0):.3f}")
-    print("\n  Consensus parameters (median of top-N):")
-    for k, v in sorted(consensus.items()):
-        print(f"    {k}: {v}")
+    print('[RETIRED] --mode extract_consensus relied on the legacy ML stack (processor/HMM/XGB/backtester), removed in the notebook-engine consolidation. Use --mode optimize (grid-search-plateau); see CONSOLIDATION.md.')
+    raise SystemExit(2)
 
 
 def cmd_compare(args):
-    """Train and backtest the specified timeframes, then show a side-by-side comparison."""
-    balance = _resolve_balance(args)
-    broker = args.broker
-    tfs = [t.strip().upper() for t in args.tf.split(",")]
-    results = {}
-
-    for tf in tfs:
-        reconfigure_for_tf(tf)
-        try:
-            params = get_best_params(balance=balance, broker=broker, tf=tf)
-        except Exception:
-            params = {}
-
-        try:
-            result, *_ = _train_for_tf(tf, balance, broker, params)
-            if "oos_sharpe_ratio" in result:
-                _oos_fdd = result.get("oos_floating_max_drawdown", result.get("oos_max_drawdown", 0.0))
-                result["oos_score"] = _calc_score({
-                    "total_return":          result.get("oos_total_return", 0.0),
-                    "floating_max_drawdown": _oos_fdd,
-                    "sharpe_ratio":          result.get("oos_sharpe_ratio", 0.0),
-                    "profit_factor":         result.get("oos_profit_factor", 1.0),
-                })
-            results[tf] = result
-        except FileNotFoundError as e:
-            logger.error("Skipping %s: %s", tf, e)
-            continue
-
-    if len(results) < 2:
-        avail = ", ".join(tfs)
-        print(f"\nOnly {len(results)} timeframe(s) available. Run --mode process --tf {avail} first.")
-        if results:
-            tf, r = next(iter(results.items()))
-            print(f"\n[{tf}] Sharpe={r['sharpe_ratio']:.3f} | OOS={r.get('oos_sharpe_ratio',0):.3f} "
-                  f"| DD={r['max_drawdown']*100:.1f}% | Trades={r['n_trades']}")
-        return
-
-    def _oos_score(r):
-        return r.get("oos_score", r.get("oos_sharpe_ratio", r.get("sharpe_ratio", 0.0)))
-
-    winner   = max(results, key=lambda k: _oos_score(results[k]))
-    col_w    = 12
-    tf_list  = list(results.keys())
-    header   = f"{'Metric':<20}" + "".join(f" {tf:>{col_w}}" for tf in tf_list)
-
-    print(f"\n{'='*50}")
-    print(f"  TIMEFRAME COMPARISON  |  Balance: ${balance:.0f}  |  Broker: {broker}")
-    print(f"{'='*50}")
-    print(header)
-    print("-" * len(header))
-    metrics_to_show = [
-        ("OOS Score",    "oos_score",                  ".2f"),
-        ("OOS Sharpe",   "oos_sharpe_ratio",            ".3f"),
-        ("OOS RF",       "oos_recovery_factor",         ".2f"),
-        ("OOS PF",       "oos_profit_factor",           ".2f"),
-        ("IS Sharpe",    "is_sharpe_ratio",             ".3f"),
-        ("OOS Float DD", "oos_floating_max_drawdown",   ".1%"),
-        ("OOS Win Rate", "oos_win_rate",                ".1%"),
-        ("OOS Trades",   "oos_n_trades",                "d"),
-        ("Full Sharpe",  "sharpe_ratio",                ".3f"),
-    ]
-    for label, key, fmt in metrics_to_show:
-        row = f"{label:<20}"
-        for tf in tf_list:
-            r   = results[tf]
-            val = r.get(key, r.get(key.replace("oos_", "").replace("is_", ""), 0))
-            s   = f"{val:{fmt}}" if fmt != "d" else str(int(val))
-            row += f" {s:>{col_w}}"
-        print(row)
-
-    for tf, r in results.items():
-        logger.info(
-            "  %s  Sharpe=%.3f (OOS=%.3f) | DD=%.1f%% | WR=%.1f%% | Trades=%d",
-            tf, r["sharpe_ratio"], r.get("oos_sharpe_ratio", r["sharpe_ratio"]),
-            r["max_drawdown"] * 100, r["win_rate"] * 100, r["n_trades"],
-        )
-
-    print(f"\n-> Recommended timeframe: {winner} (higher OOS Score)")
-    print(f"  Run: python main.py --mode train --tf {winner} --broker {broker} --balance {balance:.0f}")
+    print('[RETIRED] --mode compare relied on the legacy ML stack (processor/HMM/XGB/backtester), removed in the notebook-engine consolidation. Use --mode optimize (grid-search-plateau); see CONSOLIDATION.md.')
+    raise SystemExit(2)
 
 
 def cmd_export(args):
-    tf     = args.tf.upper()
-    broker = args.broker
-    xgb_path = get_ensemble_path(tf, broker)
-    if not xgb_path.exists():
-        xgb_path = ENSEMBLE_PKL_PATH
-    try:
-        models_ensemble, _, xgb_metrics = load_xgb_ensemble(xgb_path)
-    except FileNotFoundError:
-        logger.error("No trained ensemble model found. Run --mode train first.")
-        sys.exit(1)
-    feature_cols = xgb_metrics.get("feature_cols", FEATURE_COLS)
-    n_features   = len(feature_cols)
-    paths = export_onnx_ensemble(models_ensemble, n_features=n_features)
-    print(f"\nONNX ensemble exported ({n_features} features: {feature_cols}):")
-    for bucket, path in paths.items():
-        print(f"  [{bucket:>4}]  {path}")
-    print("\nCopy these files to your MT5 MQL5/Files/ directory.")
-    print("The EA selects the model based on the current ATR volatility bucket.")
+    print('[RETIRED] --mode export relied on the legacy ML stack (processor/HMM/XGB/backtester), removed in the notebook-engine consolidation. Use --mode optimize (grid-search-plateau); see CONSOLIDATION.md.')
+    raise SystemExit(2)
 
 
 def cmd_sync_validate(args):
@@ -665,7 +358,8 @@ def cmd_sync_validate(args):
     _fdd     = result.get("max_dd", 0.0)
     _eff     = result.get("avg_efficiency", 0.0)
     _cost_e  = result.get("cost_efficiency", 0.0)
-    _payout  = format_payout(result.get("total_return", 0.0), balance, args.broker)
+    _tr_pct  = result.get("total_return", 0.0)
+    _payout  = f"{_tr_pct:+.1f}% (${balance * _tr_pct / 100.0:+,.2f})"
     print(
         f"  [{tf} LIVE] Score: {result.get('score', 0.0):.2f}"
         f" | RF: {result.get('recovery_factor', 0.0):.2f}"
@@ -763,171 +457,8 @@ def cmd_live(args):
 
 
 def cmd_report(args):
-    balance = _resolve_balance(args)
-    broker = args.broker
-    tf = args.tf.upper()
-    reconfigure_for_tf(tf)
-
-    try:
-        params = get_best_params(balance=balance, broker=broker, tf=tf)
-    except Exception:
-        params = {}
-
-    df = process_pipeline(obs_cov=params.get("obs_cov"), trans_cov=params.get("trans_cov"),
-                          save=False, tf=tf)
-
-    _hmm_path = hmm_model_path(tf, broker)
-    if not _hmm_path.exists():
-        _hmm_path = None  # let the except branch fit a fresh one
-    try:
-        if _hmm_path is None:
-            raise FileNotFoundError
-        model_hmm = load_hmm(_hmm_path)
-        from src.engine_hmm import predict_states
-        if int(getattr(model_hmm, "n_components", 0)) != 3:
-            raise ValueError(
-                f"Non-canonical HMM artifact for {tf}/{broker}: n_components={getattr(model_hmm, 'n_components', None)}"
-            )
-        states = predict_states(model_hmm, df)
-        state_names = STATE_NAMES
-    except Exception:
-        model_hmm, states, state_names = fit_hmm(df, n_states=resolve_n_states(tf, params))
-
-    # Load the saved feature scaler so the report uses identical scaling to training
-    try:
-        _feat_scaler = load_feature_scaler(tf=tf, broker=broker)
-    except FileNotFoundError:
-        _feat_scaler = None   # old model without scaler — prepare_features fits fresh
-
-    X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
-
-    states_aligned = states[df.index.isin(df_aligned.index)]
-
-    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
-
-    _xgb_path = get_ensemble_path(tf, broker)
-    if not _xgb_path.exists():
-        _xgb_path = ENSEMBLE_PKL_PATH
-
-    models_xgb = None
-    thresholds_xgb = None
-    metrics = {}
-    if _xgb_path.exists():
-        try:
-            models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
-            if metrics.get("feature_cols") and metrics.get("feature_cols") != list(X.columns):
-                logger.warning("Feature mismatch in saved ensemble for %s/%s; ignoring ensemble artifact.", tf, broker)
-                models_xgb, thresholds_xgb, metrics = None, None, {}
-        except Exception as _e:
-            logger.warning("Could not load ensemble artifact for %s/%s: %s", tf, broker, _e)
-            models_xgb, thresholds_xgb, metrics = None, None, {}
-
-    if trend_model is None and shock_model is None and (models_xgb is None or thresholds_xgb is None):
-        models_xgb, thresholds_xgb, metrics = train_xgb_ensemble(
-            X, y,
-            max_depth=params.get("max_depth", 4),
-            learning_rate=params.get("learning_rate", 0.1),
-            n_estimators=params.get("n_estimators", 200),
-            subsample=params.get("subsample", 0.8),
-            colsample_bytree=params.get("colsample_bytree", 0.8),
-            min_child_weight=params.get("min_child_weight", 5),
-            gamma=params.get("gamma", 1.0),
-            reg_alpha=params.get("reg_alpha", 0.1),
-        )
-
-    probabilities, prob_source = regime_first_probabilities(
-        X=X,
-        states=states_aligned,
-        tf=tf,
-        broker=broker,
-        trend_model=trend_model,
-        shock_model=shock_model,
-        ensemble_models=models_xgb,
-        ensemble_thresholds=thresholds_xgb,
-        fallback_prob=0.50,
-    )
-    logger.info("Probability source for %s/%s: %s", tf, broker, prob_source)
-
-    # Ensure regime_stats are present (may be absent in pre-Z-Score saved models)
-    if models_xgb is not None and thresholds_xgb is not None and not metrics.get("regime_stats"):
-        _rs_split = metrics.get("split_idx") or int(len(X) * 0.8)
-        _X_is     = X.iloc[:_rs_split]
-        _hs_is    = states_aligned[:len(_X_is)]
-        metrics["regime_stats"] = compute_regime_stats(models_xgb, thresholds_xgb, _X_is, _hs_is)
-
-    # split_idx=None means the model was trained with train_ratio=1.0 (full-data /
-    # CPCV mode).  In that case keep split_idx=None so the report backtest is
-    # also full-period — matching the training output exactly.
-    # Only fall back to 80/20 when a stored split_idx exists but doesn't fit the
-    # current data (e.g. loaded from a model trained on a different TF).
-    split_idx = metrics.get("split_idx")
-    if split_idx is not None and not (0 < split_idx < len(X)):
-        split_idx = int(len(X) * 0.8)
-
-    result = vectorized_backtest(
-        df_aligned, probabilities, states_aligned,
-        split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
-        hmm_transmat=model_hmm.transmat_,  # use real persistence values, consistent with optimizer CPCV
-    )
-
-    # ── Inject CPCV OOS stats from last --mode optimize run if available ─────
-    _cpcv_json = Path(f"reports/cpcv_{tf.lower()}_{broker}.json")
-    if not _cpcv_json.exists():
-        # Try to backfill from the existing Optuna study DB
-        try:
-            from src.optimizer import save_best_trial_cpcv
-            save_best_trial_cpcv(broker=broker, tf=tf, balance=balance)
-        except Exception as _be:
-            logger.warning("Could not backfill CPCV JSON from study: %s", _be)
-    if _cpcv_json.exists():
-        try:
-            _cpcv = json.loads(_cpcv_json.read_text())
-            _metrics = _extract_cpcv_metrics(_cpcv)
-            _agg = _cpcv.get("cpcv_aggregate_stats") if isinstance(_cpcv, dict) else None
-            _paths = _cpcv.get("per_path_fold_stats") if isinstance(_cpcv, dict) else None
-
-            result["cpcv_score"] = _metrics["score"]
-            result["cpcv_n_valid_paths"] = _metrics["n_valid_paths"]
-            result["oos_sharpe_ratio"] = _metrics["median_sharpe"]
-            result["oos_n_trades"] = _metrics["median_trades"]
-            result["oos_win_rate"] = _metrics["median_win_rate"]
-            result["oos_max_drawdown"] = _metrics["median_drawdown"]
-            result["oos_floating_max_drawdown"] = _metrics["median_drawdown"]
-            result["oos_total_return"] = _metrics["median_return"]
-            result["cpcv_std_sharpe"] = _metrics["std_sharpe"]
-            if isinstance(_agg, dict):
-                result["cpcv_path_scores"] = (_paths or {}).get("path_scores", [])
-            else:
-                result["cpcv_path_scores"] = _cpcv.get("path_scores", [])
-            logger.info(
-                "Loaded CPCV OOS stats from %s — median_sharpe=%.3f  median_trades=%d",
-                _cpcv_json, result["oos_sharpe_ratio"], result["oos_n_trades"],
-            )
-        except Exception as _e:
-            logger.warning("Could not load CPCV JSON (%s): %s", _cpcv_json, _e)
-
-    arm = AdaptiveRiskManager(balance, broker=broker)
-    limits = arm.get_trade_limits()
-    display_params = dict(params)
-    display_params.update({
-        "broker": broker,
-        "balance_usd": balance,
-        "tier": "small" if arm.is_small_account else "growth",
-        "pos_per_trade": limits["pos_per_trade"],
-        "tf": tf,
-    })
-
-    paths = generate_full_report(
-        df_aligned, states_aligned, state_names, model_hmm,
-        X, probabilities, metrics, result, display_params,
-        split_idx=split_idx, tf=tf, broker=broker,
-        account_size=balance,
-    )
-
-    print(f"\n=== Report Generated [{tf} / {broker}] ===")
-    for p in paths:
-        print(f"  {p}")
-    print(f"\n{len(paths)} charts saved to reports/{tf}_{broker}/")
+    print('[RETIRED] --mode report relied on the legacy ML stack (processor/HMM/XGB/backtester), removed in the notebook-engine consolidation. Use --mode optimize (grid-search-plateau); see CONSOLIDATION.md.')
+    raise SystemExit(2)
 
 
 def cmd_audit(args):
@@ -1028,304 +559,13 @@ def cmd_listen(args):
 
 
 def cmd_sensitivity(args):
-    """Z-Score sensitivity analysis on already-trained models.
-
-    Loops over Bull/Bear Z-Score cutoff values (1.5 .. 3.0 in 0.25 steps),
-    reruns the OOS backtest for each, and prints a comparison table so you can
-    see whether the current cutoff is optimal.  MR (Chop) cutoffs are held
-    constant throughout.
-
-    Usage:
-        python main.py --mode sensitivity --tf H1 --broker headway_cent --balance 15
-    """
-    from src.sensitivity import run_sensitivity
-
-    balance = _resolve_balance(args)
-    tf      = args.tf.upper()
-    broker  = args.broker
-    reconfigure_for_tf(tf)
-
-    # Load processed data + models exactly as cmd_report does
-    try:
-        params = get_best_params(balance=balance, broker=broker, tf=tf)
-    except Exception:
-        params = {}
-
-    df = process_pipeline(
-        obs_cov=params.get("obs_cov"), trans_cov=params.get("trans_cov"),
-        save=False, tf=tf,
-    )
-
-    _hmm_path = hmm_model_path(tf, broker)
-    if not _hmm_path.exists():
-        _hmm_path = None
-    try:
-        if _hmm_path is None:
-            raise FileNotFoundError
-        model_hmm = load_hmm(_hmm_path)
-        if int(getattr(model_hmm, "n_components", 0)) != 3:
-            raise ValueError(
-                f"Non-canonical HMM artifact for {tf}/{broker}: n_components={getattr(model_hmm, 'n_components', None)}"
-            )
-        from src.engine_hmm import predict_states
-        states = predict_states(model_hmm, df)
-    except Exception:
-        logger.warning("No saved HMM found for %s/%s — fitting fresh.", tf, broker)
-        model_hmm, states, _ = fit_hmm(df, n_states=resolve_n_states(tf, params))
-
-    try:
-        _feat_scaler = load_feature_scaler(tf=tf, broker=broker)
-    except FileNotFoundError:
-        _feat_scaler = None
-
-    X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
-
-    states_aligned = states[df.index.isin(df_aligned.index)]
-    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
-
-    _xgb_path = get_ensemble_path(tf, broker)
-    if not _xgb_path.exists():
-        _xgb_path = ENSEMBLE_PKL_PATH
-    models_xgb = None
-    thresholds_xgb = None
-    metrics = {}
-    if _xgb_path.exists():
-        try:
-            models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
-            if metrics.get("feature_cols") and metrics.get("feature_cols") != list(X.columns):
-                logger.warning("Feature mismatch in saved ensemble for %s/%s; ignoring ensemble artifact.", tf, broker)
-                models_xgb, thresholds_xgb, metrics = None, None, {}
-        except Exception as _e:
-            logger.warning("Could not load ensemble artifact for %s/%s: %s", tf, broker, _e)
-            models_xgb, thresholds_xgb, metrics = None, None, {}
-
-    if trend_model is None and shock_model is None and (models_xgb is None or thresholds_xgb is None):
-        logger.warning("No saved regime models or ensemble found for %s/%s — can't run sensitivity.", tf, broker)
-        return
-
-    probabilities, prob_source = regime_first_probabilities(
-        X=X,
-        states=states_aligned,
-        tf=tf,
-        broker=broker,
-        trend_model=trend_model,
-        shock_model=shock_model,
-        ensemble_models=models_xgb,
-        ensemble_thresholds=thresholds_xgb,
-        fallback_prob=0.50,
-    )
-    logger.info("Probability source for %s/%s: %s", tf, broker, prob_source)
-
-    if models_xgb is not None and thresholds_xgb is not None and not metrics.get("regime_stats"):
-        _rs_split = metrics.get("split_idx") or int(len(X) * 0.8)
-        metrics["regime_stats"] = compute_regime_stats(
-            models_xgb, thresholds_xgb,
-            X.iloc[:_rs_split], states_aligned[:_rs_split],
-        )
-
-    split_idx = metrics.get("split_idx")
-    if split_idx is None or not (0 < split_idx < len(X)):
-        split_idx = int(len(X) * 0.8)
-
-    run_sensitivity(
-        tf=tf,
-        broker=broker,
-        balance=balance,
-        df_aligned=df_aligned,
-        probabilities=probabilities,
-        states_aligned=states_aligned,
-        split_idx=split_idx,
-        regime_stats=metrics.get("regime_stats", {}),
-    )
+    print('[RETIRED] --mode sensitivity relied on the legacy ML stack (processor/HMM/XGB/backtester), removed in the notebook-engine consolidation. Use --mode optimize (grid-search-plateau); see CONSOLIDATION.md.')
+    raise SystemExit(2)
 
 
 def cmd_montecarlo(args):
-    """Monte Carlo stress-test for an already-trained model.
-
-    Two tests are run in sequence:
-
-    1. **Trade reshuffling** — the chronological PnL sequence from a baseline
-       backtest is randomly permuted 10,000 times to reveal the worst-case
-       sequence-of-returns risk (95th-pctl MaxDD and Risk of Ruin).
-
-    2. **Price perturbation** — the OHLC prices are perturbed with tiny
-       multiplicative noise (std 0.0002 ≈ 2 pips) and the full bar-loop is
-       re-run 100 times to confirm the strategy survives execution slippage.
-
-    Usage::
-
-        python main.py --mode montecarlo --tf M15 --broker headway_cent --balance 15
-    """
-    import numpy as np
-    from src.monte_carlo import run_trade_reshuffle
-    from src.backtester import vectorized_backtest
-
-    balance = _resolve_balance(args)
-    broker  = args.broker
-    tf      = args.tf.upper()
-    reconfigure_for_tf(tf)
-
-    logger.info("Starting Monte Carlo Stress Test [%s / %s] balance=$%.0f",
-                tf, broker, balance)
-
-    # ── Load models (mirrors cmd_report loading logic) ────────────────────────
-    try:
-        params = get_best_params(balance=balance, broker=broker, tf=tf)
-    except Exception:
-        params = {}
-
-    df = process_pipeline(
-        obs_cov=params.get("obs_cov"), trans_cov=params.get("trans_cov"),
-        save=False, tf=tf,
-    )
-
-    _hmm_path = hmm_model_path(tf, broker)
-    try:
-        model_hmm = load_hmm(_hmm_path)
-        if int(getattr(model_hmm, "n_components", 0)) != 3:
-            raise ValueError(
-                f"Non-canonical HMM artifact for {tf}/{broker}: n_components={getattr(model_hmm, 'n_components', None)}"
-            )
-        from src.engine_hmm import predict_states
-        states = predict_states(model_hmm, df)
-    except Exception:
-        model_hmm, states, _ = fit_hmm(df, n_states=resolve_n_states(tf, params))
-
-    try:
-        _feat_scaler = load_feature_scaler(tf=tf, broker=broker)
-    except FileNotFoundError:
-        _feat_scaler = None
-
-    X, y, df_aligned, _ = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
-    states_aligned = states[df.index.isin(df_aligned.index)]
-    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
-
-    _xgb_path = get_ensemble_path(tf, broker)
-    if not _xgb_path.exists():
-        _xgb_path = ENSEMBLE_PKL_PATH
-    models_xgb = None
-    thresholds_xgb = None
-    metrics = {}
-    if _xgb_path.exists():
-        try:
-            models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
-            if metrics.get("feature_cols") and metrics.get("feature_cols") != list(X.columns):
-                logger.warning("Feature mismatch in saved ensemble for %s/%s; ignoring ensemble artifact.", tf, broker)
-                models_xgb, thresholds_xgb, metrics = None, None, {}
-        except Exception as _e:
-            logger.warning("Could not load ensemble artifact for %s/%s: %s", tf, broker, _e)
-            models_xgb, thresholds_xgb, metrics = None, None, {}
-
-    if trend_model is None and shock_model is None and (models_xgb is None or thresholds_xgb is None):
-        models_xgb, thresholds_xgb, metrics = train_xgb_ensemble(
-            X, y,
-            max_depth=params.get("max_depth", 4),
-            learning_rate=params.get("learning_rate", 0.1),
-            n_estimators=params.get("n_estimators", 200),
-            subsample=params.get("subsample", 0.8),
-            colsample_bytree=params.get("colsample_bytree", 0.8),
-            min_child_weight=params.get("min_child_weight", 5),
-            gamma=params.get("gamma", 1.0),
-            reg_alpha=params.get("reg_alpha", 0.1),
-        )
-
-    probabilities, prob_source = regime_first_probabilities(
-        X=X,
-        states=states_aligned,
-        tf=tf,
-        broker=broker,
-        trend_model=trend_model,
-        shock_model=shock_model,
-        ensemble_models=models_xgb,
-        ensemble_thresholds=thresholds_xgb,
-        fallback_prob=0.50,
-    )
-    logger.info("Probability source for %s/%s: %s", tf, broker, prob_source)
-
-    split_idx        = metrics.get("split_idx")
-    if split_idx is not None and not (0 < split_idx < len(X)):
-        split_idx = int(len(X) * 0.8)
-
-    # ── 1. Baseline chronological backtest → raw trades ───────────────────────
-    logger.info("Running baseline chronological backtest...")
-    baseline = vectorized_backtest(
-        df_aligned, probabilities, states_aligned,
-        split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
-        hmm_transmat=model_hmm.transmat_,
-        return_trades=True,
-    )
-    baseline_ret = baseline["returns"] if "returns" in baseline else np.array([])
-    # strategy_returns lives under 'returns' or can be recomputed from equity
-    # Use the direct array stored in the result dict
-    _strat_ret = baseline.get("returns",
-                    np.diff(np.log(baseline["equity_values"]),
-                            prepend=np.log(balance)))
-    _active    = _strat_ret[_strat_ret != 0]
-    _ann_factor = {"H1": np.sqrt(252 * 24), "M15": np.sqrt(252 * 96),
-                   "M5":  np.sqrt(252 * 288)}.get(tf, np.sqrt(252 * 24))
-    baseline_sharpe = (
-        _ann_factor * np.mean(_active) / np.std(_active)
-        if len(_active) > 2 and np.std(_active) > 0 else 0.0
-    )
-
-    trades_df = baseline.get("trades_df")
-    if trades_df is None or len(trades_df) == 0:
-        logger.warning("No trades in baseline backtest — Monte Carlo results will be trivial.")
-        trades_list = []
-    else:
-        trades_list = trades_df[["pnl"]].rename(columns={"pnl": "pnl"}).to_dict("records")
-
-    # ── 2. Trade reshuffling (sequence-of-returns risk) ────────────────────────
-    logger.info("Executing Sequence of Returns Reshuffling (10,000 iterations)...")
-    mc_results = run_trade_reshuffle(trades_list, initial_balance=balance)
-
-    # ── 3. Price perturbation (execution / wick risk) ─────────────────────────
-    logger.info("Executing Price Perturbation Simulation (100 iterations at noise_std=0.0002)...")
-    noise_sharpes = []
-    for _ in range(100):
-        _res = vectorized_backtest(
-            df_aligned, probabilities, states_aligned,
-            split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
-            hmm_transmat=model_hmm.transmat_,
-            return_trades=False,
-            noise_std=0.0002,
-        )
-        _nr = _res.get("returns",
-                np.diff(np.log(_res["equity_values"]), prepend=np.log(balance)))
-        _nv = _nr[_nr != 0]
-        if len(_nv) > 2 and np.std(_nv) > 0:
-            noise_sharpes.append(_ann_factor * np.mean(_nv) / np.std(_nv))
-
-    if noise_sharpes:
-        median_noise_sharpe = float(np.median(noise_sharpes))
-        worst_noise_sharpe  = float(np.min(noise_sharpes))
-    else:
-        median_noise_sharpe = worst_noise_sharpe = 0.0
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    logger.info("=== Monte Carlo Stress Test Complete ===")
-    logger.info("Baseline Sharpe:      %.3f", baseline_sharpe)
-    logger.info("Median Noise Sharpe:  %.3f", median_noise_sharpe)
-    logger.info("Worst Noise Sharpe:   %.3f", worst_noise_sharpe)
-    logger.info("Risk of 50%% Ruin:     %.2f%%", mc_results.get("risk_of_ruin_pct", 0.0))
-    logger.info("95th Pctl MaxDD:      %.1f%%", mc_results.get("95th_percentile_dd", 0.0) * 100)
-
-    print(f"\n=== Monte Carlo Stress Test [{tf} / {broker}] ===")
-    print(f"  Baseline Sharpe:      {baseline_sharpe:.3f}")
-    print(f"  Median Noise Sharpe:  {median_noise_sharpe:.3f}")
-    print(f"  Worst  Noise Sharpe:  {worst_noise_sharpe:.3f}")
-    ror = mc_results.get('risk_of_ruin_pct', 0.0)
-    dd95 = mc_results.get('95th_percentile_dd', 0.0) * 100
-    print(f"  Risk of 50% Ruin:     {ror:.2f}%")
-    print(f"  95th Pctl MaxDD:      {dd95:.1f}%")
-    n_trades = len(trades_list)
-    print(f"  Trades in baseline:   {n_trades}")
-    if n_trades == 0:
-        print("  [!] WARNING: No trades — model may need retraining or thresholds are too strict.")
-    if ror > 5.0:
-        print("  [!] WARNING: Risk of Ruin >5% — consider tightening position sizing.")
-    if dd95 > 30.0:
-        print("  [!] WARNING: 95th-pctl MaxDD >30% — sequence risk is elevated.")
+    print('[RETIRED] --mode montecarlo relied on the legacy ML stack (processor/HMM/XGB/backtester), removed in the notebook-engine consolidation. Use --mode optimize (grid-search-plateau); see CONSOLIDATION.md.')
+    raise SystemExit(2)
 
 
 def _validate_h1_args(args) -> None:
@@ -1362,8 +602,8 @@ def main():
     )
     parser.add_argument("--trials",   type=int,   default=250)
     parser.add_argument("--n_jobs",   type=int,   default=1,
-                        help="Parallel Optuna trial workers (default 1). "
-                             "See optimizer.py for caveats with n_jobs>1.")
+                        help="Parallel grid-search-plateau workers (default 1). "
+                             "Passed through to the grid-search engine.")
     parser.add_argument("--interval", type=int,   default=3600,
                         help="Guardian check interval in seconds (default 3600 = 1h).")
     parser.add_argument("--min_cap", type=float, default=15.0,
@@ -1422,12 +662,6 @@ def main():
         help="H1 maximum trades per 100 bars before turnover penalty fires. "
              "Default 4.0. Valid range [0.5, 20.0].",
     )
-    parser.add_argument(
-        "--reset_study", action="store_true", default=False,
-        help="Delete the Optuna study DB for the given broker before optimizing. "
-             "Required when the search space or feature set has changed.",
-    )
-
     args = parser.parse_args()
     _validate_h1_args(args)
     {

@@ -1,8 +1,9 @@
+# GoldRegimeX2 dependencies
+# Optuna removed as part of the grid-search-plateau migration (was: optuna>=3.5).
 numpy>=1.24
 pandas>=2.0
 hmmlearn>=0.3
 xgboost>=2.0
-optuna>=3.5
 scikit-learn>=1.3
 joblib>=1.3
 onnx>=1.15
@@ -13,3 +14,9 @@ matplotlib>=3.8
 onnxconverter-common>=1.14
 metatrader5
 tensorflow>=2.13
+
+# Optional (not required): speeds up the Numba backtest engine in the
+# grid-search-plateau pipeline. The engine detects Numba at import time and
+# falls back to pure Python when it is missing, so this is safe to omit —
+# recommended if your Python version has no compatible numba wheel.
+# numba>=0.59

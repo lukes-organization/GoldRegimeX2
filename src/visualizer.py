@@ -414,7 +414,7 @@ def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent",
         y -= 0.01
         _is_cpcv = "cpcv_score" in result
         _oos_label = (
-            f"CPCV OOS  ({result.get('cpcv_n_valid_paths', '?')}/{6} valid paths)"
+            f"CPCV OOS  ({result.get('cpcv_n_valid_paths', '?')}/{result.get('cpcv_n_paths') or len(result.get('cpcv_path_scores') or []) or 6} valid paths)"
             if _is_cpcv else "Out-of-Sample"
         )
         ax.text(0.05, y, _oos_label, fontsize=12, fontweight="bold",

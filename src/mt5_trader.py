@@ -21,38 +21,20 @@ from datetime import datetime, timezone, timedelta
 from src.notifier import send_telegram_msg
 
 from src.logger import setup_logger
-from src.processor import (
-    TF_CONFIG,
-    USDCHF_MASTER_PATH,
-    load_usdchf_data,
-    load_asset_data,
-    _EXTERNAL_ASSET_PATHS,
-    compute_log_returns,
-    kalman_smooth,
-    compute_volatility,
-    compute_rsi,
-    compute_atr,
-    compute_gmm_vol_cluster,
-    load_gmm_model,
-    load_feature_scaler,
-    CONTINUOUS_FEATURE_COLS,
-)
-from src.engine_hmm import (
-    load_model as load_hmm,
-    predict_states,
-    get_model_path as hmm_model_path,
-    MODEL_PATH as HMM_GENERIC_PATH,
-    STATE_NAMES,
-    REGIME_SHOCK,
-)
-from src.engine_xgb import (
-    load_xgb_ensemble, assign_vol_bucket, FEATURE_COLS,
-    get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
-    load_regime_models, regime_first_probability,
-)
+# -- Notebook-engine live seam (legacy ML stack removed in consolidation) --
+# Entries and exits now come solely from strategy_backtest.latest_signal(),
+# a 1:1 mirror of run_ml_filtered_backtest. See CONSOLIDATION.md.
+
+# Kept modules (still part of the consolidated system)
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
-from src.signal_engine import SignalEngine
 from src.trade_lifecycle import config_for_tf, floating_pnl_usd
+
+# Notebook-engine live signal seam (ready for the live-executor migration)
+try:
+    from src.strategy_backtest import latest_signal, load_live_bundle
+except Exception:
+    latest_signal = load_live_bundle = None
+
 
 logger = setup_logger(__name__)
 
@@ -138,44 +120,6 @@ TP_SL_CONFIG: dict = {
 }
 
 
-def calculate_tp_sl(
-    tf: str,
-    regime: int,
-    atr: float,
-    entry_price: float,
-    is_buy: bool,
-) -> tuple:
-    """Calculate regime-aware TP and SL price levels.
-
-    Args:
-        tf:          Timeframe string (H1, M15, M5).
-        regime:      HMM state (0=Bull, 1=Bear, 2/3=Chop).
-        atr:         Current ATR value in price units.
-        entry_price: Trade entry price.
-        is_buy:      True for BUY, False for SELL.
-
-    Returns:
-        ``(sl, tp1, tp2)`` — tp2 is None when not applicable.
-    """
-    cfg     = TP_SL_CONFIG.get(tf.upper(), TP_SL_CONFIG["H1"])
-    r_type  = "trend" if regime in (0, 1) else "chop"
-    params  = cfg[r_type]
-
-    sl_dist  = params["sl_mult"]  * atr
-    tp1_dist = params["tp1_mult"] * atr
-    tp2_mult = params["tp2_mult"]
-
-    if is_buy:
-        sl  = entry_price - sl_dist
-        tp1 = entry_price + tp1_dist
-        tp2 = (entry_price + tp2_mult * atr) if tp2_mult else None
-    else:
-        sl  = entry_price + sl_dist
-        tp1 = entry_price - tp1_dist
-        tp2 = (entry_price - tp2_mult * atr) if tp2_mult else None
-
-    return round(sl, 2), round(tp1, 2), (round(tp2, 2) if tp2 is not None else None)
-
 # Lazy MT5 timeframe map
 
 # ── External asset fallback cache ─────────────────────────────────────────────
@@ -183,23 +127,6 @@ def calculate_tp_sl(
 # known log return from the master CSV.  Keyed by "{col_name}_{tf}".
 _ASSET_FALLBACK_CACHE: dict[str, float] = {}
 
-def _get_asset_fallback(col_name: str, tf: str = "H1") -> float:
-    """Return the last known log return from the master CSV for *col_name* (cached)."""
-    key = f"{col_name}_{tf}"
-    if key not in _ASSET_FALLBACK_CACHE:
-        asset_key = col_name.replace("_log_return", "")
-        path_by_tf = _EXTERNAL_ASSET_PATHS.get(asset_key, {})
-        path = path_by_tf.get(tf.upper())
-        try:
-            if path and path.exists():
-                asset_df = load_asset_data(path, col_name)
-                if asset_df is not None and not asset_df.empty:
-                    _ASSET_FALLBACK_CACHE[key] = float(asset_df[col_name].dropna().iloc[-1])
-                    return _ASSET_FALLBACK_CACHE[key]
-        except Exception:
-            pass
-        _ASSET_FALLBACK_CACHE[key] = 0.0
-    return _ASSET_FALLBACK_CACHE[key]
 _MT5_TF_MAP: dict | None = None
 
 
@@ -213,16 +140,6 @@ def _get_tf_map() -> dict:
             "H1":  mt5.TIMEFRAME_H1,
         }
     return _MT5_TF_MAP
-
-
-def _tp_multipliers(tf: str, hmm_state: int) -> list[float]:
-    """Return the TP multiplier list for this TF and HMM state.
-
-    Any Chop state (2 or 3 in 4-state model) uses the tighter chop TPs —
-    this covers both trend-regime and mean-reversion trades that open in Chop.
-    """
-    cfg = TF_TP_CONFIG.get(tf.upper(), TF_TP_CONFIG["H1"])
-    return cfg["chop"] if hmm_state >= CHOP_STATE else cfg["trending"]
 
 
 def _normalise_balance(raw_balance: float, broker: str) -> float:
@@ -331,40 +248,6 @@ def check_margin(symbol: str, lot: float, order_type: int, price: float) -> bool
 # ─────────────────────────────────────────────────────────────────────────────
 # Signal derivation
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _fetch_asset_log_return(symbol: str, tf_mt5: int, mt5) -> float | None:
-    """Fetch the most recently completed bar log return for *symbol* from MT5.
-
-    Works for any symbol available on the broker (USDCHF, XAGUSD, US500, etc.).
-    Returns ``None`` only if the data call fails (symbol not subscribed, etc.).
-    """
-    rates = mt5.copy_rates_from_pos(symbol, tf_mt5, 1, 3)   # 3 completed bars
-    if rates is None or len(rates) < 2:
-        return None
-    closes = [r["close"] for r in rates]
-    if closes[-2] <= 0:
-        return None
-    return float(np.log(closes[-1] / closes[-2]))
-
-
-def compute_deviation(model_hmm, current_state: int, tf: str = "H1") -> int:
-    """Select order deviation based on regime stability and timeframe.
-
-    A low self-transition probability on the current HMM state means the regime
-    is likely to flip next bar — a proxy for elevated market volatility.
-    Deviation is widened to avoid requotes in those conditions.
-    M5 uses a higher base deviation (30) than M15/H1 (20) for scalping fills.
-    """
-    self_prob    = model_hmm.transmat_[current_state, current_state]
-    base_dev     = TF_DEFAULT_DEV.get(tf.upper(), 20)
-    high_vol_dev = TF_HIGH_VOL_DEV.get(tf.upper(), 50)
-    if self_prob < HIGH_VOL_SELF_TRANS_THRESHOLD:
-        logger.debug(
-            "High-vol deviation: state=%d  self_trans=%.3f < %.2f — using %d pts",
-            current_state, self_prob, HIGH_VOL_SELF_TRANS_THRESHOLD, high_vol_dev,
-        )
-        return high_vol_dev
-    return base_dev
 
 
 def _move_sl_to_breakeven(ticket: int, entry_price: float, mt5) -> None:
@@ -508,7 +391,6 @@ def _execute_partial_close(ticket: int, symbol: str, mt5, magic: int = MAGIC_NUM
         ticket, res.retcode if res else "None", close_vol,
     )
     return False
-
 
 
 def _close_position(ticket: int, mt5, comment: str = "GRX_close_chop", magic: int = MAGIC_NUMBER) -> None:
@@ -663,218 +545,6 @@ def send_daily_audit_report(mt5, broker: str = "headway_cent") -> None:
     send_telegram_msg("\n".join(lines))
 
 
-def _build_live_df(
-    symbol: str,
-    tf_mt5: int,
-    n_bars: int,
-    obs_cov: float,
-    trans_cov: float,
-) -> pd.DataFrame:
-    """Fetch the last *n_bars* completed bars and return a featurised DataFrame.
-
-    The currently open (incomplete) bar is excluded via offset=1.
-    Feature sequence mirrors processor.process_pipeline() exactly.
-    """
-    import MetaTrader5 as mt5
-    rates = mt5.copy_rates_from_pos(symbol, tf_mt5, 1, n_bars)
-    if rates is None or len(rates) == 0:
-        raise RuntimeError(
-            f"copy_rates_from_pos returned no data: {mt5.last_error()}"
-        )
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df = (
-        df.rename(columns={
-            "time":        "Date",
-            "open":        "Open",
-            "high":        "High",
-            "low":         "Low",
-            "close":       "Close",
-            "tick_volume": "Volume",
-        })
-        [["Date", "Open", "High", "Low", "Close", "Volume"]]
-    )
-    df.set_index("Date", inplace=True)
-    df.sort_index(inplace=True)
-
-    df["log_return"]     = compute_log_returns(df["Close"])
-    df["kalman_return"]  = kalman_smooth(df["log_return"].values, obs_cov, trans_cov)
-    df["volatility"]     = compute_volatility(df["log_return"])
-    df["rsi"]            = compute_rsi(df["Close"])
-    df["rsi_slope"]      = df["rsi"].diff()
-    df["atr_normalized"] = compute_atr(df)
-    df.dropna(inplace=True)
-    return df
-
-
-def compute_live_features(
-    symbol: str,
-    tf_mt5: int,
-    model_hmm,
-    obs_cov: float,
-    trans_cov: float,
-    feature_cols: list | None = None,
-    mt5=None,
-    tf: str = "H1",
-    broker: str = "headway_cent",
-):
-    """Build the current-bar feature vector for XGBoost ensemble inference.
-
-    Returns:
-        features_df  (pd.DataFrame shape (1, n_features)): named feature row.
-        hmm_state    (int):   current HMM regime index.
-        atr_price    (float): ATR in price terms for SL calculation.
-
-    ``feature_cols`` is loaded from the ensemble metadata so the live vector
-    always matches what the models were trained on.  If ``usdchf_log_return`` is
-    required and the fetch fails, the last known value from the master CSV is used.
-    """
-    if feature_cols is None:
-        feature_cols = FEATURE_COLS
-
-    df = _build_live_df(symbol, tf_mt5, N_BARS_WARMUP, obs_cov, trans_cov)
-    states = predict_states(model_hmm, df)
-
-    current_state   = int(states[-1])
-    rsi_slope       = float(df["rsi_slope"].iloc[-1])
-    atr_normalized  = float(df["atr_normalized"].iloc[-1])
-    prev_log_return = float(df["log_return"].iloc[-2])
-
-    # M5/M15: HMM state is one-hot encoded to match the OHE training pipeline.
-    # A causal rolling median (window=5) smooths transient state flips before
-    # encoding — identical logic to prepare_features() in engine_xgb.py.
-    # H1: retain the raw integer hmm_state for backward compatibility.
-    feature_dict: dict = {
-        "rsi_slope":       rsi_slope,
-        "atr_normalized":  atr_normalized,
-        "prev_log_return": prev_log_return,
-    }
-    if tf.upper() in ("M5", "M15"):
-        _states_series  = pd.Series(states.astype(int))
-        _smoothed_state = int(
-            _states_series.rolling(window=5, min_periods=1).median().iloc[-1]
-        )
-        feature_dict["state_0"] = int(_smoothed_state == 0)
-        feature_dict["state_1"] = int(_smoothed_state == 1)
-        feature_dict["state_2"] = int(_smoothed_state == 2)
-    else:
-        feature_dict["hmm_state"] = float(current_state)
-
-    if "usdchf_log_return" in feature_cols:
-        if mt5 is not None:
-            usdchf_ret = _fetch_asset_log_return("USDCHF", tf_mt5, mt5)
-        else:
-            usdchf_ret = None
-        if usdchf_ret is None:
-            usdchf_ret = _get_asset_fallback("usdchf_log_return", tf)
-            logger.warning(
-                "USDCHF live fetch failed — falling back to last value in "
-                "USDCHF_master.csv (%.6f).  This value is STALE (CSV ends "
-                "31/12/2025).  XGBoost is running on outdated USD-strength data. "
-                "Export a fresh USDCHF CSV from MT5 and run --mode consolidate "
-                "to restore live accuracy.",
-                usdchf_ret,
-            )
-        else:
-            logger.debug("USDCHF live return: %.6f (source: MT5 bar)", usdchf_ret)
-        feature_dict["usdchf_log_return"] = usdchf_ret
-
-    # ── Additional external assets (XAGUSD, XTIUSD, US500, USDJPY) ───────────
-    _OTHER_ASSET_COLS = {
-        "xagusd_log_return": "XAGUSD",
-        "xtiusd_log_return": "XTIUSD",
-        "us500_log_return":  "US500",
-        "usdjpy_log_return": "USDJPY",
-    }
-    for col_name, symbol in _OTHER_ASSET_COLS.items():
-        if col_name not in feature_cols:
-            continue
-        ret = _fetch_asset_log_return(symbol, tf_mt5, mt5) if mt5 is not None else None
-        if ret is None:
-            ret = _get_asset_fallback(col_name, tf)
-            logger.warning(
-                "%s live fetch failed — using fallback %.6f from master CSV.",
-                symbol, ret,
-            )
-        else:
-            logger.debug("%s live return: %.6f", symbol, ret)
-        feature_dict[col_name] = ret
-
-    if "gmm_vol_cluster" in feature_cols:
-        try:
-            _gmm, _scaler = load_gmm_model(tf, broker)
-            _cluster = compute_gmm_vol_cluster(
-                df["volatility"].values, fitted_gmm=_gmm, fitted_scaler=_scaler
-            )
-            feature_dict["gmm_vol_cluster"] = float(_cluster[-1])
-            df["gmm_vol_cluster"] = _cluster.astype(float)   # LSTM needs this column
-        except FileNotFoundError:
-            logger.warning("GMM model missing for [%s/%s] — using cluster=0", tf, broker)
-            feature_dict["gmm_vol_cluster"] = 0.0
-            df["gmm_vol_cluster"] = 0.0                       # LSTM fallback
-
-    if "synth_vix_zscore" in feature_cols:
-        from src.processor import compute_synth_vix
-        _svix = compute_synth_vix(df)
-        feature_dict["synth_vix_zscore"] = float(_svix.iloc[-1]) if not np.isnan(_svix.iloc[-1]) else 0.0
-
-    if "atr_band_position" in feature_cols:
-        from src.processor import compute_dynamic_atr_bands
-        _atr_bands = compute_dynamic_atr_bands(df)
-        feature_dict["atr_band_position"] = float(_atr_bands.iloc[-1]) if not np.isnan(_atr_bands.iloc[-1]) else 0.5
-
-    # ── Cyclical time features ────────────────────────────────────────────────
-    if any(c in feature_cols for c in ("hour_sin", "hour_cos", "minute_sin", "minute_cos")):
-        _ts        = df.index[-1]
-        _hour_frac = _ts.hour + _ts.minute / 60.0
-        if "hour_sin"   in feature_cols:
-            feature_dict["hour_sin"]   = float(np.sin(2 * np.pi * _hour_frac / 24))
-        if "hour_cos"   in feature_cols:
-            feature_dict["hour_cos"]   = float(np.cos(2 * np.pi * _hour_frac / 24))
-        if "minute_sin" in feature_cols:
-            feature_dict["minute_sin"] = float(np.sin(2 * np.pi * _ts.minute / 60))
-        if "minute_cos" in feature_cols:
-            feature_dict["minute_cos"] = float(np.cos(2 * np.pi * _ts.minute / 60))
-
-    # Runtime assertion: live feature keys must exactly match training columns.
-    # A mismatch means the model was retrained with a different feature set and
-    # the live path has not been updated — catch this before XGBoost sees garbage.
-    _live_keys  = set(feature_dict.keys())
-    _train_cols = set(feature_cols)
-    if _live_keys != _train_cols:
-        _missing = _train_cols - _live_keys
-        _extra   = _live_keys  - _train_cols
-        raise ValueError(
-            f"Live/training feature mismatch — missing: {_missing}, extra: {_extra}. "
-            f"Retrain the model or update compute_live_features()."
-        )
-
-    features_df = pd.DataFrame([feature_dict])[feature_cols]
-
-    # Apply the 10-year feature scaler so live values match the training distribution
-    cont_cols = [c for c in CONTINUOUS_FEATURE_COLS if c in features_df.columns]
-    try:
-        _feat_scaler = load_feature_scaler(tf, broker)
-        features_df[cont_cols] = _feat_scaler.transform(features_df[cont_cols])
-    except FileNotFoundError:
-        logger.warning(
-            "Feature scaler not found for [%s/%s] — running without scaling. "
-            "Re-train with --mode train to generate it.",
-            tf, broker,
-        )
-
-    # NaN/Inf guard: abort this bar rather than feed garbage to XGBoost
-    _bad = features_df.isnull().any(axis=1) | (np.isinf(features_df.values).any(axis=1))
-    if _bad.any():
-        bad_cols = features_df.columns[features_df.isnull().any() | np.isinf(features_df.values).any(axis=0)].tolist()
-        raise ValueError(f"Live feature NaN/Inf in columns {bad_cols} — skipping bar.")
-
-    atr_price   = atr_normalized * float(df["Close"].iloc[-1])
-    # Return raw (pre-scaler) atr_normalized separately so the live ER filter
-    # can compare it against spread_frac without using the scaled value.
-    return features_df, current_state, atr_price, atr_normalized, df
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Order execution
 # ─────────────────────────────────────────────────────────────────────────────
@@ -951,76 +621,6 @@ def send_market_order(
 # Live execution loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _update_regime_stability(tracker: dict, hmm_state: int) -> dict:
-    """Update per-bar regime stability state and return a stability info dict.
-
-    The *tracker* dict is mutated in-place and must be initialised once per
-    loop run as::
-
-        tracker = {"current_state": None, "consecutive_bars": 0,
-                   "previous_state": None, "exited_from_state": None}
-    """
-    if tracker["current_state"] is None:
-        tracker["current_state"]   = hmm_state
-        tracker["consecutive_bars"] = 1
-        tracker["previous_state"]  = hmm_state
-        tracker["exited_from_state"] = None
-    elif hmm_state != tracker["current_state"]:
-        logger.info(
-            "[REGIME CHANGE] %d → %d after %d bars",
-            tracker["current_state"], hmm_state, tracker["consecutive_bars"],
-        )
-        tracker["exited_from_state"] = tracker["current_state"]
-        tracker["previous_state"]    = tracker["current_state"]
-        tracker["current_state"]     = hmm_state
-        tracker["consecutive_bars"]  = 1
-    else:
-        tracker["consecutive_bars"] += 1
-
-    is_chop = hmm_state in (2, 3)
-    return {
-        "is_chop":              is_chop,
-        "consecutive_bars":     tracker["consecutive_bars"],
-        "is_stable_chop":       is_chop and tracker["consecutive_bars"] >= 3,
-        "just_entered_state":   tracker["consecutive_bars"] == 1,
-        "regime_changed_this_bar": tracker["consecutive_bars"] == 1,
-        "exited_from_state":    tracker["exited_from_state"],
-        "previous_state":       tracker["previous_state"],
-    }
-
-
-def _get_transition_prob(model_hmm, hmm_state: int) -> float:
-    """Return P(state → state) from the HMM transition matrix (self-transition)."""
-    try:
-        transmat = model_hmm.transmat_
-        if hmm_state < transmat.shape[0]:
-            return float(transmat[hmm_state, hmm_state])
-    except Exception:
-        pass
-    return 0.70
-
-
-def _calculate_bb_position(close_prices: np.ndarray, period: int = 20,
-                            num_std: float = 2.0) -> float:
-    """Return price position within Bollinger Bands: 0 = lower band, 1 = upper band.
-
-    Returns 0.5 (neutral) if there are insufficient bars or the band is too narrow.
-    """
-    if len(close_prices) < period:
-        return 0.5
-    try:
-        sma    = np.mean(close_prices[-period:])
-        std    = np.std(close_prices[-period:])
-        upper  = sma + num_std * std
-        lower  = sma - num_std * std
-        bw     = upper - lower
-        if bw < 1e-6:
-            return 0.5
-        pos = (close_prices[-1] - lower) / bw
-        return float(np.clip(pos, 0.0, 1.0))
-    except Exception:
-        return 0.5
-
 
 def run_live_loop(
     tf: str          = "H1",
@@ -1059,706 +659,293 @@ def run_live_loop(
 def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     profit_target: float = None,
                     use_tiered: bool = False) -> None:
-    """Inner loop extracted to allow clean finally / disconnect in run_live_loop."""
-    tf_mt5 = _get_tf_map()[tf.upper()]
+    """1:1 LIVE MIRROR of run_ml_filtered_backtest / _run_backtest_numba.
 
-    # Resolve live balance
+    Entries and exits are derived solely from strategy_backtest.latest_signal().
+    SL/TP sizing, the asymmetric guard_factor, the leg A/B structure, the
+    scale-in leg C, the regime-3 structural MR exit, and the mode-4 ATR trail /
+    time stop all replicate the notebook backtest kernel exactly. Lot sizing
+    keeps AdaptiveRiskManager. Real bid/ask fills already embed spread/slippage,
+    so the kernel's synthetic spread/slippage adjustments are the one necessary
+    live adaptation. PAPER-TRADE (demo) before risking capital.
+    """
+    from src.mt5_sync import ensure_data_updated
+
+    tf_up  = tf.upper()
+    tf_mt5 = _get_tf_map()[tf_up]
+    symbol = DEFAULT_SYMBOL
+    is_m5  = tf_up == "M5"
+    PIP_SIZE_PRICE = 0.10   # XAUUSD: 1 pip = 0.10 price (kernel constant)
+
     telemetry = get_account_telemetry()
     if account_size is None:
         account_size = _normalise_balance(telemetry["balance"], broker)
-        logger.info(
-            "Balance auto-detected: MT5 raw=%.2f  USD normalised=%.2f",
-            telemetry["balance"], account_size,
-        )
-
+        logger.info("Balance auto-detected: MT5 raw=%.2f  USD normalised=%.2f",
+                    telemetry["balance"], account_size)
     display_account_info(trading_balance=account_size)
 
-    # Resolve TF-specific magic number — each TF instance must use its own number
-    # so H1/M15/M5 running simultaneously don't see each other's positions.
-    magic = TF_MAGIC_MAP.get(tf.upper(), TF_MAGIC_MAP["H1"])
-    logger.info("Magic number for [%s]: %d", tf.upper(), magic)
+    magic = TF_MAGIC_MAP.get(tf_up, TF_MAGIC_MAP["H1"])
+    logger.info("Magic number for [%s]: %d", tf_up, magic)
 
-    # Load models — prefer broker+TF specific file; fall back to generic
-    hmm_path = hmm_model_path(tf, broker)
-    if not hmm_path.exists():
-        hmm_path = HMM_GENERIC_PATH
+    # Notebook-engine live bundle (raises if --mode optimize was not run first).
+    bundle = None
+    if load_live_bundle is not None:
+        for _a in ((tf_up, broker), (tf_up,), ()):
+            try:
+                bundle = load_live_bundle(*_a); break
+            except TypeError:
+                continue
+    if latest_signal is None:
+        raise RuntimeError("strategy_backtest.latest_signal unavailable — cannot trade.")
+
+    arm = AdaptiveRiskManager(account_size, tf=tf_up, broker=broker)
+    equity_gate = DailyEquityGate(tf=tf_up)
     try:
-        model_hmm = load_hmm(hmm_path)
-    except FileNotFoundError:
-        raise FileNotFoundError("HMM model not found. Run --mode train first.")
-    if int(getattr(model_hmm, "n_components", 0)) != 3:
-        raise RuntimeError(
-            f"Live runtime requires a 3-state HMM model; found n_components={getattr(model_hmm, 'n_components', None)}. "
-            "Re-train with canonical 3 states before live trading."
-        )
-
-    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
-
-    xgb_path = get_ensemble_path(tf, broker)
-    if not xgb_path.exists():
-        xgb_path = XGB_GENERIC_PATH
-
-    models_xgb = None
-    thresholds_xgb = None
-    xgb_meta = {}
-    if xgb_path.exists():
-        try:
-            models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble(xgb_path)
-        except FileNotFoundError:
-            models_xgb, thresholds_xgb, xgb_meta = None, None, {}
-
-    feature_cols = xgb_meta.get("feature_cols")
-    if not feature_cols:
-        _regime_cols = None
-        for _m in (trend_model, shock_model):
-            _names = getattr(_m, "feature_names_in_", None) if _m is not None else None
-            if _names is not None and len(_names) > 0:
-                _regime_cols = [str(c) for c in _names]
-                break
-        feature_cols = _regime_cols or list(FEATURE_COLS)
-
-    if trend_model is None and shock_model is None and (models_xgb is None or thresholds_xgb is None):
-        raise FileNotFoundError(
-            "No regime models or XGB ensemble model found. Run --mode train first."
-        )
-
-    # Resolve Kalman params from Optuna study or TF defaults
-    try:
-        from src.optimizer import get_best_params
-        params    = get_best_params(balance=account_size, broker=broker, tf=tf)
-        obs_cov   = params.get("obs_cov")
-        trans_cov = params.get("trans_cov")
+        equity_gate.reset_day(telemetry["equity"])
     except Exception:
-        params    = {}
-        obs_cov   = None
-        trans_cov = None
+        pass
 
-    cfg_tf    = TF_CONFIG[tf.upper()]
-    obs_cov   = obs_cov   if obs_cov   is not None else cfg_tf["obs_cov_default"]
-    trans_cov = trans_cov if trans_cov is not None else cfg_tf["trans_cov_default"]
+    legs = {"A": None, "B": None, "C": None}
+    leg_a_profit_hit = False
+    leg_b_profit_hit = False
+    last_bar_time = 0
+    last_audit_day = None
 
-    # Session state (persists across bars within a day)
-    last_bar_time = None
-    current_day   = None
-    cooldown_bars = 0   # bars to wait after a trade close before evaluating new signals
-    # Tracks the tickets and entry context of the most recently placed signal
-    # so the break-even SL logic can fire when TP1 closes position 1.
-    signal_tracker = {
-        "tickets": [],
-        "entry_price": 0.0,
-        "direction": None,
-        "tp1_hit": False,
-        "tp1_level": None,
-        "guard_hit": False,
-        "signal_type": None,
-        "atr_price": 0.0,
-        "bars_in_trade": 0,
-        "max_fav_pnl_usd": 0.0,
-        "entry_regime": None,
-    }   # cached ATR + lifecycle tracking for unified evaluate_bar exits
-    # Per-ticket ATR trail state: {ticket: {"activated": bool, "partial_done": bool, "current_sl": float}}
-    atr_state_tracker: dict = {}
-    # Deprecated peak-pnl tracker kept for cleanup compat (atr_state_tracker supersedes it)
-    peak_pnl_tracker: dict = {}
-    # Two-sided equity gate: loss side (5%) + Trailing Daily Equity Lock (profit side)
-    equity_gate = DailyEquityGate(tf=tf)
-    equity_gate.reset_day(account_size)
+    EXIT_MAP = {"fixed_tp": 0, "mr_exit": 1, "fixed_tp_plus_mr": 2,
+                "partial_tp_plus_mr": 3, "partial_tp_mr_time_stop": 4}
 
-    # SignalEngine — stateful per-bar regime confirmation engine
-    signal_engine = SignalEngine(tf=tf)
-    # Rolling close-price cache for Bollinger Band confluence filter (live only)
-    close_prices_cache: list = []
+    def _leg_lots(stop_dist):
+        try:
+            if getattr(arm, "is_small_account", False):
+                return (0.02, 0.03) if broker == "headway_cent" else (0.01, 0.01)
+            sl_pips = max(stop_dist / PIP_SIZE_PRICE, 1.0)
+            base = float(arm.calculate_lot_size(sl_pips))
+            per = max(MIN_LOT_GUARD, round(base / 2.0, 2))
+            return per, per
+        except Exception as exc:
+            logger.warning("Lot sizing fallback (%s)", exc)
+            return (0.02, 0.03) if broker == "headway_cent" else (0.01, 0.01)
 
-    arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
-    logger.info(
-        "Live loop started — TF=%s  broker=%s  balance=$%.2f  %s",
-        tf, broker, account_size, arm,
-    )
+    def _open_map():
+        poss = mt5.positions_get(symbol=symbol) or []
+        return {p.ticket: p for p in poss if p.magic == magic}
 
-    # ATR-linked trailing stop applies to all TFs unconditionally.
-    # The legacy profit_target CLI param is kept for backward compat but is no
-    # longer used — the ATR trail supersedes the old fixed-exit logic.
-    _lc_cfg        = config_for_tf(tf)
-    _atr_mult_log  = _lc_cfg.trail_mult
-    _activ_pnl_log = _lc_cfg.activation_pnl_usd
-    logger.info(
-        "ATR Trailing Stop — activation $%.2f | "
-        "multiplier %.1fx ATR [%s] | partial close (lot>%.2f).",
-        _activ_pnl_log, _atr_mult_log, tf.upper(), MIN_LOT_GUARD,
-    )
+    def _closed_in_profit(ticket):
+        try:
+            now = datetime.now(timezone.utc); start = now - timedelta(hours=48)
+            raw = mt5.history_deals_get(start, now, position=ticket) or []
+            deals = [d for d in raw if d.position_id == ticket]
+            if not any(d.entry == 1 for d in deals):
+                return None
+            return sum(d.profit + d.commission for d in deals) > 0
+        except Exception:
+            return None
 
-    # Warn if the MQL5 EA (same magic number) already has open positions.
-    _startup_positions = mt5.positions_get(symbol=DEFAULT_SYMBOL) or []
-    _ea_conflict = [p for p in _startup_positions if p.magic == magic]
-    if _ea_conflict:
-        logger.warning(
-            "CONFLICT: %d open position(s) with magic=%d detected at startup. "
-            "These were likely placed by the MQL5 EA (GoldRegimeX.mq5). "
-            "Running both EA and Python bridge simultaneously causes signal blocking. "
-            "Detach the EA from the chart before continuing.",
-            len(_ea_conflict), magic,
-        )
+    def reconcile():
+        nonlocal leg_a_profit_hit, leg_b_profit_hit
+        open_map = _open_map(); closed = []
+        for key in ("A", "B", "C"):
+            leg = legs[key]
+            if leg is None:
+                continue
+            if leg["ticket"] not in open_map:
+                prof = _closed_in_profit(leg["ticket"])
+                closed.append(leg["ticket"])
+                if key == "A" and prof:
+                    leg_a_profit_hit = True
+                if key == "B" and prof:
+                    leg_b_profit_hit = True
+                legs[key] = None
+        if closed:
+            _log_closed_pnl(closed, mt5, broker=broker, tf=tf_up)
+        if legs["A"] is None and legs["B"] is None and legs["C"] is None:
+            leg_a_profit_hit = False
+            leg_b_profit_hit = False
 
-    # Pre-seed the Bollinger Band close-price cache from MT5 history so BB
-    # is live from bar 1 instead of returning the neutral 0.5 fallback for
-    # the first 20 hours of every session.
-    try:
-        _seed_rates = mt5.copy_rates_from_pos(DEFAULT_SYMBOL, tf_mt5, 1, 50)
-        if _seed_rates is not None and len(_seed_rates) > 0:
-            close_prices_cache = [float(r["close"]) for r in _seed_rates]
-            logger.info("BB cache pre-seeded: %d historical closes loaded.", len(close_prices_cache))
-    except Exception as _seed_exc:
-        logger.debug("BB cache pre-seed failed (non-critical): %s", _seed_exc)
+    def _close_all(reason):
+        nonlocal leg_a_profit_hit, leg_b_profit_hit
+        tickets = []
+        for key in ("A", "B", "C"):
+            if legs[key] is not None:
+                _close_position(legs[key]["ticket"], mt5, comment=reason, magic=magic)
+                tickets.append(legs[key]["ticket"]); legs[key] = None
+        if tickets:
+            _log_closed_pnl(tickets, mt5, broker=broker, tf=tf_up)
+        leg_a_profit_hit = False
+        leg_b_profit_hit = False
+
+    logger.info("[%s] Notebook-engine live loop started (1:1 backtest parity).", tf_up)
+    send_telegram_msg(f"[{tf_up}] GoldRegimeX live loop online (engine-parity build).")
 
     while True:
         try:
-            # ── 1. Daily reset at UTC midnight ────────────────────────────
             today = datetime.now(timezone.utc).date()
-            if today != current_day:
-                current_day  = today
-                # Anchor the equity gate to the fixed risk-sizing balance so loss%
-                # and profit-lock% are computed against the same reference that
-                # check() receives (account_size + open_pnl).  Using the live MT5
-                # balance here would mismatch the baseline and trigger a false lock.
-                equity_gate.reset_day(account_size)
-                logger.info("New UTC day %s — equity gate reset (anchor $%.2f USD).", today, account_size)
-                # Send yesterday's P&L summary to Telegram at day rollover
+            if last_audit_day != today:
+                last_audit_day = today
                 try:
                     send_daily_audit_report(mt5, broker=broker)
-                except Exception as _audit_exc:
-                    logger.warning("Daily audit report failed: %s", _audit_exc)
+                except Exception as exc:
+                    logger.warning("Daily audit failed: %s", exc)
+                try:
+                    equity_gate.reset_day(get_account_telemetry()["equity"])
+                except Exception:
+                    pass
 
-            # ── 2. Bar-change detection ───────────────────────────────────
-            bars = mt5.copy_rates_from_pos(DEFAULT_SYMBOL, tf_mt5, 1, 1)
-            if bars is None or len(bars) == 0:
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-            bar_time = bars[0]["time"]
+            try:
+                tele = get_account_telemetry()
+                equity_gate.check(tele["equity"])
+                if getattr(equity_gate, "locked", False):
+                    if any(legs[k] is not None for k in ("A", "B", "C")):
+                        _close_all("GRX_daily_equity_gate")
+                    logger.warning("[%s] Daily equity gate LOCKED — trading paused.", tf_up)
+                    time.sleep(POLL_INTERVAL_SEC); continue
+            except Exception as exc:
+                logger.warning("Equity gate check failed: %s", exc)
+
+            rates = mt5.copy_rates_from_pos(symbol, tf_mt5, 1, 1)
+            if rates is None or len(rates) == 0:
+                time.sleep(POLL_INTERVAL_SEC); continue
+            bar_time = int(rates[0]["time"])
             if bar_time == last_bar_time:
-                # Between bars: detect position closures and report P&L immediately
-                if signal_tracker["tickets"]:
-                    open_set = {
-                        p.ticket
-                        for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                        if p.magic == magic
-                    }
-                    closed = [t for t in signal_tracker["tickets"] if t not in open_set]
-                    if closed:
-                        _log_closed_pnl(closed, mt5, broker=broker, tf=tf)
-                        for _t in closed:
-                            peak_pnl_tracker.pop(_t, None)
-                            atr_state_tracker.pop(_t, None)
-                        signal_tracker["tickets"] = [
-                            t for t in signal_tracker["tickets"] if t in open_set
-                        ]
-                        if not signal_tracker["tickets"]:
-                            signal_tracker["tp1_hit"] = False
-                            signal_engine.on_trade_closed()
-                            cooldown_bars = 3
-                            logger.info("Post-trade cooldown activated: 3 bars.")
-
-                # ── Daily equity protection gate ──────────────────────────
-                _pnl_divisor = 100 if broker == "headway_cent" else 1
-                _open_pnl = sum(
-                    p.profit for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                    if p.magic == magic
-                ) / _pnl_divisor
-                if equity_gate.check(account_size + _open_pnl):
-                    if equity_gate.needs_loss_notification:
-                        _loss_usd = -_open_pnl
-                        logger.warning(
-                            "Daily loss limit hit: equity=%.2f  loss=%.2f  "
-                            "(%.0f%% of $%.2f) -- closing all & locking until UTC midnight.",
-                            account_size + _open_pnl, _loss_usd,
-                            equity_gate.loss_pct * 100, account_size,
-                        )
-                        for _gp in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or []):
-                            if _gp.magic == magic:
-                                _close_position(_gp.ticket, mt5,
-                                                comment="GRX_Daily_Loss_Limit",
-                                                magic=magic)
-                        try:
-                            send_telegram_msg(
-                                f"🚨 UNIVERSAL SAFETY TRIGGERED [{tf}]: "
-                                f"Daily loss limit hit (${_loss_usd:.2f}). "
-                                "Bot locked for recovery."
-                            )
-                        except Exception:
-                            pass
-                    elif equity_gate.needs_profit_notification:
-                        logger.info(
-                            "Trailing Daily Equity Lock engaged [%s]: day gain ≥%.0f%% — "
-                            "profits banked, no new signals until UTC midnight.",
-                            tf, equity_gate.profit_lock_pct * 100,
-                        )
-                        try:
-                            send_telegram_msg(
-                                f"🔒 <b>Equity Lock [{tf} / {broker}]</b>\n"
-                                f"Day gain ≥ <b>{equity_gate.profit_lock_pct*100:.0f}%</b> — profits banked.\n"
-                                f"No new signals until midnight UTC."
-                            )
-                        except Exception:
-                            pass
-                    time.sleep(POLL_INTERVAL_SEC)
-                    continue
-
-                # ── M5 Quick Scalp Exit ────────────────────────────────────
-                # Close individual positions that reach the $4 scalp target.
-                # If regime hasn't changed and daily cap not hit, allow re-entry.
-                if tf.upper() == "M5" and signal_tracker["tickets"]:
-                    _scalp_target = config_for_tf("M5").scalp_target_usd
-                    for _st in list(signal_tracker["tickets"]):
-                        _sp = mt5.positions_get(ticket=_st)
-                        if not _sp:
-                            continue
-                        _s_pnl = floating_pnl_usd(_sp[0].profit, broker)
-                        if _s_pnl >= _scalp_target:
-                            _close_position(_st, mt5, comment="GRX_Fixed_Scalp_Target", magic=magic)
-                            logger.info(
-                                "[M5 SCALP] Position closed at target: ticket=%d  P&L=+$%.2f",
-                                _st, _s_pnl,
-                            )
-                            signal_tracker["tickets"] = [
-                                t for t in signal_tracker["tickets"] if t != _st
-                            ]
-                            peak_pnl_tracker.pop(_st, None)
-                            atr_state_tracker.pop(_st, None)
-
-                # ── ATR-linked Hybrid Trailing Stop ───────────────────────
-                # Phase 1 (one-time per ticket): when P&L >= PROFIT_ACTIVATION_USD,
-                #   move SL to breakeven+2×spread; optionally close 50% volume.
-                # Phase 2 (every poll): trail SL at price ∓ (ATR_mult × cached ATR).
-                if signal_tracker["tickets"]:
-                    _atr_mult  = _lc_cfg.trail_mult
-                    _activ_pnl = _lc_cfg.activation_pnl_usd
-                    _atr_cache = signal_tracker.get("atr_price", 0.0)
-                    _open_pos  = [
-                        p for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                        if p.magic == magic
-                        and p.ticket in set(signal_tracker["tickets"])
-                    ]
-                    for _pos in _open_pos:
-                        _cur    = floating_pnl_usd(_pos.profit, broker)
-                        _ticket = _pos.ticket
-                        _atr_st = atr_state_tracker.setdefault(
-                            _ticket,
-                            {"activated": False, "partial_done": False,
-                             "current_sl": _pos.sl},
-                        )
-
-                        if not _atr_st["activated"] and _cur >= _activ_pnl:
-                            # Phase 1: lock in break-even + 2× spread (one time)
-                            _tick   = mt5.symbol_info_tick(DEFAULT_SYMBOL)
-                            _spread = _tick.ask - _tick.bid
-                            _dir    = signal_tracker["direction"]
-                            if _dir == "BUY":
-                                _be_sl = round(signal_tracker["entry_price"] + _spread * 2, 2)
-                            else:
-                                _be_sl = round(signal_tracker["entry_price"] - _spread * 2, 2)
-                            _move_sl_to_breakeven(_ticket, _be_sl, mt5)
-                            _atr_st["activated"]  = True
-                            _atr_st["current_sl"] = _be_sl
-                            logger.info(
-                                "ATR trail activated: ticket=%d  P&L=+$%.2f  BE_SL=%.2f",
-                                _ticket, _cur, _be_sl,
-                            )
-                            # Partial close — skipped automatically if lot <= MIN_LOT_GUARD
-                            if not _atr_st["partial_done"]:
-                                if _execute_partial_close(_ticket, DEFAULT_SYMBOL, mt5, magic=magic):
-                                    _atr_st["partial_done"] = True
-
-                        elif _atr_st["activated"] and _atr_cache > 0:
-                            # Phase 2: ratchet SL toward price at ATR distance
-                            _tick = mt5.symbol_info_tick(DEFAULT_SYMBOL)
-                            _dir  = signal_tracker["direction"]
-                            if _dir == "BUY":
-                                _trail_sl = round(_tick.bid - _atr_mult * _atr_cache, 2)
-                            else:
-                                _trail_sl = round(_tick.ask + _atr_mult * _atr_cache, 2)
-                            if _set_trailing_sl(_ticket, _trail_sl,
-                                                _atr_st["current_sl"], _dir, mt5):
-                                _atr_st["current_sl"] = _trail_sl
-
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
+                reconcile()
+                time.sleep(POLL_INTERVAL_SEC); continue
             last_bar_time = bar_time
 
-            # ── Decrement post-trade cooldown on each new bar ─────────────
-            if cooldown_bars > 0:
-                cooldown_bars -= 1
-                logger.info("Post-trade cooldown: %d bar(s) remaining.", cooldown_bars)
-
-            # Update rolling close cache for Bollinger Band confluence filter
-            close_prices_cache.append(float(bars[0]["close"]))
-            if len(close_prices_cache) > 50:
-                close_prices_cache.pop(0)
-
-            # ── 3. Refresh telemetry for margin/display (risk sizing always
-            #        uses the caller-supplied account_size, not the live MT5
-            #        balance, because demo accounts carry arbitrary balances).
             try:
-                telemetry = get_account_telemetry()
-            except Exception:
-                telemetry = {}
+                ensure_data_updated(tf_up, symbol)
+            except Exception as exc:
+                logger.warning("Data refresh skipped: %s", exc)
 
-            arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
+            sig = latest_signal(tf_up, bundle=bundle)
+            if not sig:
+                time.sleep(POLL_INTERVAL_SEC); continue
 
-            # ── 4. Compute live features + probability ────────────────────
-            features_df, hmm_state, atr_price, raw_atr_norm, live_df = compute_live_features(
-                DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
-                feature_cols=feature_cols, mt5=mt5, tf=tf, broker=broker,
-            )
-            signal_tracker["atr_price"] = atr_price   # cache for between-bar ATR trail
+            signal      = int(sig.get("signal", 0))
+            regime_code = int(sig.get("regime_code", 0))
+            atr14       = float(sig.get("atr", 0.0) or 0.0)
+            engine_close = float(sig.get("close", 0.0) or 0.0)
+            bp = sig.get("base_params", {}) or {}
+            atr_stop         = float(bp.get("atr_stop", 2.0))
+            atr_target       = float(bp.get("atr_target", 2.0))
+            leg_a_atr_target = float(bp.get("leg_a_atr_target", 1.0))
+            exit_model       = str(bp.get("exit_model", "fixed_tp"))
+            trail_mult       = float(bp.get("trail_mult", 0.0))
+            time_stop_minutes = float(bp.get("time_stop_minutes", -1.0))
+            code = EXIT_MAP.get(exit_model, 0)
+            enable_fixed_tp  = code in (0, 2)
+            enable_mr        = code in (1, 2, 3, 4)
+            enable_time_stop = code == 4
+            enable_trail     = code == 4
 
-            # ── 4b. Hourly maintenance: weekly data pull + TCN staleness ──
-            _now_hour = datetime.now(timezone.utc).replace(
-                minute=0, second=0, microsecond=0
-            )
-            if not hasattr(run_live_loop, "_last_maint_hour") or \
-                    run_live_loop._last_maint_hour != _now_hour:
-                run_live_loop._last_maint_hour = _now_hour
-                try:
-                    from src.data_updater import WeeklyDataUpdater
-                    _upd = WeeklyDataUpdater()
-                    if _upd.should_update():
-                        logger.info("Sunday detected — running weekly data update.")
-                        _upd.update_all_timeframes()
-                except Exception as _upd_exc:
-                    logger.debug("Weekly data updater: %s", _upd_exc)
-            prob, prob_source = regime_first_probability(
-                features_df=features_df,
-                hmm_state=hmm_state,
-                tf=tf,
-                broker=broker,
-                trend_model=trend_model,
-                shock_model=shock_model,
-                ensemble_models=models_xgb,
-                ensemble_thresholds=thresholds_xgb,
-            )
-            logger.info("Probability source: %s | prob=%.3f", prob_source, prob)
-            gmm_cluster = int(features_df["gmm_vol_cluster"].iloc[0]) if "gmm_vol_cluster" in features_df.columns else -1
+            reconcile()
 
-            # ── Spread efficiency filter ──────────────────────────────────────
-            # Use the RAW (pre-scaler) atr_normalized fraction — the StandardScaler
-            # can produce negative values which make the ratio meaningless.
-            _spread_frac = BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0.0004)
-            _er          = raw_atr_norm / _spread_frac if _spread_frac > 0 else 999.0
-            if _er < 1.25:
-                logger.info(
-                    "Efficiency ratio %.2f < 1.25 (ATR=%.5f / spread=%.5f) — no signal.",
-                    _er, raw_atr_norm, _spread_frac,
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
+            if enable_mr and regime_code == 3 and any(legs[k] is not None for k in ("A", "B", "C")):
+                logger.info("[%s] Structural MR exit (regime==3) — flattening.", tf_up)
+                send_telegram_msg(f"[{tf_up}] MR exit (regime 3) — closing all legs.")
+                _close_all("GRX_MR_regime3")
+                time.sleep(POLL_INTERVAL_SEC); continue
 
-            # ── 5. Log bar info on every new bar (always visible) ─────────
-            bar_str   = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            state_lbl = STATE_NAMES.get(int(hmm_state), str(hmm_state))
-            logger.info(
-                "Bar %s | state=%s | prob=%.3f | Efficiency=%.1fx",
-                bar_str, hmm_state, prob, _er,
-            )
-            send_telegram_msg(
-                f"📊 <b>Bar</b> {bar_str} [{tf}]\n"
-                f"Regime: <b>{state_lbl}</b> ({hmm_state})  |  "
-                f"Prob: <b>{prob:.3f}</b>  |  "
-                f"Efficiency: <b>{_er:.1f}x</b>"
-            )
+            if enable_time_stop and time_stop_minutes > 0 and legs["B"] is not None:
+                now_min = int(datetime.now(timezone.utc).timestamp() // 60)
+                if (now_min - legs["B"]["entry_min"]) >= time_stop_minutes:
+                    logger.info("[%s] Time stop (%.0f min) — flattening.", tf_up, time_stop_minutes)
+                    _close_all("GRX_time_stop")
+                    time.sleep(POLL_INTERVAL_SEC); continue
 
-            from src.processor import compute_synth_vix, compute_dynamic_atr_bands
-            _svix_raw  = compute_synth_vix(live_df)
-            _svix_val  = float(_svix_raw.iloc[-1]) if not np.isnan(_svix_raw.iloc[-1]) else 0.0
-            _atr_bands = compute_dynamic_atr_bands(live_df)
-            _atr_band_val = float(_atr_bands.iloc[-1]) if not np.isnan(_atr_bands.iloc[-1]) else 0.5
-
-            # ── 6. Position management (always runs — P&L, break-even, policy-exit)
-            if signal_tracker["tickets"]:
-                _all_pos = [
-                    p for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                    if p.magic == magic
-                ]
-                _pos_by_ticket = {int(p.ticket): p for p in _all_pos}
-                open_set = set(_pos_by_ticket.keys())
-                active = [t for t in signal_tracker["tickets"] if t in open_set]
-                closed = [t for t in signal_tracker["tickets"] if t not in open_set]
-                # Log P&L for any positions that closed since last bar
-                if closed:
-                    _log_closed_pnl(closed, mt5, broker=broker, tf=tf)
-                # Profit guard: move SL to entry+spread when 70% to TP1 (all TFs)
-                if active:
-                    _apply_profit_guard(signal_tracker, mt5)
-                # TP1 hit: first position gone → move runner's SL to break-even
-                if len(active) < len(signal_tracker["tickets"]) and not signal_tracker["tp1_hit"]:
-                    signal_tracker["tp1_hit"] = True
-                    for ticket in active:
-                        _move_sl_to_breakeven(ticket, signal_tracker["entry_price"], mt5)
-
-                if active:
-                    signal_tracker["bars_in_trade"] = int(signal_tracker.get("bars_in_trade", 0)) + 1
-                    _cur_pnl_raw = float(
-                        sum(_pos_by_ticket[t].profit for t in active if t in _pos_by_ticket)
-                    )
-                    _cur_pnl_usd = float(floating_pnl_usd(_cur_pnl_raw, broker))
-                    _max_fav = float(signal_tracker.get("max_fav_pnl_usd", 0.0))
-                    signal_tracker["max_fav_pnl_usd"] = max(_max_fav, _cur_pnl_usd)
-
-                    _pos_ctx = {
-                        "direction": 1 if signal_tracker.get("direction") == "BUY" else -1,
-                        "cur_pnl": _cur_pnl_usd,
-                        "max_fav_pnl": float(signal_tracker.get("max_fav_pnl_usd", 0.0)),
-                        "bars_in_trade": int(signal_tracker.get("bars_in_trade", 0)),
-                    }
-                    _row_ctx_exit = {
-                        "hmm_state": int(hmm_state),
-                        "prob": float(prob),
-                        "synth_vix_zscore": _svix_val,
-                        "atr_band_position": _atr_band_val,
-                    }
-                    _exit_decision = signal_engine.evaluate_bar(
-                        _row_ctx_exit,
-                        _pos_ctx,
-                        {"tf": tf, "hmm_transmat": model_hmm.transmat_},
-                    )
-                    if _exit_decision.exit:
-                        for ticket in active:
-                            _close_position(
-                                ticket,
-                                mt5,
-                                comment=f"GRX_policy_exit_{_exit_decision.reason}",
-                                magic=magic,
-                            )
-                        logger.info("Policy exit triggered: %s", _exit_decision.reason)
-                        active = []
-
-                signal_tracker["tickets"] = active
-                if not active:
-                    signal_engine.on_trade_closed()
-                    signal_tracker["bars_in_trade"] = 0
-                    signal_tracker["max_fav_pnl_usd"] = 0.0
-                    cooldown_bars = 3
-                    logger.info("Post-trade cooldown activated: 3 bars.")
-            if equity_gate.locked:
-                logger.info(
-                    "Equity gate locked — no new signal (state=%s).",
-                    state_lbl,
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 8. Skip new signals if a position is still open ──────────
-            if has_open_position(DEFAULT_SYMBOL, magic):
-                logger.info(
-                    "Open position -- holding (state=%s).",
-                    state_lbl,
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 8a. Post-trade cooldown guard ─────────────────────────────
-            if cooldown_bars > 0:
-                logger.info(
-                    "Cooldown active: %d bar(s) remaining — no new signal (state=%s).",
-                    cooldown_bars, state_lbl,
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 8. Global multi-TF exposure guard ────────────────────────
-            # Count open positions across ALL three GRX magic numbers so that
-            # H1 + M15 + M5 running simultaneously on the same $15 account
-            # can't exceed 4 open positions total.
-            _all_grx_open = sum(
-                1 for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
-                if p.magic in ALL_GRX_MAGICS
-            )
-            if _all_grx_open >= 4:
-                logger.info(
-                    "[GLOBAL GUARD] Max account exposure reached (%d positions across all TFs). "
-                    "Skipping %s signal.", _all_grx_open, tf,
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 9. Signal routing — regime-confirmation engine ────────────
-
-            _bb_pos = _calculate_bb_position(np.array(close_prices_cache))
-
-            # ── Single policy call via evaluate_bar (Phase 2) ─────────────────
-            # evaluate_bar calls update_regime internally and enforces M15/M5
-            # specialization gates (_m15_entry_ok, dynamic_prob_threshold).
-            _row_ctx = {
-                "hmm_state":         hmm_state,
-                "prob":              prob,
-                "synth_vix_zscore":  _svix_val,
-                "atr_band_position": _atr_band_val,
-            }
-            _entry_decision = signal_engine.evaluate_bar(
-                _row_ctx, None, {"tf": tf, "hmm_transmat": model_hmm.transmat_}
-            )
-            if not _entry_decision.enter:
-                regime_desc = ("BULL" if hmm_state == BULL_STATE
-                               else "BEAR" if hmm_state == BEAR_STATE
-                               else "CHOP")
-                logger.info(
-                    "[LOGIC AUDIT] %s | state=%d  prob=%.3f  bars=%d  P(stay)=%.2f  vix_z=%.2f  atr_band=%.2f  reason=%s",
-                    regime_desc, hmm_state, prob,
-                    signal_engine.bars_in_regime,
-                    _get_transition_prob(model_hmm, hmm_state),
-                    _svix_val, _atr_band_val, _entry_decision.reason,
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            _dir_int  = _entry_decision.direction
-            _size_mult = _entry_decision.position_size_multiplier
-
-            if _dir_int == 1:
-                direction   = "BUY"
-                order_type  = mt5.ORDER_TYPE_BUY
-                signal_type = "shock" if _entry_decision.regime == REGIME_SHOCK else "trend"
-                logger.info("[SIGNAL] BUY (%s) | prob=%.3f | bars=%d | P(stay)=%.2f",
-                            signal_type,
-                            prob, signal_engine.bars_in_regime, _get_transition_prob(model_hmm, hmm_state))
-            elif _dir_int == -1:
-                direction   = "SELL"
-                order_type  = mt5.ORDER_TYPE_SELL
-                signal_type = "shock" if _entry_decision.regime == REGIME_SHOCK else "trend"
-                logger.info("[SIGNAL] SELL (%s) | prob=%.3f | bars=%d | P(stay)=%.2f",
-                            signal_type,
-                            prob, signal_engine.bars_in_regime, _get_transition_prob(model_hmm, hmm_state))
-            else:
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 9. Position sizing ────────────────────────────────────────
-            tp_mults      = _tp_multipliers(tf, hmm_state)
-            limits        = arm.get_trade_limits(hmm_state)
-            pos_per_trade = min(limits["pos_per_trade"], len(tp_mults))
-            sl_distance   = max(atr_price * TF_ATR_MULTIPLIER.get(tf.upper(), 2.0), 0.01)
-
-            # $15 accounts use hardcoded lot splits — bypass AdaptiveRiskManager.
-            # Cent:     0.02 (pos1) + 0.03 (pos2) = 0.05 micro-lots total.
-            # Standard: 0.01 single position only — margin safety on $15 standard.
-            # Accounts > $50: dynamic ARM sizing as normal.
-            if round(account_size) == 15:
-                if broker == "headway_cent":
-                    forced_lots = [0.02, 0.03]
+            if enable_trail and legs["B"] is not None and atr14 > 0 and trail_mult > 0 and engine_close > 0:
+                legB = legs["B"]; dist = trail_mult * atr14
+                if legB["side"] == 1:
+                    new_sl = engine_close - dist
+                    if _set_trailing_sl(legB["ticket"], new_sl, legB["stop"], "BUY", mt5):
+                        legB["stop"] = new_sl
                 else:
-                    forced_lots   = [0.01]
-                    pos_per_trade = 1
-                pos_per_trade = min(pos_per_trade, len(forced_lots))
-                logger.info(
-                    "[SPECIAL] $15 Account Detected: Enforcing forced lot sizing "
-                    "(Broker: %s)  lots=%s  pos_per_trade=%d",
-                    broker, forced_lots, pos_per_trade,
-                )
-            else:
-                lot_total   = arm.calculate_lot_size(stop_loss_pips=sl_distance)
-                lot_per_pos = max(0.01, round(lot_total / pos_per_trade, 2))
-                forced_lots = [lot_per_pos] * pos_per_trade
+                    new_sl = engine_close + dist
+                    if _set_trailing_sl(legB["ticket"], new_sl, legB["stop"], "SELL", mt5):
+                        legB["stop"] = new_sl
 
-            # ── 10. Deviation (TF-specific + regime stability) ────────────
-            deviation = compute_deviation(model_hmm, hmm_state, tf)
+            is_flat = legs["A"] is None and legs["B"] is None and legs["C"] is None
+            leg_a_closed_b_open = legs["A"] is None and legs["B"] is not None and leg_a_profit_hit
+            leg_b_closed_a_open = legs["B"] is None and legs["A"] is not None and leg_b_profit_hit
+            can_scale_in = legs["C"] is None and (leg_a_closed_b_open or leg_b_closed_a_open)
 
-            # ── 11. SL / TP prices ────────────────────────────────────────
-            tick = mt5.symbol_info_tick(DEFAULT_SYMBOL)
-            if direction == "BUY":
-                entry_price = tick.ask
-                sl_price    = round(entry_price - sl_distance, 2)
-                tp_levels   = [round(entry_price + sl_distance * m, 2) for m in tp_mults]
-            else:
-                entry_price = tick.bid
-                sl_price    = round(entry_price + sl_distance, 2)
-                tp_levels   = [round(entry_price - sl_distance * m, 2) for m in tp_mults]
+            if signal != 0 and (is_flat or can_scale_in) and atr14 > 0:
+                info = mt5.symbol_info(symbol); tick = mt5.symbol_info_tick(symbol)
+                if info is None or tick is None:
+                    time.sleep(POLL_INTERVAL_SEC); continue
+                spread_price = info.spread * info.point
+                if spread_price > 0.8 * atr14:
+                    logger.info("[%s] Spread %.3f > 0.8*ATR %.3f — skip entry.", tf_up, spread_price, 0.8 * atr14)
+                    time.sleep(POLL_INTERVAL_SEC); continue
+                all_pos = mt5.positions_get(symbol=symbol) or []
+                if sum(1 for p in all_pos if p.magic in ALL_GRX_MAGICS) >= 4:
+                    logger.info("[%s] Global exposure cap (4) reached — skip entry.", tf_up)
+                    time.sleep(POLL_INTERVAL_SEC); continue
 
-            # ── 11b. Spread viability guard (M5 scalps + all TFs on standard) ─
-            spread_ratio = MIN_SPREAD_RATIO.get(broker, 1.5)
-            if tf.upper() == "M5" or broker == "standard":
-                sym_info     = mt5.symbol_info(DEFAULT_SYMBOL)
-                spread_price = (sym_info.spread * sym_info.point) if sym_info else 0.0
-                tp1_distance = sl_distance * tp_mults[0]
-                if spread_price > 0 and tp1_distance < spread_price * spread_ratio:
-                    logger.warning(
-                        "Unviable trade [%s/%s]: TP1=%.4f < %.1fx spread=%.4f. Skipping.",
-                        tf, broker, tp1_distance, spread_ratio, spread_price,
+                side  = 1 if signal > 0 else -1
+                guard = (0.85 if side == 1 else 0.75) if is_m5 else 0.65
+                dev   = int(TF_DEFAULT_DEV.get(tf_up, DEFAULT_DEVIATION))
+                otype = mt5.ORDER_TYPE_BUY if side == 1 else mt5.ORDER_TYPE_SELL
+                entry_ref = tick.ask if side == 1 else tick.bid
+                now_min = int(datetime.now(timezone.utc).timestamp() // 60)
+
+                if is_flat:
+                    actual_stop_dist = atr_stop * atr14 * guard
+                    runner_tp_dist   = atr_target * atr14 * guard
+                    leg_a_tp_dist    = leg_a_atr_target * atr14
+                    lot_a, lot_b = _leg_lots(actual_stop_dist)
+                    if side == 1:
+                        stop_px = entry_ref - actual_stop_dist
+                        a_tp = entry_ref + leg_a_tp_dist if leg_a_atr_target > 0 else 0.0
+                        b_tp = entry_ref + runner_tp_dist if enable_fixed_tp else 0.0
+                    else:
+                        stop_px = entry_ref + actual_stop_dist
+                        a_tp = entry_ref - leg_a_tp_dist if leg_a_atr_target > 0 else 0.0
+                        b_tp = entry_ref - runner_tp_dist if enable_fixed_tp else 0.0
+                    if not check_margin(symbol, lot_a + lot_b, otype, entry_ref):
+                        logger.warning("[%s] Margin check failed — skip entry.", tf_up)
+                        time.sleep(POLL_INTERVAL_SEC); continue
+                    resA = send_market_order(symbol, otype, lot_a, round(stop_px, 2), round(a_tp, 2), dev, magic, f"GRX_{tf_up}_A")
+                    if resA.get("success"):
+                        legs["A"] = {"ticket": resA["order"], "side": side, "entry": entry_ref,
+                                     "stop": round(stop_px, 2), "tp": round(a_tp, 2), "entry_min": now_min, "lot": lot_a}
+                    resB = send_market_order(symbol, otype, lot_b, round(stop_px, 2), round(b_tp, 2), dev, magic, f"GRX_{tf_up}_B")
+                    if resB.get("success"):
+                        legs["B"] = {"ticket": resB["order"], "side": side, "entry": entry_ref,
+                                     "stop": round(stop_px, 2), "tp": round(b_tp, 2), "entry_min": now_min, "lot": lot_b}
+                    leg_a_profit_hit = False; leg_b_profit_hit = False
+                    side_txt = "BUY" if side == 1 else "SELL"
+                    b_desc = f"TP {b_tp:.2f}" if enable_fixed_tp else "runner (no TP)"
+                    send_telegram_msg(
+                        f"[{tf_up}] {side_txt} opened (legs A+B)\n"
+                        f"entry~{entry_ref:.2f}  SL {stop_px:.2f}  guard {guard}\n"
+                        f"legA TP {a_tp:.2f} lot {lot_a}  |  legB {b_desc} lot {lot_b}\n"
+                        f"atr {atr14:.2f}  exit_model {exit_model}"
                     )
-                    time.sleep(POLL_INTERVAL_SEC)
-                    continue
+                elif can_scale_in:
+                    runner = legs["B"] if leg_a_closed_b_open else legs["A"]
+                    if side != runner["side"]:
+                        time.sleep(POLL_INTERVAL_SEC); continue
+                    stop_dist_c = 0.5 * atr14 * guard
+                    tp_dist_c   = 0.5 * atr14 * guard
+                    la, lb = _leg_lots(stop_dist_c)
+                    lot_c = la if leg_a_closed_b_open else lb
+                    if side == 1:
+                        stop_px = entry_ref - stop_dist_c; c_tp = entry_ref + tp_dist_c
+                    else:
+                        stop_px = entry_ref + stop_dist_c; c_tp = entry_ref - tp_dist_c
+                    if not check_margin(symbol, lot_c, otype, entry_ref):
+                        time.sleep(POLL_INTERVAL_SEC); continue
+                    resC = send_market_order(symbol, otype, lot_c, round(stop_px, 2), round(c_tp, 2), dev, magic, f"GRX_{tf_up}_C")
+                    if resC.get("success"):
+                        legs["C"] = {"ticket": resC["order"], "side": side, "entry": entry_ref,
+                                     "stop": round(stop_px, 2), "tp": round(c_tp, 2), "entry_min": now_min, "lot": lot_c}
+                        send_telegram_msg(f"[{tf_up}] Scale-in leg C {('BUY' if side==1 else 'SELL')} lot {lot_c}  SL {stop_px:.2f}  TP {c_tp:.2f}")
 
-            # ── 12. Margin check ──────────────────────────────────────────
-            if not check_margin(DEFAULT_SYMBOL, max(forced_lots), order_type, entry_price):
-                logger.warning(
-                    "Insufficient margin for %s lot=%.2f. Skipping. Free margin: %.2f",
-                    direction, max(forced_lots), telemetry.get("free_margin", 0),
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 13. Send order(s) with state-aware staged TPs ─────────────
-            signal_tracker = {
-                "tickets": [],
-                "entry_price": entry_price,
-                "direction": direction,
-                "tp1_hit": False,
-                "tp1_level": tp_levels[0],
-                "guard_hit": False,
-                "signal_type": signal_type,
-                "bars_in_trade": 0,
-                "max_fav_pnl_usd": 0.0,
-                "entry_regime": _entry_decision.regime,
-            }
-            peak_pnl_tracker = {}
-            logger.info(
-                "SIGNAL %s | state=%d | prob=%.3f | size=%.2f | lots=%s | sl=%.2f | tp=%s | dev=%d",
-                direction, hmm_state, prob, _size_mult,
-                "+".join(f"{l:.2f}" for l in forced_lots[:pos_per_trade]),
-                sl_price, "/".join(f"{t:.2f}" for t in tp_levels), deviation,
-            )
-            for p in range(pos_per_trade):
-                tp_price    = tp_levels[p]
-                current_lot = forced_lots[p] if p < len(forced_lots) else forced_lots[-1]
-                _trade_tag  = "SHOCK" if signal_type == "shock" else "TREND"
-                comment     = f"GRX_{tf}_{_trade_tag}_{direction}_s{hmm_state}_tp{p+1}"
-                result = send_market_order(
-                    symbol=DEFAULT_SYMBOL,
-                    order_type=order_type,
-                    lot=current_lot,
-                    sl=sl_price,
-                    tp=tp_price,
-                    deviation=deviation,
-                    magic=magic,
-                    comment=comment,
-                )
-                if result["success"]:
-                    signal_tracker["tickets"].append(result["order"])
-                else:
-                    logger.error(
-                        "Order %d/%d failed — retcode=%d  %s",
-                        p + 1, pos_per_trade,
-                        result["retcode"], result["comment"],
-                    )
-
-            # Send one Telegram message per signal summarising all filled positions
-            if signal_tracker["tickets"]:
-                signal_engine.on_trade_entered(hmm_state)
-                _emoji  = "🟢" if direction == "BUY" else "🔴"
-                _tag    = "⚡ VOLATILITY SHOCK" if signal_type == "shock" else "📈 TREND"
-                _tp_str = " / ".join(f"{t:.2f}" for t in tp_levels)
-                _tix    = "  ".join(f"#{t}" for t in signal_tracker["tickets"])
-                send_telegram_msg(
-                    f"{_emoji} <b>Trade opened</b> [{tf}]  {_tag}\n"
-                    f"<b>{direction}</b>  Regime: <b>{state_lbl}</b>  Prob: <b>{prob:.3f}</b>\n"
-                    f"Lots: <b>{'+'.join(f'{l:.2f}' for l in forced_lots[:pos_per_trade])}</b>  "
-                    f"SL: <b>{sl_price:.2f}</b>  TP: <b>{_tp_str}</b>\n"
-                    f"Tickets: {_tix}"
-                )
-
+            time.sleep(POLL_INTERVAL_SEC)
         except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt — stopping live loop.")
+            logger.info("[%s] Interrupted — exiting live loop.", tf_up)
             break
         except Exception as exc:
-            logger.error(
-                "Unhandled loop error: %s — sleeping 30 s before retry.",
-                exc, exc_info=True,
-            )
-            time.sleep(30)
+            logger.exception("[%s] Loop iteration error: %s", tf_up, exc)
+            time.sleep(POLL_INTERVAL_SEC)
+
