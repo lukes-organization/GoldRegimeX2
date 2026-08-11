@@ -1,5 +1,0 @@
-timeframe,method,n_trades,obs_return_%,median_return_%,return_p5_%,return_p95_%,median_dd_%,dd_p95_%,prob_profit_%,prob_ruin_%
-M15,reshuffle,106,2716.13,2716.13,2716.13,2716.13,1.21,5.99,100.0,0.0
-M15,bootstrap,106,2716.13,2711.77,2478.52,2969.21,1.1,6.05,100.0,0.0
-M5,reshuffle,545,5799.4,5799.4,5799.4,5799.4,0.26,1.82,100.0,0.0
-M5,bootstrap,545,5799.4,5794.53,5581.32,6018.69,0.23,1.83,100.0,0.0

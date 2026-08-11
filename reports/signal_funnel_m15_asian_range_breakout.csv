@@ -1,0 +1,11 @@
+strategy,direction,stage,count,pct_of_total,pct_of_previous
+M15 Asian Breakout,long,total_bars,120159,100.0,100.0
+M15 Asian Breakout,long,session_allowed,25800,21.471550195990314,21.471550195990314
+M15 Asian Breakout,long,bullish_macro_regime,4941,4.11205153172047,19.151162790697676
+M15 Asian Breakout,long,close_above_asian_high,2629,2.187934320358858,53.20785266140457
+M15 Asian Breakout,long,previous_close_not_above_high,305,0.25383034146422656,11.601369341955117
+M15 Asian Breakout,short,total_bars,120159,100.0,100.0
+M15 Asian Breakout,short,session_allowed,25800,21.471550195990314,21.471550195990314
+M15 Asian Breakout,short,bearish_macro_regime,4212,3.505355404089581,16.325581395348838
+M15 Asian Breakout,short,close_below_asian_low,2012,1.6744480230361438,47.768281101614434
+M15 Asian Breakout,short,previous_close_not_below_low,253,0.21055434882114532,12.57455268389662

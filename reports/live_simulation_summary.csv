@@ -1,3 +1,0 @@
-timeframe,months,start,end,bars,trades,win_rate_%,profit_factor,net_profit_$,expectancy_$,return_%,max_dd_raw_%,max_dd_seasoned_%,max_dd_$,sharpe,sortino,calmar,recovery_factor,mar,final_balance_$,final_equity_$
-M15,6,2026-02-02,2026-07-31,11793,106,97.17,119.093,407.42,3.8436,2716.07,2.83,0.45,2.45,5.213,0.0,32059.942,34.099,32059.942,422.41,422.41
-M5,6,2026-02-02,2026-07-31,35273,545,99.63,613.613,869.91,1.5962,5799.02,7.2,2.29,8.87,6.863,0.0,57027.09,13.661,57027.09,884.85,884.85

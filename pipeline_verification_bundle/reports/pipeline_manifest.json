@@ -1,9 +1,0 @@
-{
-  "feature_hash": "623f341ad1b78b4e7c919f12106b8693da20a38a180f0e7cc6b70d33b6ad50ef",
-  "session_filter_hash": "c023b0b650f67baa63d91e5f0e35040763bad77a561b19c55e323e7d99db84f3",
-  "strategy_hash": "e83d755769aefe1c0f9533fce138127f326ba7da88ea6b3fca5e3848a0ea293c",
-  "candidate_hash": "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126",
-  "model_hash": "c89a148be40e6752261e3038609a4b68de22fa3bfdaf32f884edffb8480b9bbe",
-  "pipeline_version": "v1.0.0",
-  "written_at": "2026-07-14T07:23:44.615783+00:00"
-}

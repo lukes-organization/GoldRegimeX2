@@ -1,2 +1,0 @@
-timeframe,dominant_stage,dominant_marginal_loss_pct,explanation
-M15,HMM,97.88200513584083,"Dominant bottleneck: HMM stage removes 97.9% of candidates that reached it. This is the marginal loss (relative to survivors of the previous stage), not the total loss versus Generated, so it is not misattributed to signal generation."

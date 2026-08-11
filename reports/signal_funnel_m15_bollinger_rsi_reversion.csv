@@ -1,0 +1,11 @@
+strategy,direction,stage,count,pct_of_total,pct_of_previous
+M15 Bollinger/RSI Mean Reversion,long,total_bars,120159,100.0,100.0
+M15 Bollinger/RSI Mean Reversion,long,mr_regime,23494,19.55242636839521,19.55242636839521
+M15 Bollinger/RSI Mean Reversion,long,band_excursion,2194,1.825913997286928,9.338554524559463
+M15 Bollinger/RSI Mean Reversion,long,band_reentry,1653,1.375677227673333,75.34184138559708
+M15 Bollinger/RSI Mean Reversion,long,rsi_extreme,0,0.0,0.0
+M15 Bollinger/RSI Mean Reversion,short,total_bars,120159,100.0,100.0
+M15 Bollinger/RSI Mean Reversion,short,mr_regime,23494,19.55242636839521,19.55242636839521
+M15 Bollinger/RSI Mean Reversion,short,band_excursion,2229,1.8550420692582328,9.487528730739763
+M15 Bollinger/RSI Mean Reversion,short,band_reentry,1621,1.349045847585283,72.72319425751458
+M15 Bollinger/RSI Mean Reversion,short,rsi_extreme,0,0.0,0.0

@@ -1,187 +1,124 @@
-"""src/strategy_backtest.py -- single source of truth for scoring + backtesting.
+"""src/strategy_backtest.py -- deployed-model signal for the live/demo app.
 
-This module is the *only* bridge between the trained notebook engine
-(``src.grid_search_plateau``) and the rest of the application (train / validate
-/ live).  It loads the exported live bundle produced by ``--mode optimize``
-(``pipeline_verification_bundle/models/goldregimex_live_model.pkl``) and runs
-inference + backtests through the SAME code path the notebook uses
-(``grid_search_plateau.evaluate_ml_model``), so:
+latest_signal(tf) reproduces the SAME decision the Explorer backtester makes on
+the most recent bar:
+  1. build the shared features on the freshest CSVs using the NOTEBOOK'S OWN
+     load_panel + build_features (loaded via notebook_runner, defs only),
+  2. run the deployed HMM+XGB model from the exported bundle,
+  3. apply the plateau-selected probability threshold and the regime gate.
+Because it uses the notebook's feature code + the exported model + threshold,
+online signals match backtest -- the backtester is a mirror of live/demo.
 
-    the model that is optimized  ==  the model that is validated
-                                 ==  the model that is traded.
-
-The legacy ML stack (processor / engine_hmm / engine_xgb / backtester /
-signal_engine) has been retired -- see CONSOLIDATION.md.
-
-Canonical engine contract (from grid_search_plateau):
-    feat  = build_features(panel, tf)          # adds regime_code, atr14, Close, ...
-    probs = model.predict_proba_raw(feat)      # [:,0]=P(down)  [:,2]=P(up)
-    trades, metrics = run_ml_filtered_backtest(tf, feat, probs, base_params, threshold)
-Signals are TREND-gated (regime_code == 1) and confidence-filtered on the
-grid-selected xgb_threshold.
+Everything degrades gracefully: if the bundle or optional deps are unavailable it
+returns None / a reason string, which the app surfaces to the user instead of
+crashing.
 """
 from __future__ import annotations
-
-import pickle
+import sys, pickle
 from pathlib import Path
-from typing import Optional
-
 import numpy as np
-import pandas as pd
 
-from src.logger import setup_logger
+from . import ml_models
+from . import notebook_runner as nr
 
-logger = setup_logger(__name__)
+BUNDLE_PKL = nr.REPO_ROOT / "pipeline_verification_bundle" / "models" / "goldregimex_live_model.pkl"
 
-# Repo-root anchored path to the exported live bundle.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-LIVE_MODEL_PKL = _REPO_ROOT / "pipeline_verification_bundle" / "models" / "goldregimex_live_model.pkl"
+_BUNDLE = None
+_DEFS = None
 
 
-def load_live_bundle(path: Path | str = LIVE_MODEL_PKL) -> dict:
-    """Load the exported live bundle (models + thresholds + base_params).
+def _register_pickle_classes():
+    "Expose the model classes under __main__ so the notebook-pickled bundle loads."
+    main = sys.modules.get("__main__")
+    if main is None:
+        return
+    for name in dir(ml_models):
+        obj = getattr(ml_models, name)
+        if isinstance(obj, type) and not hasattr(main, name):
+            setattr(main, name, obj)
 
-    Raises FileNotFoundError with actionable guidance if optimize hasn't run.
-    """
-    path = Path(path)
-    if not path.exists():
+
+def load_live_bundle(path=None, force=False):
+    """Load and cache the exported live model bundle."""
+    global _BUNDLE
+    if _BUNDLE is not None and not force:
+        return _BUNDLE
+    p = Path(path) if path else BUNDLE_PKL
+    if not p.exists():
         raise FileNotFoundError(
-            f"Live model bundle not found at {path}. "
-            "Run  python main.py --mode optimize  first."
-        )
-    with open(path, "rb") as fh:
-        bundle = pickle.load(fh)
-    return bundle
+            "Live model bundle not found at %s. Build it first: python main.py explore" % p)
+    _register_pickle_classes()
+    with open(p, "rb") as fh:
+        _BUNDLE = pickle.load(fh)
+    return _BUNDLE
 
 
-def bundle_params_for(tf: str, bundle: Optional[dict] = None):
-    """Return (model, base_params, threshold) for a timeframe from the bundle.
+def _explorer_defs():
+    """Load the Explorer notebook's config + loaders + feature code (defs only)."""
+    global _DEFS
+    if _DEFS is None:
+        import numpy as _np, pandas as _pd, math as _math, os as _os
+        ns = {"np": _np, "pd": _pd, "math": _math, "os": _os}
+        # RAW cells: 1 bootstrap, 2 ML shims, 3 config, 6 loaders, 7 features
+        nr.run_notebook("explorer", namespace=ns, only=[1, 2, 3, 6, 7],
+                        allow_fail=True, quiet=True)
+        _DEFS = ns
+    return _DEFS
 
-    base_params already carries ``exit_model`` (matching the notebook export).
-    ``threshold`` is the plateau-selected xgb_threshold for the timeframe.
+
+def latest_signal(tf, df=None, bundle=None):
+    """Return the deployed signal on the latest bar, or None if unavailable.
+
+    dict shape: signal(-1/0/1), prob_up, prob_down, threshold, regime_code, atr,
+    close, base_params, timestamp, timeframe, reason.
     """
     tf = str(tf).upper()
-    if bundle is None:
-        bundle = load_live_bundle()
-    models = bundle.get("models", {}) or {}
-    thresholds = bundle.get("thresholds", {}) or {}
-    base = bundle.get("base_params", {}) or {}
+    try:
+        b = bundle or load_live_bundle()
+    except Exception:
+        return None
+    models = b.get("models", {})
     if tf not in models:
-        raise KeyError(f"Timeframe {tf} not in live bundle models: {list(models)}")
-    if tf not in thresholds:
-        raise KeyError(f"Timeframe {tf} not in live bundle thresholds: {list(thresholds)}")
+        return {"signal": 0, "timeframe": tf, "reason": "no deployed model for %s" % tf}
     model = models[tf]
-    base_params = dict(base.get(tf) or {})
-    threshold = float(thresholds[tf])
-    return model, base_params, threshold
-
-
-def _build_feat(tf: str, df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """Load the exec panel (or use ``df``) and build the engine feature frame.
-
-    Features are always computed on the full supplied history so rolling
-    windows (EMA200, ATR, triple-barrier, ...) are correct; callers may slice
-    the RESULT afterwards.
-    """
-    from src import grid_search_plateau as engine
-    panel = df if df is not None else engine.load_panel(tf)
-    return engine.build_features(panel, tf)
-
-
-def build_scored_frame(tf: str, df: Optional[pd.DataFrame] = None,
-                       bundle: Optional[dict] = None) -> pd.DataFrame:
-    """Return the feature frame with model probabilities + filtered signal.
-
-    Adds columns: prob_down, prob_flat, prob_up, raw_signal, signal.
-    Signal semantics mirror ``run_ml_filtered_backtest`` exactly:
-      * raw_signal from TrendPullbackStrategy, zeroed outside TREND (regime_code==1)
-      * signal keeps a long only when prob_up >= threshold, a short only when
-        prob_down >= threshold, else 0.
-    """
-    from src import grid_search_plateau as engine
-    model, base_params, threshold = bundle_params_for(tf, bundle)
-    feat = _build_feat(tf, df)
-
-    probs = np.asarray(model.predict_proba_raw(feat))
-    feat = feat.copy()
-    feat["prob_down"] = probs[:, 0]
-    feat["prob_flat"] = probs[:, 1] if probs.shape[1] > 2 else 0.0
-    feat["prob_up"] = probs[:, 2] if probs.shape[1] > 2 else probs[:, -1]
-
-    raw = engine.TrendPullbackStrategy().generate_signals(feat, base_params)
-    trend_mask = feat["regime_code"].to_numpy() == 1
-    raw = raw.where(pd.Series(trend_mask, index=feat.index), 0)
-    raw_arr = raw.to_numpy(dtype=np.int8)
-
-    filtered = raw_arr.copy()
-    filtered[(raw_arr == 1) & (feat["prob_up"].to_numpy() < threshold)] = 0
-    filtered[(raw_arr == -1) & (feat["prob_down"].to_numpy() < threshold)] = 0
-
-    feat["raw_signal"] = raw_arr
-    feat["signal"] = filtered
-    return feat
-
-
-def backtest_tf(tf: str, df: Optional[pd.DataFrame] = None,
-                bundle: Optional[dict] = None, tail: Optional[int] = None) -> dict:
-    """Backtest a timeframe through the notebook engine and return metrics.
-
-    Mirrors ``grid_search_plateau.evaluate_ml_model``.  ``df`` may supply an
-    alternative panel (e.g. freshly synced data); otherwise ``load_panel`` is
-    used.  ``tail`` slices the FEATURE frame to the most recent N rows AFTER
-    feature construction (used by the validator for a recent-window Sharpe).
-
-    Returned dict keys come straight from ``compute_metrics``:
-      profit_factor, sharpe, sortino, calmar, max_drawdown (PERCENT),
-      expectancy, win_rate (0-1), trade_count, net_profit, profit_per_trade,
-      net_return_pct.
-    """
-    from src import grid_search_plateau as engine
-    model, base_params, threshold = bundle_params_for(tf, bundle)
-    feat = _build_feat(tf, df)
-    if tail and len(feat) > int(tail):
-        feat = feat.iloc[-int(tail):]
-
-    probs = np.asarray(model.predict_proba_raw(feat))
-    _trades, metrics = engine.run_ml_filtered_backtest(
-        tf.upper(), feat, probs, base_params, float(threshold)
-    )
-    return dict(metrics)
-
-
-def latest_signal(tf: str, df: Optional[pd.DataFrame] = None,
-                  bundle: Optional[dict] = None) -> dict:
-    """Return the most recent bar's trading decision for live execution.
-
-    The returned dict is engine-consistent with the backtest and carries
-    everything the live executor needs to size an order identically to how the
-    backtest fills it:
-
-        signal       -1 / 0 / +1   (SELL / no-trade / BUY)
-        prob_up      float          P(up) for the last bar
-        prob_down    float          P(down) for the last bar
-        threshold    float          grid-selected xgb_threshold
-        regime_code  int            HMM regime of the last bar (1 == TREND)
-        atr          float          atr14 of the last bar (SL/TP sizing base)
-        close        float          last close price
-        base_params  dict           strategy params incl. atr_stop/atr_target/
-                                     leg_a_atr_target/exit_model
-        timestamp    Timestamp      index of the last bar
-
-    SL/TP for live must be sized as  base_params['atr_stop'] * atr  (stop) and
-    base_params['atr_target'] * atr  (target) so live == backtest.
-    """
-    _model, base_params, threshold = bundle_params_for(tf, bundle)
-    feat = build_scored_frame(tf, df=df, bundle=bundle)
-    last = feat.iloc[-1]
-    return {
-        "signal": int(last["signal"]),
-        "prob_up": float(last["prob_up"]),
-        "prob_down": float(last["prob_down"]),
-        "threshold": float(threshold),
-        "regime_code": int(last["regime_code"]),
-        "atr": float(last["atr14"]) if "atr14" in feat.columns else float("nan"),
-        "close": float(last["Close"]) if "Close" in feat.columns else float("nan"),
-        "base_params": dict(base_params),
-        "timestamp": feat.index[-1],
-    }
+    thr = float(b.get("thresholds", {}).get(tf, 0.5))
+    base_params = dict(b.get("base_params", {}).get(tf, {}))
+    try:
+        defs = _explorer_defs()
+        build_features = defs.get("build_features")
+        load_panel = defs.get("load_panel")
+        if build_features is None or load_panel is None:
+            return {"signal": 0, "timeframe": tf,
+                    "reason": "notebook feature code unavailable (install requirements)"}
+        if df is None:
+            df = load_panel(tf)
+        feat = build_features(df, tf).dropna()
+        if len(feat) == 0:
+            return {"signal": 0, "timeframe": tf, "reason": "no feature rows"}
+        proba = np.asarray(model.predict_proba_raw(feat.tail(1)))[-1]
+        prob_down = float(proba[0])
+        prob_up = float(proba[-1])
+        last = feat.iloc[-1]
+        regime_code = int(last["regime_code"]) if "regime_code" in feat.columns else 0
+        if "atr" in feat.columns:
+            atr_v = float(last["atr"])
+        elif "atr14" in feat.columns:
+            atr_v = float(last["atr14"])
+        else:
+            atr_v = float("nan")
+        close = float(last["Close"]) if "Close" in feat.columns else float("nan")
+        signal = 0
+        if prob_up >= thr and prob_up >= prob_down:
+            signal = 1
+        elif prob_down >= thr and prob_down > prob_up:
+            signal = -1
+        if regime_code == 2:  # SHOCK regime: stand aside (matches backtester gate)
+            signal = 0
+        return {
+            "signal": int(signal), "prob_up": prob_up, "prob_down": prob_down,
+            "threshold": thr, "regime_code": regime_code, "atr": atr_v, "close": close,
+            "base_params": base_params, "timestamp": str(feat.index[-1]),
+            "timeframe": tf, "reason": "ok",
+        }
+    except Exception as e:
+        return {"signal": 0, "timeframe": tf, "reason": "signal error: %s" % e}

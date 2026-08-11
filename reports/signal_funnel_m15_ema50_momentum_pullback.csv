@@ -1,0 +1,13 @@
+strategy,direction,stage,count,pct_of_total,pct_of_previous
+M15 EMA50 Pullback,long,total_bars,120159,100.0,100.0
+M15 EMA50 Pullback,long,regime_bull,22555,18.77096180893649,18.77096180893649
+M15 EMA50 Pullback,long,ema50_slope_positive,22199,18.474687705456937,98.42163600088672
+M15 EMA50 Pullback,long,pullback_to_ema50,407,0.3387178654948859,1.8334159196360196
+M15 EMA50 Pullback,long,close_above_ema50,346,0.2879517972020406,85.012285012285
+M15 EMA50 Pullback,long,volume_confirmation,237,0.19723865877712032,68.4971098265896
+M15 EMA50 Pullback,short,total_bars,120159,100.0,100.0
+M15 EMA50 Pullback,short,regime_bear,21121,17.57754308874075,17.57754308874075
+M15 EMA50 Pullback,short,ema50_slope_negative,20785,17.297913597816226,98.40916623265944
+M15 EMA50 Pullback,short,pullback_to_ema50,676,0.5625879043600562,3.252345441424104
+M15 EMA50 Pullback,short,close_below_ema50,553,0.46022353714661407,81.80473372781066
+M15 EMA50 Pullback,short,volume_confirmation,333,0.2771327990412703,60.21699819168174

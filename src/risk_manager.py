@@ -1,323 +1,66 @@
-import time
+"""src/risk_manager.py -- position sizing + equity guard for the live/demo engine.
 
-from src.logger import setup_logger
+Mirrors the Explorer notebook's DEPLOYED sizing policy (config cell 3 + the
+live_settings block exported inside the model bundle): base per-leg lots
+LOT_CYCLE_SMALL, escalated to LIVE_SCALED_LOT once realized profit clears
+PROFIT_SCALE_THRESHOLD_CENTS.  Headway 'cent' accounts express balance / P&L in
+cents (x100), hence CENT_MULTIPLIER.  The live loop uses these EXACT numbers so
+live sizing equals the backtester's sizing.
+"""
+from __future__ import annotations
 
-logger = setup_logger(__name__)
+CENT_MULTIPLIER = 100.0  # headway cent account: 1 USD == 100 account-cents
 
-# Spread and commission fractions of price per trade (normalized cost)
 BROKER_CONFIGS = {
-    "standard": {
-        "spread_frac": 0.0002,
-        "commission_frac": 0.0001,
-    },
-    "headway_cent": {
-        # XAUUSD on Headway Cent: ~$0.30 spread + ~$0.03/micro-lot commission
-        "spread_frac": 0.0002,
-        "commission_frac": 0.0002,
-    },
+    "headway_cent": {"cent_account": True, "cent_multiplier": CENT_MULTIPLIER},
+    "standard": {"cent_account": False, "cent_multiplier": 1.0},
 }
 
-MIN_CAPITAL_USD = 15.0
-CENT_MULTIPLIER = 100       # Headway Cent: 1 USD displayed as 100 cents
-SMALL_ACCOUNT_THRESHOLD = 50.0  # USD — boundary between small and growth tiers
 
-
-class CentConverter:
-    """Lot sizing for Headway Cent accounts (micro-lot floor = 0.01)."""
-
-    MIN_LOT = 0.01
-
-    def __init__(self, account_balance_usd: float):
-        self.account_balance_usd = max(float(account_balance_usd), MIN_CAPITAL_USD)
-
-    @property
-    def displayed_balance(self) -> float:
-        return self.account_balance_usd * CENT_MULTIPLIER
-
-    def calculate_lot(self, risk_pct: float, stop_distance_norm: float) -> float:
-        if stop_distance_norm <= 0:
-            return self.MIN_LOT
-        risk_amount = self.account_balance_usd * risk_pct
-        lot = risk_amount / stop_distance_norm
-        lot = max(self.MIN_LOT, (lot // self.MIN_LOT) * self.MIN_LOT)
-        return round(lot, 2)
-
-    def __repr__(self) -> str:
-        return (
-            f"CentConverter(balance=${self.account_balance_usd:.2f}, "
-            f"displayed={self.displayed_balance:.0f} cents)"
-        )
-
-
-class AdaptiveRiskManager:
-    """Dynamic lot sizing for Headway Cent and Standard accounts.
-
-    Returns ``pos_per_trade`` — the number of positions to open per signal —
-    based on account balance tier.  Trade-frequency limits are removed; the
-    Daily Equity Gate (loss side) and Trailing Daily Equity Lock (profit side)
-    inside ``DailyEquityGate`` now handle all stop-trading decisions.
-
-    Account tiers
-    ─────────────
-    ≤ $50 USD  — small account:
-        • pos_per_trade : 2  (standard accounts get 1 — margin safety on $15)
-
-    > $50 USD  — growth account:
-        • pos_per_trade : 3  (staged TPs across three independent positions)
-
-    Consecutive Loss Guard
-    ──────────────────────
-    ``MAX_STREAK`` consecutive losing trades triggers a ``LOCKOUT_HOURS``
-    cooldown during which ``can_trade()`` returns False.  This prevents
-    "Death by a Thousand Cuts" on M5 where the bot might enter several bad
-    mean-reversion trades in a row during a trending breakout.
-
-    Note: AdaptiveRiskManager is re-instantiated each bar in the live loop
-    for balance drift tracking.  To preserve streak state across bars, the
-    caller should pass ``consecutive_losses=`` and ``streak_locked_until=``
-    from the previous instance, or keep a single persistent ARM per session.
-    """
-
-    CHOP_STATE    = 2
-    MAX_STREAK    = 3         # consecutive losses before lockout
-    LOCKOUT_HOURS = 4.0       # hours to pause trading after streak triggers
-
-    def __init__(self, balance: float, tf: str = "H1", broker: str = "headway_cent",
-                 consecutive_losses: int = 0, streak_locked_until: float = 0.0):
-        self.balance = max(float(balance), MIN_CAPITAL_USD)
-        self.tf      = tf.upper()
-        self.broker  = broker
-        self.consecutive_losses = consecutive_losses
-        self._streak_locked_until = streak_locked_until if streak_locked_until > 0 else None
-        tier = "small" if self.balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
-        logger.debug(
-            "AdaptiveRiskManager: balance=$%.2f tier=%s tf=%s broker=%s streak=%d",
-            self.balance, tier, self.tf, self.broker, self.consecutive_losses,
-        )
-
-    @property
-    def is_small_account(self) -> bool:
-        return self.balance <= SMALL_ACCOUNT_THRESHOLD
-
-    def get_trade_limits(self, market_state: int = None, tf: str = None) -> dict:
-        """Return ``pos_per_trade`` for the current balance tier.
-
-        Args:
-            market_state: Unused — kept for call-site compatibility.
-            tf: Timeframe string (e.g. ``"M5"``). Defaults to ``self.tf``.
-
-        Returns:
-            dict with key ``pos_per_trade``.
-        """
-        if self.is_small_account:
-            # Standard accounts: single position on micro-balance for margin safety
-            if self.broker == "standard":
-                return {"pos_per_trade": 1}
-            return {"pos_per_trade": 2}
-        return {"pos_per_trade": 3}
-
-    def can_trade(self) -> bool:
-        """Return False while the consecutive-loss streak lockout is active.
-
-        Called from the live loop before placing any new signal.  If the
-        lockout window has expired it resets automatically so no manual
-        intervention is required.
-        """
-        if self._streak_locked_until is not None:
-            if time.time() < self._streak_locked_until:
-                remaining = (self._streak_locked_until - time.time()) / 3600
-                logger.warning(
-                    "ConsecutiveLossGuard: trading locked for another %.1fh "
-                    "(streak=%d, max=%d).",
-                    remaining, self.consecutive_losses, self.MAX_STREAK,
-                )
-                return False
-            # Lockout window expired — reset
-            logger.info("ConsecutiveLossGuard: lockout expired — trading resumed.")
-            self._streak_locked_until = None
-            self.consecutive_losses   = 0
-        return True
-
-    def record_trade_result(self, won: bool) -> None:
-        """Update the consecutive-loss streak counter after each closed trade.
-
-        Args:
-            won: True if the trade closed profitable, False if it was a loss.
-
-        Behaviour:
-            - Win  → streak resets to 0.
-            - Loss → streak increments.  If it reaches ``MAX_STREAK``, trading
-              is locked for ``LOCKOUT_HOURS`` hours (``can_trade()`` returns
-              False) to let the market regime settle before re-entry.
-        """
-        if won:
-            if self.consecutive_losses > 0:
-                logger.debug(
-                    "ConsecutiveLossGuard: winning trade — resetting streak from %d.",
-                    self.consecutive_losses,
-                )
-            self.consecutive_losses = 0
-        else:
-            self.consecutive_losses += 1
-            logger.info(
-                "ConsecutiveLossGuard: losing trade recorded (streak=%d / max=%d).",
-                self.consecutive_losses, self.MAX_STREAK,
-            )
-            if self.consecutive_losses >= self.MAX_STREAK:
-                self._streak_locked_until = time.time() + self.LOCKOUT_HOURS * 3600
-                logger.warning(
-                    "ConsecutiveLossGuard: %d consecutive losses — "
-                    "locking trading for %.0fh.",
-                    self.consecutive_losses, self.LOCKOUT_HOURS,
-                )
-
-    def calculate_lot_size(self, stop_loss_pips: float) -> float:
-        """1% risk rule for Headway cent XAUUSD.
-
-        On the Headway cent account the effective contract is 1 oz per lot, so
-        each $1 price move = $1 P&L per lot.  Formula:
-
-            lot = (balance × 1%) / sl_price_distance
-
-        Example: $15 balance, 14.27-pt SL → $0.15 / 14.27 = 0.0105 → 0.01 lot.
-        """
-        risk_per_trade = self.balance * 0.01
-        if stop_loss_pips <= 0:
-            return 0.01
-        lot_size = risk_per_trade / stop_loss_pips
-        return max(0.01, round(lot_size, 2))
-
-    def __repr__(self) -> str:
-        tier   = "small" if self.is_small_account else "growth"
-        locked = self._streak_locked_until is not None and time.time() < self._streak_locked_until
-        return (
-            f"AdaptiveRiskManager(balance=${self.balance:.0f}, tier={tier}, "
-            f"broker={self.broker}, streak={self.consecutive_losses}/{self.MAX_STREAK}, "
-            f"locked={locked})"
-        )
+def broker_cent_multiplier(broker):
+    cfg = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"])
+    return float(cfg["cent_multiplier"]) if cfg["cent_account"] else 1.0
 
 
 class DailyEquityGate:
-    """Floating-equity safety switch for live trading.
+    """Blocks NEW entries once the day's realized drawdown breaches a fraction of
+    the day's starting equity (same intent as Explorer cell 20's
+    ProductionRiskCircuitBreaker).  Reset per calendar day."""
 
-    Two-sided gate that blocks new signals when either limit is breached:
+    def __init__(self, start_equity, max_daily_loss_frac=0.10):
+        self.start_equity = float(start_equity)
+        self.max_daily_loss_frac = float(max_daily_loss_frac)
+        self.day = None
+        self.day_start_equity = float(start_equity)
 
-    Loss side (universal):
-        If running equity (balance + open floating P&L) drops ≥ ``loss_pct``
-        below the start-of-day baseline, the loss gate locks and all open
-        positions are closed.
+    def update_day(self, today, equity):
+        if self.day != today:
+            self.day = today
+            self.day_start_equity = float(equity)
 
-    Profit side (Trailing Daily Equity Lock):
-        If running equity rises ≥ ``PROFIT_LOCK_PCT[tf]`` above the
-        start-of-day baseline, the profit gate locks — banking the day's gains
-        before a late-session regime shift can give them back.
+    def can_enter(self, equity):
+        floor = self.day_start_equity * (1.0 - self.max_daily_loss_frac)
+        return float(equity) > floor
 
-        Thresholds by TF:
-            M5:     20% day gain  (scalp sessions can spike fast)
-            M15:    10% day gain  (intraday sessions)
-            H1:     10% day gain  (swing sessions)
 
-    Both gates reset at UTC midnight via ``reset_day``.
+class AdaptiveRiskManager:
+    """Per-leg lot sizing identical to the deployed live-simulation policy."""
 
-    Usage in the live loop::
+    def __init__(self, settings):
+        s = settings or {}
+        self.lot_cycle_small = list(s.get("lot_cycle_small", [0.02, 0.02]))
+        self.max_positions = int(s.get("max_positions_per_cycle", len(self.lot_cycle_small)))
+        self.profit_scale_threshold_cents = float(s.get("profit_scale_threshold_cents", 5000.0))
+        self.enable_scaling = bool(s.get("live_enable_lot_scaling", True))
+        self.scaled_lot = float(s.get("live_scaled_lot", 0.03))
+        self.initial_balance_cents = float(s.get("initial_balance_cents", 1500.0))
 
-        gate = DailyEquityGate(tf="M5")
-        gate.reset_day(live_account_balance_usd)   # call once at start of day
+    def leg_lots(self, realized_profit_cents=0.0):
+        "Return the per-leg lot list for the current cycle."
+        if self.enable_scaling and float(realized_profit_cents) >= self.profit_scale_threshold_cents:
+            return [self.scaled_lot for _ in self.lot_cycle_small]
+        return list(self.lot_cycle_small)
 
-        # each poll cycle:
-        current_eq = account_size + open_pnl
-        if gate.check(current_eq):
-            if gate.needs_loss_notification:
-                <close all positions + send Telegram loss alert>
-            elif gate.needs_profit_notification:
-                <send Telegram equity-locked alert>
-            continue   # skip new signals until tomorrow
-    """
-
-    DAILY_LOSS_PCT = 0.05   # 5% default loss limit
-
-    # Trailing Daily Equity Lock thresholds per timeframe
-    PROFIT_LOCK_PCT = {
-        "M5":  0.20,   # 20% — fast-moving scalp sessions
-        "M15": 0.10,   # 10% — intraday sessions
-        "H1":  0.10,   # 10% — swing sessions
-    }
-
-    def __init__(self, loss_pct: float = DAILY_LOSS_PCT, tf: str = "H1"):
-        self.loss_pct         = loss_pct
-        self.profit_lock_pct  = self.PROFIT_LOCK_PCT.get(tf.upper(), 0.10)
-        self._tf              = tf.upper()
-        self._start_equity: float | None = None
-        self._loss_locked     = False
-        self._profit_locked   = False
-        self._loss_notified   = False
-        self._profit_notified = False
-
-    def reset_day(self, equity: float) -> None:
-        """Initialise or reset for a new UTC trading day."""
-        self._start_equity    = float(equity)
-        self._loss_locked     = False
-        self._profit_locked   = False
-        self._loss_notified   = False
-        self._profit_notified = False
-        logger.debug(
-            "DailyEquityGate [%s] reset: start_equity=%.2f  loss=%.0f%%  profit_lock=%.0f%%",
-            self._tf, equity, self.loss_pct * 100, self.profit_lock_pct * 100,
-        )
-
-    def check(self, current_equity: float) -> bool:
-        """Return True if either the loss or profit gate has been triggered.
-
-        Calling this repeatedly after lock is safe — it stays True and does
-        NOT re-trigger notifications.
-        """
-        if self._start_equity is None or self._start_equity <= 0:
-            return False
-        change_pct = (current_equity - self._start_equity) / self._start_equity
-        if -change_pct >= self.loss_pct:
-            self._loss_locked = True
-        if change_pct >= self.profit_lock_pct:
-            self._profit_locked = True
-        return self._loss_locked or self._profit_locked
-
-    @property
-    def locked(self) -> bool:
-        """True if either gate is active."""
-        return self._loss_locked or self._profit_locked
-
-    @property
-    def loss_locked(self) -> bool:
-        return self._loss_locked
-
-    @property
-    def profit_locked(self) -> bool:
-        return self._profit_locked
-
-    @property
-    def needs_notification(self) -> bool:
-        """Backwards-compat alias → ``needs_loss_notification``."""
-        return self.needs_loss_notification
-
-    @property
-    def needs_loss_notification(self) -> bool:
-        """True exactly once — the first poll cycle after the loss gate engages."""
-        if self._loss_locked and not self._loss_notified:
-            self._loss_notified = True
-            return True
-        return False
-
-    @property
-    def needs_profit_notification(self) -> bool:
-        """True exactly once — the first poll cycle after the profit gate engages."""
-        if self._profit_locked and not self._profit_notified:
-            self._profit_notified = True
-            return True
-        return False
-
-    def __repr__(self) -> str:
-        return (
-            f"DailyEquityGate(tf={self._tf}, loss={self.loss_pct*100:.0f}%, "
-            f"profit_lock={self.profit_lock_pct*100:.0f}%, "
-            f"loss_locked={self._loss_locked}, profit_locked={self._profit_locked}, "
-            f"start=${self._start_equity or 0:.2f})"
-        )
+    @classmethod
+    def from_bundle(cls, bundle):
+        return cls((bundle or {}).get("settings", {}))

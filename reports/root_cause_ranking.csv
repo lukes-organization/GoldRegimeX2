@@ -1,3 +1,0 @@
-issue,evidence,timeframe,rank
-Signal generation collapse,signal loss 88.1% > 20% (generated 8107 -> executed 968),M15,1
-Signal generation collapse,signal loss 88.0% > 20% (generated 26773 -> executed 3203),M5,1

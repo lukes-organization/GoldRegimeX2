@@ -1,0 +1,9 @@
+strategy,direction,funnel_final,raw_signal_count,reconciled
+m5_ema_pinbar_scalp,long,617,617,True
+m5_ema_pinbar_scalp,short,430,430,True
+m15_asian_range_breakout,long,305,305,True
+m15_asian_range_breakout,short,253,253,True
+m15_bollinger_rsi_reversion,long,0,0,True
+m15_bollinger_rsi_reversion,short,0,0,True
+m15_ema50_momentum_pullback,long,237,237,True
+m15_ema50_momentum_pullback,short,333,333,True

@@ -40,13 +40,21 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
 
 
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder RSI with explicit zero-gain/zero-loss edge cases.
+
+    A window with gains but no losses is RSI=100; a window with losses but no
+    gains is RSI=0. Only a completely flat window is RSI=50.
+    """
     delta = close.diff()
     gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
+    loss = (-delta).clip(lower=0.0)
     avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+    out = 100.0 - (100.0 / (1.0 + rs))
+    out = out.where(avg_loss != 0.0, 100.0)
+    out = out.where(avg_gain != 0.0, 0.0)
+    return out.where(~((avg_gain == 0.0) & (avg_loss == 0.0)), 50.0)
 
 
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:

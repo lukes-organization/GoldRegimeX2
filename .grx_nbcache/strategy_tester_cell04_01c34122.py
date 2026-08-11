@@ -1,15 +1,3 @@
-"""src/data_updater.py -- gap-fill CSV updater (VERBATIM from the notebooks).
-
-The helper functions below are copied unchanged from the 'Automatic MT5 Data
-Updater' cell that is IDENTICAL in Strategy_Tester.ipynb and
-GoldRegimeX_Explorer.ipynb.  Only the trailing notebook driver is wrapped into
-update_all_data() so it runs either standalone (python main.py update-data) or
-automatically whenever a grid-search plateau runs (the notebooks call the same
-cell via AUTO_UPDATE_DATA=True).  Needs a running, logged-in MT5 terminal; if
-MetaTrader5 is unavailable it warns and leaves the CSVs untouched.
-"""
-from __future__ import annotations
-
 # ============================================================================
 # Automatic MT5 Data Updater  (runs on EVERY fresh run of this notebook)
 # ----------------------------------------------------------------------------
@@ -354,67 +342,47 @@ def _mt5_connect():
         raise RuntimeError("MT5 initialize() failed: %s" % (mt5.last_error(),))
     return mt5
 
-
-DEFAULT_DATA_PATHS = {
-    "TF_TO_XAU_RAW": {"M15": _Path("data/raw/XAU_15m_data.csv"), "M5": _Path("data/raw/XAU_5m_data.csv")},
-    "TF_TO_XAG_MASTER": {"M15": _Path("data/raw/XAGUSD_M15_201601040100_202605072245.csv"), "M5": _Path("data/raw/XAGUSD_M5_201601040105_202605072255.csv")},
-    "TF_TO_XTI_MASTER": {"M15": _Path("data/raw/XTIUSD_M15_201702102000_202605072345.csv"), "M5": _Path("data/raw/XTIUSD_M5_201702102000_202605072355.csv")},
-    "TF_TO_USDCHF_MASTER": {"M15": _Path("data/processed/USDCHF_master_M15.csv"), "M5": _Path("data/processed/USDCHF_master_M5.csv")},
-}
-
-
-def update_all_data(config=None, symbols=None):
-    """Refresh every configured CSV up to now from MT5. Returns targets touched.
-    Never raises when MT5 is simply unavailable (warns and returns 0)."""
-    cfg = dict(DEFAULT_DATA_PATHS)
-    if config:
-        cfg.update(config)
-    syms = dict(MT5_SYMBOLS)
-    if symbols:
-        syms.update(symbols)
-    if not AUTO_UPDATE_DATA:
-        print("[data-updater] AUTO_UPDATE_DATA=False - skipping MT5 refresh; using existing CSVs.")
-        return 0
+if not AUTO_UPDATE_DATA:
+    print("[data-updater] AUTO_UPDATE_DATA=False - skipping MT5 refresh; using existing CSVs.")
+else:
     try:
         _mt5 = _mt5_connect()
     except Exception as _exc:
+        _mt5 = None
         print("[data-updater] MT5 unavailable (%s)." % _exc)
         print("               Using existing CSV files unchanged.")
-        return 0
-    _touched = 0
-    try:
-        _now = pd.Timestamp.now()
-        print("=" * 74)
-        print("MT5 DATA UPDATE (gap-fill to latest)  -  %s" % _now.strftime("%Y-%m-%d %H:%M"))
-        print("=" * 74)
-        _targets = _canonical_targets(cfg, syms)
-        for _asset, _tf, _path, _fmt in _targets:
-            _symbol = syms.get(_asset, _asset)
-            _resolved = _resolve_target(_path)
-            _last = _read_last_ts(_resolved, _fmt)
-            _n = _bars_needed(_tf, _last, _now, TF_MINUTES, FETCH_BUFFER_BARS, MAX_FETCH_BARS, INITIAL_BACKFILL_BARS)
-            _r = _fetch_mt5(_mt5, _symbol, _tf, _n)
-            if _r is None:
-                continue
-            if _fmt == "xau_semicolon":
-                _added, _total, _ = _append_xau_semicolon(_path, _r)
-            elif _fmt == "master_comma":
-                _added, _total, _ = _append_master_comma(_path, _r)
-            else:
-                _added, _total, _ = _append_mt4_tab(_path, _r)
-            _touched += 1
-            _from = _last.strftime("%Y-%m-%d %H:%M") if _last is not None else "(new file)"
-            print("  [ok] %-6s %-3s  from %-16s  +%d bars -> %d rows  (%s)" % (_symbol, _tf, _from, _added, _total, _resolved.name))
-        if _touched == 0:
-            print("  (no assets updated - check MT5 symbols / Market Watch)")
-    finally:
+    if _mt5 is not None:
         try:
-            _mt5.shutdown()
-        except Exception:
-            pass
-    print("Data refresh complete. The loader cells/pipelines now read the updated CSVs.")
-    return _touched
-
-
-if __name__ == "__main__":
-    update_all_data()
+            _now = pd.Timestamp.now()
+            print("=" * 74)
+            print("MT5 DATA UPDATE (gap-fill to latest)  -  %s" % _now.strftime("%Y-%m-%d %H:%M"))
+            print("=" * 74)
+            _targets = _canonical_targets(globals(), MT5_SYMBOLS)
+            _touched = 0
+            for _asset, _tf, _path, _fmt in _targets:
+                _symbol = MT5_SYMBOLS.get(_asset, _asset)
+                _resolved = _resolve_target(_path)
+                _last = _read_last_ts(_resolved, _fmt)
+                _n = _bars_needed(_tf, _last, _now, TF_MINUTES, FETCH_BUFFER_BARS,
+                                  MAX_FETCH_BARS, INITIAL_BACKFILL_BARS)
+                _r = _fetch_mt5(_mt5, _symbol, _tf, _n)
+                if _r is None:
+                    continue
+                if _fmt == "xau_semicolon":
+                    _added, _total, _ = _append_xau_semicolon(_path, _r)
+                elif _fmt == "master_comma":
+                    _added, _total, _ = _append_master_comma(_path, _r)
+                else:
+                    _added, _total, _ = _append_mt4_tab(_path, _r)
+                _touched += 1
+                _from = _last.strftime("%Y-%m-%d %H:%M") if _last is not None else "(new file)"
+                print("  [ok] %-6s %-3s  from %-16s  +%d bars -> %d rows  (%s)"
+                      % (_symbol, _tf, _from, _added, _total, _resolved.name))
+            if _touched == 0:
+                print("  (no assets updated - check MT5 symbols / Market Watch)")
+        finally:
+            try:
+                _mt5.shutdown()
+            except Exception:
+                pass
+        print("Data refresh complete. The loader cells below now read the updated CSVs.")
